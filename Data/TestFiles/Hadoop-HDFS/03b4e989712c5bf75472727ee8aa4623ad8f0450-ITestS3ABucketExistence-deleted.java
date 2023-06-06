@@ -1,0 +1,2 @@
+    expectUnknownStore(
+        () -> fs.getFileStatus(root));

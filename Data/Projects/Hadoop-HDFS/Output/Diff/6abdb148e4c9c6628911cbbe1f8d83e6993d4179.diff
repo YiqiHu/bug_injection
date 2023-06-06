@@ -1,0 +1,824 @@
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/placement/CSMappingPlacementRule.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/placement/CSMappingPlacementRule.java
+index b1a733dfd15b..908498d8c703 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/placement/CSMappingPlacementRule.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/placement/CSMappingPlacementRule.java
+@@ -26,7 +26,12 @@
+ import org.apache.hadoop.yarn.conf.YarnConfiguration;
+ import org.apache.hadoop.yarn.exceptions.YarnException;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.ResourceScheduler;
+-import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.*;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CSQueue;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacityScheduler;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacitySchedulerConfiguration;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacitySchedulerContext;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacitySchedulerQueueManager;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.LeafQueue;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+@@ -250,46 +255,47 @@ private String validateAndNormalizeQueue(
+ 
+   private String validateAndNormalizeQueueWithParent(
+       String parent, String leaf, boolean allowCreate) throws YarnException {
+-    CSQueue parentQueue = queueManager.getQueue(parent);
+-    //we don't find the specified parent, so the placement rule is invalid
+-    //for this case
+-    if (parentQueue == null) {
+-      if (queueManager.isAmbiguous(parent)) {
+-        throw new YarnException("Mapping rule specified a parent queue '" +
+-            parent + "', but it is ambiguous.");
+-      } else {
+-        throw new YarnException("Mapping rule specified a parent queue '" +
+-            parent + "', but it does not exist.");
+-      }
+-    }
+-
+-    //normalizing parent path
+-    String parentPath = parentQueue.getQueuePath();
+-    String fullPath = parentPath + DOT + leaf;
+-
+-    //checking if the queue actually exists
+-    CSQueue queue = queueManager.getQueue(fullPath);
+-    //if we have a parent which is not a managed parent and the queue doesn't
+-    //then it is an invalid target, since the queue won't be auto-created
+-    if (!(parentQueue instanceof ManagedParentQueue) && queue == null) {
++    String normalizedPath =
++        MappingRuleValidationHelper.normalizeQueuePathRoot(
++            queueManager, parent + DOT + leaf);
++    MappingRuleValidationHelper.ValidationResult validity =
++        MappingRuleValidationHelper.validateQueuePathAutoCreation(
++            queueManager, normalizedPath);
++
++    switch (validity) {
++    case AMBIGUOUS_PARENT:
+       throw new YarnException("Mapping rule specified a parent queue '" +
+-          parent + "', but it is not a managed parent queue, " +
++          parent + "', but it is ambiguous.");
++    case AMBIGUOUS_QUEUE:
++      throw new YarnException("Mapping rule specified a target queue '" +
++          normalizedPath + "', but it is ambiguous.");
++    case EMPTY_PATH:
++      throw new YarnException("Mapping rule did not specify a target queue.");
++    case NO_PARENT_PROVIDED:
++      throw new YarnException("Mapping rule did not specify an existing queue" +
++          " nor a dynamic parent queue.");
++    case NO_DYNAMIC_PARENT:
++      throw new YarnException("Mapping rule specified a parent queue '" +
++          parent + "', but it is not a dynamic parent queue, " +
+           "and no queue exists with name '" + leaf + "' under it.");
++    case QUEUE_EXISTS:
++      break;
++    case CREATABLE:
++      if (!allowCreate) {
++        throw new YarnException("Mapping rule doesn't allow auto-creation of " +
++            "the queue '" + normalizedPath + "'.");
++      }
++      break;
++    default:
++      //Probably the QueueCreationValidation have
++      //new items, which are not handled here
++      throw new YarnException("Unknown queue path validation result. '" +
++          validity + "'.");
+     }
+ 
+-    //if the queue does not exist but the parent is managed we need to check if
+-    //auto-creation is allowed
+-    if (parentQueue instanceof ManagedParentQueue
+-        && queue == null
+-        && allowCreate == false) {
+-      throw new YarnException("Mapping rule doesn't allow auto-creation of " +
+-          "the queue '" + fullPath + "'");
+-    }
+-
+-
+-    //at this point we either have a managed parent or the queue actually
+-    //exists so we have a placement context, returning it
+-    return fullPath;
++    //at this point we either have a dynamic parent or the queue actually
++    //exists, returning it
++    return normalizedPath;
+   }
+ 
+   private String validateAndNormalizeQueueWithNoParent(String leaf)
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/placement/MappingRuleValidationContext.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/placement/MappingRuleValidationContext.java
+index 95a2257afed9..172ce419f546 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/placement/MappingRuleValidationContext.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/placement/MappingRuleValidationContext.java
+@@ -46,8 +46,9 @@ interface MappingRuleValidationContext {
+    * A part is dynamic if a known variable is referenced in it.
+    * @param queuePath The path to check
+    * @return true if no dynamic parts were found
++   * @throws YarnException if invalid path parts are found (eg. empty)
+    */
+-  boolean isPathStatic(String queuePath);
++  boolean isPathStatic(String queuePath) throws YarnException;
+ 
+   /**
+    * This method will add a known variable to the validation context, known
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/placement/MappingRuleValidationContextImpl.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/placement/MappingRuleValidationContextImpl.java
+index 80bf9293d41a..1b768d4cdd2f 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/placement/MappingRuleValidationContextImpl.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/placement/MappingRuleValidationContextImpl.java
+@@ -24,8 +24,11 @@
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacitySchedulerQueueManager;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.LeafQueue;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.ManagedParentQueue;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.ParentQueue;
+ 
+-import java.util.Set;
++import java.util.*;
++
++import static org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacitySchedulerConfiguration.DOT;
+ 
+ public class MappingRuleValidationContextImpl
+     implements MappingRuleValidationContext {
+@@ -51,76 +54,56 @@
+ 
+   /**
+    * This method will determine if a static queue path is valid.
++   * We consider a path static (in the target path validation context)
++   * If non if it's parts contain any substitutable variables.
++   * eg. root.groups.bob is static, while root.groups.%user is dynamic
+    * @param path The static path of the queue
+-   * @return true of the path is valid
++   * @return true if the path is valid
+    * @throws YarnException if the path is invalid
+    */
+   private boolean validateStaticQueuePath(MappingQueuePath path)
+       throws YarnException {
+-    //Try getting queue by its full path name, if it exists it is a static
+-    //leaf queue indeed, without any auto creation magic
+-    CSQueue queue = queueManager.getQueue(path.getFullPath());
+-    if (queue == null) {
+-      //We might not be able to find the queue, because the reference was
+-      // ambiguous this should only happen if the queue was referenced by
+-      // leaf name only
+-      if (queueManager.isAmbiguous(path.getFullPath())) {
+-        throw new YarnException(
+-            "Target queue is an ambiguous leaf queue '" +
+-            path.getFullPath() + "'");
+-      }
+-
+-      //if leaf queue does not exist,
+-      //we need to check if the parent exists and is a managed parent
+-      if (!path.hasParent()) {
+-        throw new YarnException(
+-            "Target queue does not exist and has no parent defined '" +
+-            path.getFullPath() + "'");
+-      }
+-
+-      CSQueue parentQueue = queueManager.getQueue(path.getParent());
+-      if (parentQueue == null) {
+-        if (queueManager.isAmbiguous(path.getParent())) {
+-          throw new YarnException("Target queue path '" + path +
+-              "' contains an ambiguous parent queue '" +
+-              path.getParent() + "' reference");
+-        } else {
+-          throw new YarnException("Target queue path '" + path + "' " +
+-              "contains an invalid parent queue '" + path.getParent() + "'.");
+-        }
+-      }
+-
+-      if (!(parentQueue instanceof ManagedParentQueue)) {
+-        //If the parent path was referenced by short name, and it is not
+-        // managed, we look up if there is a queue under it with the leaf
+-        // queue's name
+-        String normalizedParentPath = parentQueue.getQueuePath() + "."
+-            + path.getLeafName();
+-        CSQueue normalizedQueue = queueManager.getQueue(normalizedParentPath);
+-        if (normalizedQueue instanceof LeafQueue) {
+-          return true;
+-        }
+-
+-        if (normalizedQueue == null) {
+-          throw new YarnException(
+-              "Target queue '" + path.getFullPath() + "' does not exist" +
+-              " and has a non-managed parent queue defined.");
+-        } else {
+-          throw new YarnException("Target queue '" + path + "' references" +
+-              "a non-leaf queue, target queues must always be " +
+-              "leaf queues.");
+-        }
+-
+-      }
++    String normalizedPath = MappingRuleValidationHelper.normalizeQueuePathRoot(
++        queueManager, path.getFullPath());
++    MappingRuleValidationHelper.ValidationResult validity =
++        MappingRuleValidationHelper.validateQueuePathAutoCreation(
++            queueManager, normalizedPath);
+ 
+-    } else {
+-      // if queue exists, validate if its an instance of leaf queue
++    switch (validity) {
++    case AMBIGUOUS_PARENT:
++      throw new YarnException("Target queue path '" + path +
++          "' contains an ambiguous parent queue '" +
++          path.getParent() + "' reference.");
++    case AMBIGUOUS_QUEUE:
++      throw new YarnException("Target queue is an ambiguous leaf queue '" +
++              path.getFullPath() + "'.");
++    case EMPTY_PATH:
++      throw new YarnException("Mapping rule did not specify a target queue.");
++    case NO_PARENT_PROVIDED:
++      throw new YarnException(
++          "Target queue does not exist and has no parent defined '" +
++              path.getFullPath() + "'.");
++    case NO_DYNAMIC_PARENT:
++      throw new YarnException("Mapping rule specified a parent queue '" +
++          path.getParent() + "', but it is not a dynamic parent queue, " +
++          "and no queue exists with name '" + path.getLeafName() +
++          "' under it.");
++    case QUEUE_EXISTS:
++      CSQueue queue = queueManager.getQueue(normalizedPath);
+       if (!(queue instanceof LeafQueue)) {
+-        throw new YarnException("Target queue '" + path + "' references" +
+-            "a non-leaf queue, target queues must always be " +
+-            "leaf queues.");
++        throw new YarnException("Target queue '" + path.getFullPath() +
++            "' but it's not a leaf queue.");
+       }
++      break;
++    case CREATABLE:
++      break;
++    default:
++      //Probably the QueueCreationValidation have
++      //new items, which are not handled here
++      throw new YarnException("Unknown queue path validation result. '" +
++          validity + "'.");
+     }
++
+     return true;
+   }
+ 
+@@ -133,47 +116,91 @@ private boolean validateStaticQueuePath(MappingQueuePath path)
+    */
+   private boolean validateDynamicQueuePath(MappingQueuePath path)
+       throws YarnException{
+-    //if the queue is dynamic and we don't have a parent path, we cannot do
+-    //any validation, since the dynamic part can be substituted to anything
+-    //and that is the only part
+-    if (!path.hasParent()) {
+-      return true;
++    ArrayList<String> parts = new ArrayList<>();
++    Collections.addAll(parts, path.getFullPath().split("\\."));
++    //How deep is the path to be created after the root element
++
++    Iterator<String> pointer = parts.iterator();
++    if (!pointer.hasNext()) {
++      //This should not happen since we only call validateDynamicQueuePath
++      //if we have found at least ONE dynamic part, which implies the path is
++      //not empty, so if we get here, I'm really curious what the path was,
++      //that's the reason we give back a theoretically "empty" path
++      throw new YarnException("Empty queue path provided '" + path + "'");
+     }
++    StringBuilder staticPartBuffer = new StringBuilder(pointer.next());
++    String staticPartParent = null;
+ 
+-    String parent = path.getParent();
+-    //if the parent path has dynamic parts, we cannot do any more validations
+-    if (!isPathStatic(parent)) {
++    //If not even the root of the reference is static we cannot validate
++    if (!isPathStatic(staticPartBuffer.toString())) {
+       return true;
+     }
+ 
+-    //We check if the parent queue exists
+-    CSQueue parentQueue = queueManager.getQueue(parent);
+-    if (parentQueue == null) {
+-      throw new YarnException("Target queue path '" + path + "' contains an " +
+-          "invalid parent queue");
++    //getting the static part of the queue, we can only validate that
++    while (pointer.hasNext()) {
++      String nextPart = pointer.next();
++      if (isPathStatic(nextPart)) {
++        staticPartParent = staticPartBuffer.toString();
++        staticPartBuffer.append(DOT).append(nextPart);
++      } else {
++        //when we find the first dynamic part, we stop the search
++        break;
++      }
+     }
++    String staticPart = staticPartBuffer.toString();
+ 
+-    if (!(parentQueue instanceof ManagedParentQueue)) {
+-      if (parentQueue.getChildQueues() != null) {
+-        for (CSQueue queue : parentQueue.getChildQueues()) {
+-          if (queue instanceof LeafQueue) {
+-            //if a non managed parent queue has at least one leaf queue, this
+-            //mapping can be valid, we cannot do any more checks
+-            return true;
+-          }
+-        }
++    String normalizedStaticPart =
++        MappingRuleValidationHelper.normalizeQueuePathRoot(
++            queueManager, staticPart);
++    CSQueue queue = queueManager.getQueue(normalizedStaticPart);
++    //if the static part of our queue exists, and it's not a leaf queue,
++    //we cannot do any deeper validation
++    if (queue != null) {
++      if (queue instanceof LeafQueue) {
++        throw new YarnException("Queue path '" + path +"' is invalid " +
++            "because '" + normalizedStaticPart + "' is a leaf queue, " +
++            "which can have no other queues under it.");
+       }
++      return true;
++    }
+ 
+-      //There is no way we can place anything into the queue referenced by the
+-      // rule, because we cannot auto create, and we don't have any leaf queues
+-      //Actually this branch is not accessible with the current queue hierarchy,
+-      //there should be no parents without any leaf queues. This condition says
+-      //for sanity checks
+-      throw new YarnException("Target queue path '" + path + "' has " +
+-          "a non-managed parent queue which has no LeafQueues either.");
++    if (staticPartParent != null) {
++      String normalizedStaticPartParent
++          = MappingRuleValidationHelper.normalizeQueuePathRoot(
++              queueManager, staticPartParent);
++      queue = queueManager.getQueue(normalizedStaticPartParent);
++      //if the parent of our static part is eligible for creation, we validate
++      //this rule
++      if (isDynamicParent(queue)) {
++        return true;
++      }
+     }
+ 
+-    return true;
++    //at this point we cannot find any parent which is eligible for creating
++    //this path
++    throw new YarnException("No eligible parent found on path '" + path + "'.");
++  }
++
++  /**
++   * This method determines if a queue is eligible for being a parent queue.
++   * Since YARN-10506 not only managed parent queues can have child queues.
++   * @param queue The queue object
++   * @return true if queues can be created under this queue otherwise false
++   */
++  private boolean isDynamicParent(CSQueue queue) {
++    if (queue == null) {
++      return false;
++    }
++
++    if (queue instanceof ManagedParentQueue) {
++      return true;
++    }
++
++    if (queue instanceof ParentQueue) {
++      return ((ParentQueue)queue).isEligibleForAutoQueueCreation();
++    }
++
++    return false;
+   }
+ 
+ 
+@@ -186,6 +213,9 @@ private boolean validateDynamicQueuePath(MappingQueuePath path)
+    * @throws YarnException if the provided queue path is invalid
+    */
+   public boolean validateQueuePath(String queuePath) throws YarnException {
++    if (queuePath == null || queuePath.isEmpty()) {
++      throw new YarnException("Queue path is empty.");
++    }
+     MappingQueuePath path = new MappingQueuePath(queuePath);
+ 
+     if (isPathStatic(queuePath)) {
+@@ -200,11 +230,17 @@ public boolean validateQueuePath(String queuePath) throws YarnException {
+    * A part is dynamic if a known variable is referenced in it.
+    * @param queuePath The path to check
+    * @return true if no dynamic parts were found
++   * @throws YarnException if a path part is invalid (eg. empty)
+    */
+-  public boolean isPathStatic(String queuePath) {
++  public boolean isPathStatic(String queuePath) throws YarnException {
+     String[] parts = queuePath.split("\\.");
+     for (int i = 0; i < parts.length; i++) {
+-      if (knownVariables.contains(parts[i])) {
++      if (parts[i].isEmpty()) {
++        throw new YarnException("Path segment cannot be empty '" +
++            queuePath + "'.");
++      }
++
++      if (!isPathPartStatic(parts[i])) {
+         return false;
+       }
+     }
+@@ -212,6 +248,20 @@ public boolean isPathStatic(String queuePath) {
+     return true;
+   }
+ 
++  /**
++   * Method to determine if the provided queue path part is dynamic.
++   * A part is dynamic if a known variable is referenced in it.
++   * @param pathPart The path part to check
++   * @return true if part is not dynamic
++   */
++  private boolean isPathPartStatic(String pathPart) {
++    if (knownVariables.contains(pathPart)) {
++      return false;
++    }
++
++    return true;
++  }
++
+   /**
+    * This method will add a known variable to the validation context, known
+    * variables can be used to determine if a path is static or dynamic.
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/placement/MappingRuleValidationHelper.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/placement/MappingRuleValidationHelper.java
+new file mode 100644
+index 000000000000..d23f73577d43
+--- /dev/null
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/placement/MappingRuleValidationHelper.java
+@@ -0,0 +1,153 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.yarn.server.resourcemanager.placement;
++
++import org.apache.hadoop.yarn.exceptions.YarnException;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CSQueue;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacitySchedulerQueueManager;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.ManagedParentQueue;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.ParentQueue;
++
++import java.util.ArrayList;
++import java.util.Collections;
++
++import static org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacitySchedulerConfiguration.DOT;
++
++/**
++ * This class' functionality needs to be merged into CapacityScheduler
++ * or CapacitySchedulerQueueManager, but that will include a lot of testcase
++ * changes, so temporarily the logic is extracted to this class.
++ */
++public final class MappingRuleValidationHelper {
++  public enum ValidationResult {
++    CREATABLE,
++    QUEUE_EXISTS,
++    NO_PARENT_PROVIDED,
++    NO_DYNAMIC_PARENT,
++    AMBIGUOUS_PARENT,
++    AMBIGUOUS_QUEUE,
++    EMPTY_PATH
++  }
++
++  /**
++   * Utility class hidden constructor.
++   */
++  private MappingRuleValidationHelper() {
++
++  }
++
++  public static String normalizeQueuePathRoot(
++      CapacitySchedulerQueueManager queueManager, String fullPath)
++      throws YarnException {
++    //Normalizing the root of the path
++    ArrayList<String> parts = new ArrayList<>();
++    Collections.addAll(parts, fullPath.split("\\."));
++
++    //the first element of the path is the path root
++    String pathRoot = parts.get(0);
++    CSQueue pathRootQueue = queueManager.getQueue(pathRoot);
++    if (pathRootQueue == null) {
++      if (queueManager.isAmbiguous(pathRoot)) {
++        throw new YarnException("Path root '" + pathRoot +
++            "' is ambiguous. Path '" + fullPath + "' is invalid");
++      } else {
++        throw new YarnException("Path root '" + pathRoot +
++            "' does not exist. Path '" + fullPath + "' is invalid");
++      }
++    }
++
++    //Normalizing the root
++    parts.set(0, pathRootQueue.getQueuePath());
++    return String.join(DOT, parts);
++  }
++
++  public static ValidationResult validateQueuePathAutoCreation(
++      CapacitySchedulerQueueManager queueManager, String path) {
++    //Some sanity checks, the empty path and existing queue can be checked easy
++    if (path == null || path.isEmpty()) {
++      return ValidationResult.EMPTY_PATH;
++    }
++
++    if (queueManager.getQueue(path) != null) {
++      return ValidationResult.QUEUE_EXISTS;
++    }
++
++    if (queueManager.isAmbiguous(path)) {
++      return ValidationResult.AMBIGUOUS_QUEUE;
++    }
++
++    //Creating the path of the parent queue and grand parent queue
++    ArrayList<String> parts = new ArrayList<>();
++    Collections.addAll(parts, path.split("\\."));
++
++    //dropping leaf name part of the path
++    parts.remove(parts.size() - 1);
++    String parentPath = parts.size() >= 1 ? String.join(".", parts) : "";
++    //dropping parent name part of the path
++    parts.remove(parts.size() - 1);
++    String grandParentPath = parts.size() >= 1 ? String.join(".", parts) : "";
++
++    if (parentPath.isEmpty()) {
++      return ValidationResult.NO_PARENT_PROVIDED;
++    }
++
++    if (queueManager.isAmbiguous(parentPath)) {
++      return ValidationResult.AMBIGUOUS_PARENT;
++    }
++    CSQueue parentQueue = queueManager.getQueue(parentPath);
++    if (parentQueue == null) {
++      if (grandParentPath.isEmpty()) {
++        return ValidationResult.NO_PARENT_PROVIDED;
++      }
++
++      if (queueManager.isAmbiguous(grandParentPath)) {
++        return ValidationResult.AMBIGUOUS_PARENT;
++      }
++      //if we don't have a valid parent queue, we need to check the grandparent
++      //if the grandparent allows new dynamic creation, the dynamic parent and
++      //the dynamic leaf queue can be created as well
++      CSQueue grandParentQueue = queueManager.getQueue(grandParentPath);
++      if (grandParentQueue != null && grandParentQueue instanceof ParentQueue &&
++          ((ParentQueue)grandParentQueue).isEligibleForAutoQueueCreation()) {
++        //Grandparent is a new dynamic parent queue, which allows deep queue
++        //creation
++        return ValidationResult.CREATABLE;
++      }
++
++      return ValidationResult.NO_DYNAMIC_PARENT;
++    }
++
++    //at this point we know we have a parent queue we just need to make sure
++    //it allows queue creation
++    if (parentQueue instanceof ManagedParentQueue) {
++      //Managed parent is the legacy way, so it will allow creation
++      return ValidationResult.CREATABLE;
++    }
++    if (parentQueue instanceof ParentQueue) {
++      //the new way of dynamic queue creation uses ParentQueues so we need to
++      //check if those queues allow dynamic queue creation
++      if (((ParentQueue)parentQueue).isEligibleForAutoQueueCreation()) {
++        return ValidationResult.CREATABLE;
++      }
++    }
++    //at this point we can be sure the parent does not support auto queue
++    //creation it's either being a leaf queue or a non-dynamic parent queue
++    return ValidationResult.NO_DYNAMIC_PARENT;
++  }
++}
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/placement/MockQueueHierarchyBuilder.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/placement/MockQueueHierarchyBuilder.java
+index ee167eecf334..f7c8a99ce38d 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/placement/MockQueueHierarchyBuilder.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/placement/MockQueueHierarchyBuilder.java
+@@ -21,7 +21,12 @@
+ import org.apache.hadoop.thirdparty.com.google.common.collect.Maps;
+ import org.apache.hadoop.thirdparty.com.google.common.collect.Sets;
+ import org.apache.commons.compress.utils.Lists;
+-import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.*;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.AbstractCSQueue;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CSQueue;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacitySchedulerQueueManager;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.LeafQueue;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.ManagedParentQueue;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.ParentQueue;
+ 
+ import java.util.ArrayList;
+ import java.util.List;
+@@ -36,6 +41,7 @@ class MockQueueHierarchyBuilder {
+   private static final String QUEUE_SEP = ".";
+   private List<String> queuePaths = Lists.newArrayList();
+   private List<String> managedParentQueues = Lists.newArrayList();
++  private List<String> dynamicParentQueues = Lists.newArrayList();
+   private Set<String> ambiguous = Sets.newHashSet();
+   private Map<String, String> shortNameMapping = Maps.newHashMap();
+   private CapacitySchedulerQueueManager queueManager;
+@@ -62,6 +68,12 @@ public MockQueueHierarchyBuilder withManagedParentQueue(
+     return this;
+   }
+ 
++  public MockQueueHierarchyBuilder withDynamicParentQueue(
++      String dynamicQueue) {
++    this.dynamicParentQueues.add(dynamicQueue);
++    return this;
++  }
++
+   public void build() {
+     if (this.queueManager == null) {
+       throw new IllegalStateException(
+@@ -77,6 +89,15 @@ public void build() {
+       }
+     }
+ 
++    for (String dynamicParentQueue : dynamicParentQueues) {
++      if (!queuePaths.contains(dynamicParentQueue)) {
++        queuePaths.add(dynamicParentQueue);
++      } else {
++        throw new IllegalStateException("Cannot add a dynamic parent " +
++            "and a simple queue with the same path");
++      }
++    }
++
+     Map<String, AbstractCSQueue> queues = Maps.newHashMap();
+     for (String queuePath : queuePaths) {
+       addQueues(queues, queuePath);
+@@ -128,10 +149,12 @@ private AbstractCSQueue createQueue(ParentQueue parentQueue,
+       return createRootQueue(ROOT);
+     } else if (managedParentQueues.contains(currentQueuePath)) {
+       return addManagedParentQueueAsChildOf(parentQueue, queueName);
++    } else if (dynamicParentQueues.contains(currentQueuePath)) {
++      return addParentQueueAsChildOf(parentQueue, queueName, true);
+     } else if (isLeaf) {
+       return addLeafQueueAsChildOf(parentQueue, queueName);
+     } else {
+-      return addParentQueueAsChildOf(parentQueue, queueName);
++      return addParentQueueAsChildOf(parentQueue, queueName, false);
+     }
+   }
+ 
+@@ -144,8 +167,9 @@ private AbstractCSQueue createRootQueue(String rootQueueName) {
+   }
+ 
+   private AbstractCSQueue addParentQueueAsChildOf(ParentQueue parent,
+-      String queueName) {
++      String queueName, boolean isDynamic) {
+     ParentQueue queue = mock(ParentQueue.class);
++    when(queue.isEligibleForAutoQueueCreation()).thenReturn(isDynamic);
+     setQueueFields(parent, queue, queueName);
+     return queue;
+   }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/placement/TestMappingRuleValidationContextImpl.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/placement/TestMappingRuleValidationContextImpl.java
+index d9ea7d5cc162..383f70eed651 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/placement/TestMappingRuleValidationContextImpl.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/placement/TestMappingRuleValidationContextImpl.java
+@@ -29,7 +29,7 @@
+ 
+ public class TestMappingRuleValidationContextImpl {
+   @Test
+-  public void testContextVariables() {
++  public void testContextVariables() throws YarnException {
+     //Setting up queue manager and emulated queue hierarchy
+     CapacitySchedulerQueueManager qm =
+         mock(CapacitySchedulerQueueManager.class);
+@@ -79,7 +79,7 @@ void assertValidPath(MappingRuleValidationContext ctx, String path) {
+     try {
+       ctx.validateQueuePath(path);
+     } catch (YarnException e) {
+-      fail("Path '" + path + "' should be VALID");
++      fail("Path '" + path + "' should be VALID: " + e);
+     }
+   }
+ 
+@@ -93,7 +93,7 @@ void assertInvalidPath(MappingRuleValidationContext ctx, String path) {
+   }
+ 
+   @Test
+-  public void testDynamicQueueValidation() {
++  public void testManagedQueueValidation() {
+     //Setting up queue manager and emulated queue hierarchy
+     CapacitySchedulerQueueManager qm =
+         mock(CapacitySchedulerQueueManager.class);
+@@ -123,12 +123,53 @@ public void testDynamicQueueValidation() {
+     assertValidPath(ctx, "managed.%dynamic");
+ 
+     assertInvalidPath(ctx, "root.invalid.%dynamic");
+-    assertInvalidPath(ctx, "root.umanaged.%dynamic");
++    assertInvalidPath(ctx, "root.unmanaged.%dynamic");
+ 
+     assertValidPath(ctx, "root.unmanagedwithchild.%user");
+     assertValidPath(ctx, "unmanagedwithchild.%user");
+   }
+ 
++  @Test
++  public void testDynamicQueueValidation() {
++    //Setting up queue manager and emulated queue hierarchy
++    CapacitySchedulerQueueManager qm =
++        mock(CapacitySchedulerQueueManager.class);
++
++    MockQueueHierarchyBuilder.create()
++        .withQueueManager(qm)
++        .withQueue("root.unmanaged")
++        .withDynamicParentQueue("root.managed")
++        .withQueue("root.unmanagedwithchild.child")
++        .withQueue("root.leaf")
++        .build();
++    when(qm.getQueue(isNull())).thenReturn(null);
++
++    MappingRuleValidationContextImpl ctx =
++        new MappingRuleValidationContextImpl(qm);
++    try {
++      ctx.addVariable("%dynamic");
++      ctx.addVariable("%user");
++    } catch (YarnException e) {
++      fail("We don't expect the add variable to fail: " + e.getMessage());
++    }
++
++    assertValidPath(ctx, "%dynamic");
++    assertValidPath(ctx, "root.%dynamic");
++    assertValidPath(ctx, "%user.%dynamic");
++    assertValidPath(ctx, "root.managed.%dynamic");
++    assertValidPath(ctx, "managed.%dynamic");
++    assertValidPath(ctx, "managed.static");
++    assertValidPath(ctx, "managed.static.%dynamic");
++    assertValidPath(ctx, "managed.static.%dynamic.%dynamic");
++
++    assertInvalidPath(ctx, "root.invalid.%dynamic");
++    assertInvalidPath(ctx, "root.unmanaged.%dynamic");
++
++    assertValidPath(ctx, "root.unmanagedwithchild.%user");
++    assertValidPath(ctx, "unmanagedwithchild.%user");
++  }
++
++
+   @Test
+   public void testStaticQueueValidation() {
+     //Setting up queue manager and emulated queue hierarchy
+@@ -142,6 +183,9 @@ public void testStaticQueueValidation() {
+         .withQueue("root.deep.queue.path")
+         .withQueue("root.ambi.ambileaf")
+         .withQueue("root.deep.ambi.ambileaf")
++        .withQueue("root.deep.ambi.very.deeepleaf")
++        .withDynamicParentQueue("root.dynamic")
++        .withQueue("root.dynamic.static.static")
+         .build();
+     when(qm.getQueue(isNull())).thenReturn(null);
+ 
+@@ -160,13 +204,22 @@ public void testStaticQueueValidation() {
+     assertInvalidPath(ctx, "ambi.ambileaf");
+     assertValidPath(ctx, "root.ambi.ambileaf");
+ 
++    assertInvalidPath(ctx, "root.dynamic.static");
++    assertValidPath(ctx, "root.dynamic.static.static");
++    //Invalid because static is already created as a non-dynamic parent queue
++    assertInvalidPath(ctx, "root.dynamic.static.any");
++    //Valid because 'any' is not created yet
++    assertValidPath(ctx, "root.dynamic.any.thing");
++    //Too deep, dynamic is the last dynamic parent
++    assertInvalidPath(ctx, "root.dynamic.any.thing.deep");
+ 
+     assertValidPath(ctx, "root.managed.a");
+     assertInvalidPath(ctx, "root.deep");
+     assertInvalidPath(ctx, "deep");
+     assertInvalidPath(ctx, "deep.queue");
+     assertInvalidPath(ctx, "root.deep.queue");
+-    assertInvalidPath(ctx, "deep.queue.path");
++    assertValidPath(ctx, "deep.queue.path");
++    assertInvalidPath(ctx, "ambi.very.deeepleaf");
+     assertValidPath(ctx, "queue.path");
+     assertInvalidPath(ctx, "queue.invalidPath");
+     assertValidPath(ctx, "path");
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestCapacitySchedulerAutoQueueCreation.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestCapacitySchedulerAutoQueueCreation.java
+index 300993b94750..4dc0fab16106 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestCapacitySchedulerAutoQueueCreation.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestCapacitySchedulerAutoQueueCreation.java
+@@ -436,7 +436,8 @@ public void testQueueMappingValidationFailsWithInvalidParentQueueInMapping()
+         //expected exception
+ 
+         assertTrue(e.getMessage().contains(
+-            "Target queue path 'a1.%user' has a non-managed parent queue"));
++            "Queue path 'a1.%user' is invalid because 'root.a.a1' " +
++                "is a leaf queue"));
+       }
+ 
+       //"a" is not auto create enabled and app_user does not exist as a leaf
+@@ -450,7 +451,7 @@ public void testQueueMappingValidationFailsWithInvalidParentQueueInMapping()
+       } catch (IOException e) {
+         //expected exception
+         assertTrue(e.getMessage().contains(
+-            "contains an invalid parent queue 'INVALID_PARENT_QUEUE'"));
++            "Path root 'INVALID_PARENT_QUEUE' does not exist."));
+       }
+     } finally {
+       if (newMockRM != null) {
+@@ -474,13 +475,14 @@ public void testQueueMappingUpdatesFailsOnRemovalOfParentQueueInMapping()
+       newCS.updatePlacementRules();
+ 
+       try {
+-        setupQueueMapping(newCS, CURRENT_USER_MAPPING, "",
++        setupQueueMapping(newCS, CURRENT_USER_MAPPING, "nonexistent",
+             CURRENT_USER_MAPPING);
+         newCS.updatePlacementRules();
+         fail("Expected invalid parent queue mapping failure");
+       } catch (IOException e) {
+         //expected exception
+-        assertTrue(e.getMessage().contains("invalid parent queue"));
++        assertTrue(
++            e.getMessage().contains("Path root 'nonexistent' does not exist."));
+       }
+     } finally {
+       if (newMockRM != null) {

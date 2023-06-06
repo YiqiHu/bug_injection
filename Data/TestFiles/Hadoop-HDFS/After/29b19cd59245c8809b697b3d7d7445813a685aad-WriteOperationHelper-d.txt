@@ -1,0 +1,425 @@
+
+
+package org.apache.hadoop.fs.s3a;
+
+import javax.annotation.Nullable;
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import com.amazonaws.services.s3.model.AmazonS3Exception;
+import com.amazonaws.services.s3.model.CompleteMultipartUploadRequest;
+import com.amazonaws.services.s3.model.CompleteMultipartUploadResult;
+import com.amazonaws.services.s3.model.InitiateMultipartUploadRequest;
+import com.amazonaws.services.s3.model.MultipartUpload;
+import com.amazonaws.services.s3.model.ObjectMetadata;
+import com.amazonaws.services.s3.model.PartETag;
+import com.amazonaws.services.s3.model.PutObjectRequest;
+import com.amazonaws.services.s3.model.PutObjectResult;
+import com.amazonaws.services.s3.model.SelectObjectContentRequest;
+import com.amazonaws.services.s3.model.SelectObjectContentResult;
+import com.amazonaws.services.s3.model.UploadPartRequest;
+import com.amazonaws.services.s3.model.UploadPartResult;
+import com.amazonaws.services.s3.transfer.model.UploadResult;
+import com.google.common.base.Preconditions;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.hadoop.classification.InterfaceAudience;
+import org.apache.hadoop.classification.InterfaceStability;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.PathIOException;
+import org.apache.hadoop.fs.s3a.s3guard.BulkOperationState;
+import org.apache.hadoop.fs.s3a.s3guard.S3Guard;
+import org.apache.hadoop.fs.s3a.select.SelectBinding;
+import org.apache.hadoop.util.DurationInfo;
+
+import static com.google.common.base.Preconditions.checkArgument;
+import static com.google.common.base.Preconditions.checkNotNull;
+import static org.apache.hadoop.fs.s3a.Invoker.*;
+import static org.apache.hadoop.fs.s3a.S3AUtils.longOption;
+import static org.apache.hadoop.fs.s3a.impl.InternalConstants.DEFAULT_UPLOAD_PART_COUNT_LIMIT;
+import static org.apache.hadoop.fs.s3a.impl.InternalConstants.UPLOAD_PART_COUNT_LIMIT;
+
+
+@InterfaceAudience.Private
+@InterfaceStability.Unstable
+public class WriteOperationHelper {
+  private static final Logger LOG =
+      LoggerFactory.getLogger(WriteOperationHelper.class);
+
+  
+  private final S3AFileSystem owner;
+
+  
+  private final Invoker invoker;
+
+  
+  private final Configuration conf;
+
+  
+  private final String bucket;
+
+  
+  protected WriteOperationHelper(S3AFileSystem owner, Configuration conf) {
+    this.owner = owner;
+    this.invoker = new Invoker(new S3ARetryPolicy(conf),
+        this::operationRetried);
+    this.conf = conf;
+    bucket = owner.getBucket();
+  }
+
+  
+  void operationRetried(String text, Exception ex, int retries,
+      boolean idempotent) {
+    owner.operationRetried(text, ex, retries, idempotent);
+  }
+
+  
+  public <T> T retry(String action,
+      String path,
+      boolean idempotent,
+      Invoker.Operation<T> operation)
+      throws IOException {
+
+    return invoker.retry(action, path, idempotent, operation);
+  }
+
+  
+  public PutObjectRequest createPutObjectRequest(String destKey,
+      InputStream inputStream, long length) {
+    return owner.newPutObjectRequest(destKey,
+        newObjectMetadata(length),
+        inputStream);
+  }
+
+  
+  public PutObjectRequest createPutObjectRequest(String dest,
+      File sourceFile) {
+    Preconditions.checkState(sourceFile.length() < Integer.MAX_VALUE,
+        "File length is too big for a single PUT upload");
+    return owner.newPutObjectRequest(dest,
+        newObjectMetadata((int) sourceFile.length()),
+        sourceFile);
+  }
+
+  
+  public void writeSuccessful(long length) {
+  }
+
+  
+  public void writeFailed(Exception ex) {
+    LOG.debug("Write to {} failed", this, ex);
+  }
+
+  
+  public ObjectMetadata newObjectMetadata(long length) {
+    return owner.newObjectMetadata(length);
+  }
+
+  
+  @Retries.RetryTranslated
+  public String initiateMultiPartUpload(String destKey) throws IOException {
+    LOG.debug("Initiating Multipart upload to {}", destKey);
+    final InitiateMultipartUploadRequest initiateMPURequest =
+        new InitiateMultipartUploadRequest(bucket,
+            destKey,
+            newObjectMetadata(-1));
+    initiateMPURequest.setCannedACL(owner.getCannedACL());
+    owner.setOptionalMultipartUploadRequestParameters(initiateMPURequest);
+
+    return retry("initiate MultiPartUpload", destKey, true,
+        () -> owner.initiateMultipartUpload(initiateMPURequest).getUploadId());
+  }
+
+  
+  @Retries.RetryTranslated
+  private CompleteMultipartUploadResult finalizeMultipartUpload(
+      String destKey,
+      String uploadId,
+      List<PartETag> partETags,
+      long length,
+      Retried retrying,
+      @Nullable BulkOperationState operationState) throws IOException {
+    if (partETags.isEmpty()) {
+      throw new IOException(
+          "No upload parts in multipart upload to " + destKey);
+    }
+    CompleteMultipartUploadResult uploadResult =
+        invoker.retry("Completing multipart commit", destKey,
+            true,
+            retrying,
+            () -> {
+              
+              
+              return owner.getAmazonS3Client().completeMultipartUpload(
+                  new CompleteMultipartUploadRequest(bucket,
+                      destKey,
+                      uploadId,
+                      new ArrayList<>(partETags)));
+            }
+    );
+    owner.finishedWrite(destKey, length, uploadResult.getETag(),
+        uploadResult.getVersionId(), operationState);
+    return uploadResult;
+  }
+
+  
+  @Retries.RetryTranslated
+  public CompleteMultipartUploadResult completeMPUwithRetries(
+      String destKey,
+      String uploadId,
+      List<PartETag> partETags,
+      long length,
+      AtomicInteger errorCount)
+      throws IOException {
+    checkNotNull(uploadId);
+    checkNotNull(partETags);
+    LOG.debug("Completing multipart upload {} with {} parts",
+        uploadId, partETags.size());
+    return finalizeMultipartUpload(destKey,
+        uploadId,
+        partETags,
+        length,
+        (text, e, r, i) -> errorCount.incrementAndGet(),
+        null);
+  }
+
+  
+  @Retries.RetryTranslated
+  public void abortMultipartUpload(String destKey, String uploadId,
+      Retried retrying)
+      throws IOException {
+    invoker.retry("Aborting multipart upload", destKey, true,
+        retrying,
+        () -> owner.abortMultipartUpload(
+            destKey,
+            uploadId));
+  }
+
+  
+  @Retries.RetryTranslated
+  public void abortMultipartUpload(MultipartUpload upload)
+      throws IOException {
+    invoker.retry("Aborting multipart commit", upload.getKey(), true,
+        () -> owner.abortMultipartUpload(upload));
+  }
+
+
+  
+  @Retries.RetryTranslated
+  public int abortMultipartUploadsUnderPath(String prefix)
+      throws IOException {
+    LOG.debug("Aborting multipart uploads under {}", prefix);
+    int count = 0;
+    List<MultipartUpload> multipartUploads = owner.listMultipartUploads(prefix);
+    LOG.debug("Number of outstanding uploads: {}", multipartUploads.size());
+    for (MultipartUpload upload: multipartUploads) {
+      try {
+        abortMultipartUpload(upload);
+        count++;
+      } catch (FileNotFoundException e) {
+        LOG.debug("Already aborted: {}", upload.getKey(), e);
+      }
+    }
+    return count;
+  }
+
+  
+  @Retries.RetryTranslated
+  public void abortMultipartCommit(String destKey, String uploadId)
+      throws IOException {
+    abortMultipartUpload(destKey, uploadId, invoker.getRetryCallback());
+  }
+
+  
+  public UploadPartRequest newUploadPartRequest(
+      String destKey,
+      String uploadId,
+      int partNumber,
+      int size,
+      InputStream uploadStream,
+      File sourceFile,
+      Long offset) throws PathIOException {
+    checkNotNull(uploadId);
+    
+    checkArgument((uploadStream != null) ^ (sourceFile != null),
+        "Data source");
+    checkArgument(size >= 0, "Invalid partition size %s", size);
+    checkArgument(partNumber > 0,
+        "partNumber must be between 1 and %s inclusive, but is %s",
+            DEFAULT_UPLOAD_PART_COUNT_LIMIT, partNumber);
+
+    LOG.debug("Creating part upload request for {} #{} size {}",
+        uploadId, partNumber, size);
+    long partCountLimit = longOption(conf,
+        UPLOAD_PART_COUNT_LIMIT,
+        DEFAULT_UPLOAD_PART_COUNT_LIMIT,
+        1);
+    if (partCountLimit != DEFAULT_UPLOAD_PART_COUNT_LIMIT) {
+      LOG.warn("Configuration property {} shouldn't be overridden by client",
+              UPLOAD_PART_COUNT_LIMIT);
+    }
+    final String pathErrorMsg = "Number of parts in multipart upload exceeded."
+        + " Current part count = %s, Part count limit = %s ";
+    if (partNumber > partCountLimit) {
+      throw new PathIOException(destKey,
+          String.format(pathErrorMsg, partNumber, partCountLimit));
+    }
+    UploadPartRequest request = new UploadPartRequest()
+        .withBucketName(bucket)
+        .withKey(destKey)
+        .withUploadId(uploadId)
+        .withPartNumber(partNumber)
+        .withPartSize(size);
+    if (uploadStream != null) {
+      
+      request.setInputStream(uploadStream);
+    } else {
+      checkArgument(sourceFile.exists(),
+          "Source file does not exist: %s", sourceFile);
+      checkArgument(offset >= 0, "Invalid offset %s", offset);
+      long length = sourceFile.length();
+      checkArgument(offset == 0 || offset < length,
+          "Offset %s beyond length of file %s", offset, length);
+      request.setFile(sourceFile);
+      request.setFileOffset(offset);
+    }
+    return request;
+  }
+
+  
+  @Override
+  public String toString() {
+    final StringBuilder sb = new StringBuilder(
+        "WriteOperationHelper {bucket=").append(bucket);
+    sb.append('}');
+    return sb.toString();
+  }
+
+  
+  @Retries.RetryTranslated
+  public PutObjectResult putObject(PutObjectRequest putObjectRequest)
+      throws IOException {
+    return retry("Writing Object",
+        putObjectRequest.getKey(), true,
+        () -> owner.putObjectDirect(putObjectRequest));
+  }
+
+  
+  @Retries.RetryTranslated
+  public UploadResult uploadObject(PutObjectRequest putObjectRequest)
+      throws IOException {
+    
+    return retry("Writing Object",
+        putObjectRequest.getKey(), true,
+        () -> owner.executePut(putObjectRequest, null));
+  }
+
+  
+  @Retries.OnceTranslated
+  public void revertCommit(String destKey,
+      @Nullable BulkOperationState operationState) throws IOException {
+    once("revert commit", destKey,
+        () -> {
+          Path destPath = owner.keyToQualifiedPath(destKey);
+          owner.deleteObjectAtPath(destPath,
+              destKey, true, operationState);
+          owner.maybeCreateFakeParentDirectory(destPath);
+        }
+    );
+  }
+
+  
+  @Retries.RetryTranslated
+  public CompleteMultipartUploadResult commitUpload(
+      String destKey,
+      String uploadId,
+      List<PartETag> partETags,
+      long length,
+      @Nullable BulkOperationState operationState)
+      throws IOException {
+    checkNotNull(uploadId);
+    checkNotNull(partETags);
+    LOG.debug("Completing multipart upload {} with {} parts",
+        uploadId, partETags.size());
+    return finalizeMultipartUpload(destKey,
+        uploadId,
+        partETags,
+        length,
+        Invoker.NO_OP,
+        operationState);
+  }
+
+  
+  public BulkOperationState initiateCommitOperation(
+      Path path) throws IOException {
+    return S3Guard.initiateBulkWrite(owner.getMetadataStore(),
+        BulkOperationState.OperationType.Commit, path);
+  }
+
+  
+  @Retries.RetryTranslated
+  public UploadPartResult uploadPart(UploadPartRequest request)
+      throws IOException {
+    return retry("upload part",
+        request.getKey(),
+        true,
+        () -> owner.uploadPart(request));
+  }
+
+  
+  public Configuration getConf() {
+    return conf;
+  }
+
+  
+  public SelectObjectContentRequest newSelectRequest(Path path) {
+    SelectObjectContentRequest request = new SelectObjectContentRequest();
+    request.setBucketName(bucket);
+    request.setKey(owner.pathToKey(path));
+    return request;
+  }
+
+  
+  @Retries.RetryTranslated
+  public SelectObjectContentResult select(
+      final Path source,
+      final SelectObjectContentRequest request,
+      final String action)
+      throws IOException {
+    String bucketName = request.getBucketName();
+    Preconditions.checkArgument(bucket.equals(bucketName),
+        "wrong bucket: %s", bucketName);
+    if (LOG.isDebugEnabled()) {
+      LOG.debug("Initiating select call {} {}",
+          source, request.getExpression());
+      LOG.debug(SelectBinding.toString(request));
+    }
+    return invoker.retry(
+        action,
+        source.toString(),
+        true,
+        () -> {
+          try (DurationInfo ignored =
+                   new DurationInfo(LOG, "S3 Select operation")) {
+            try {
+              return owner.getAmazonS3Client().selectObjectContent(request);
+            } catch (AmazonS3Exception e) {
+              LOG.error("Failure of S3 Select request against {}",
+                  source);
+              LOG.debug("S3 Select request against {}:\n{}",
+                  source,
+                  SelectBinding.toString(request),
+                  e);
+              throw e;
+            }
+          }
+        });
+  }
+}

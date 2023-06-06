@@ -1,0 +1,171 @@
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api/src/main/java/org/apache/hadoop/yarn/conf/YarnConfiguration.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api/src/main/java/org/apache/hadoop/yarn/conf/YarnConfiguration.java
+index be9c49fa482d..763b3e031701 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api/src/main/java/org/apache/hadoop/yarn/conf/YarnConfiguration.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api/src/main/java/org/apache/hadoop/yarn/conf/YarnConfiguration.java
+@@ -4076,6 +4076,11 @@ public static boolean isAclEnabled(Configuration conf) {
+   public static final String FS_NODE_LABELS_STORE_ROOT_DIR = NODE_LABELS_PREFIX
+       + "fs-store.root-dir";
+ 
++  /** FS store file replication. */
++  public static final String FS_STORE_FILE_REPLICATION = YARN_PREFIX
++      + "fs-store.file.replication";
++  public static final int DEFAULT_FS_STORE_FILE_REPLICATION = 0;
++
+   /**
+    * Node-attribute configurations.
+    */
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/nodelabels/store/AbstractFSNodeStore.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/nodelabels/store/AbstractFSNodeStore.java
+index d0fb837a2da7..81514942af0f 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/nodelabels/store/AbstractFSNodeStore.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/nodelabels/store/AbstractFSNodeStore.java
+@@ -27,6 +27,7 @@
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.io.IOUtils;
+ import org.apache.hadoop.yarn.nodelabels.store.op.FSNodeStoreLogOp;
++import org.apache.hadoop.yarn.conf.YarnConfiguration;
+ import org.apache.hadoop.yarn.nodelabels.store.FSStoreOpHandler.StoreType;
+ 
+ import java.io.EOFException;
+@@ -47,6 +48,7 @@
+   private FSDataOutputStream editlogOs;
+ 
+   private Path editLogPath;
++  private int replication;
+   private StoreSchema schema;
+ 
+   protected M manager;
+@@ -65,6 +67,8 @@ protected void initStore(Configuration conf, Path fsStorePath,
+     initFileSystem(conf);
+     // mkdir of root dir path
+     fs.mkdirs(fsWorkingPath);
++    this.replication = conf.getInt(YarnConfiguration.FS_STORE_FILE_REPLICATION,
++        YarnConfiguration.DEFAULT_FS_STORE_FILE_REPLICATION);
+     LOG.info("Created store directory :" + fsWorkingPath);
+   }
+ 
+@@ -162,6 +166,7 @@ protected void recoverFromStore() throws IOException {
+       StoreOp op = FSStoreOpHandler.getMirrorOp(storeType);
+       op.write(os, manager);
+     }
++    checkAvailability(writingMirrorPath);
+     // Move mirror to mirror.old
+     if (fs.exists(mirrorPath)) {
+       fs.delete(oldMirrorPath, false);
+@@ -178,11 +183,27 @@ protected void recoverFromStore() throws IOException {
+     // create a new editlog file
+     editlogOs = fs.create(editLogPath, true);
+     editlogOs.close();
+-
++    checkAvailability(editLogPath);
+     LOG.info("Finished write mirror at:" + mirrorPath.toString());
+     LOG.info("Finished create editlog file at:" + editLogPath.toString());
+   }
+ 
++  /**
++   * Make sure replica is highly available. It will avoid setting replication,
++   * if the value configured for
++   * {@link YarnConfiguration#FS_STORE_FILE_REPLICATION} is 0.
++   */
++  private void checkAvailability(Path file) throws IOException {
++    try {
++      if (replication != 0
++          && fs.getFileStatus(file).getReplication() < replication) {
++        fs.setReplication(file, (short) replication);
++      }
++    } catch (UnsupportedOperationException e) {
++      LOG.error("Failed set replication for a file : {}", file);
++    }
++  }
++
+   protected void loadManagerFromEditLog(Path editPath) throws IOException {
+     if (!fs.exists(editPath)) {
+       return;
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/resources/yarn-default.xml b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/resources/yarn-default.xml
+index 65bdcf4bfd0e..815ddd307361 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/resources/yarn-default.xml
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/resources/yarn-default.xml
+@@ -3804,6 +3804,14 @@
+     <value>org.apache.hadoop.yarn.nodelabels.FileSystemNodeLabelsStore</value>
+   </property>
+ 
++  <property>
++    <description>The replication factor for the FS store
++     files. Default value is 0, means it will use file system
++      default replication.</description>
++    <name>yarn.fs-store.file.replication</name>
++    <value>0</value>
++  </property>
++
+   <property>
+     <description>
+       Enable the CSRF filter for the RM web app
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/nodelabels/TestNodeLabelFileReplication.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/nodelabels/TestNodeLabelFileReplication.java
+new file mode 100644
+index 000000000000..b1cdc93a8757
+--- /dev/null
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/nodelabels/TestNodeLabelFileReplication.java
+@@ -0,0 +1,64 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.yarn.server.resourcemanager.nodelabels;
++
++import java.io.IOException;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hdfs.MiniDFSCluster;
++import org.apache.hadoop.yarn.conf.YarnConfiguration;
++import org.apache.hadoop.yarn.nodelabels.CommonNodeLabelsManager;
++import org.junit.Assert;
++import org.junit.Test;
++
++public class TestNodeLabelFileReplication {
++
++  @Test
++  public void testNodeLabelFileReplication() throws IOException {
++    int expectedReplication = 10;
++    Configuration conf = new Configuration();
++    conf.setBoolean(YarnConfiguration.NODE_LABELS_ENABLED, true);
++    conf.setInt(YarnConfiguration.FS_STORE_FILE_REPLICATION,
++        expectedReplication);
++    MiniDFSCluster cluster = null;
++    try {
++      cluster = new MiniDFSCluster.Builder(new Configuration()).numDataNodes(1)
++          .build();
++      FileSystem fs = cluster.getFileSystem();
++      String nodeLabelDir = fs.getUri().toString() + "/nodelabel";
++      conf.set(YarnConfiguration.FS_NODE_LABELS_STORE_ROOT_DIR, nodeLabelDir);
++      CommonNodeLabelsManager manager = new CommonNodeLabelsManager();
++      manager.init(conf);
++      manager.start();
++      int fileReplication = fs
++          .getFileStatus(new Path(nodeLabelDir, "nodelabel.mirror"))
++          .getReplication();
++      Assert.assertEquals(
++          "Node label file replication should be " + expectedReplication,
++          expectedReplication, fileReplication);
++      manager.close();
++    } finally {
++      if (cluster != null) {
++        cluster.shutdown();
++      }
++    }
++  }
++}

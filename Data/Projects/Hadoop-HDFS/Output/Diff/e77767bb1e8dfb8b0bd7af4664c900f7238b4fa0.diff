@@ -1,0 +1,770 @@
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/Constants.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/Constants.java
+index 561ab4a84a7c..0ca4aa01a7e5 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/Constants.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/Constants.java
+@@ -481,6 +481,20 @@ private Constants() {
+       "fs.s3a.metadatastore.authoritative";
+   public static final boolean DEFAULT_METADATASTORE_AUTHORITATIVE = false;
+ 
++  /**
++   * Bucket validation parameter which can be set by client. This will be
++   * used in {@code S3AFileSystem.initialize(URI, Configuration)}.
++   * Value: {@value}
++   */
++  public static final String S3A_BUCKET_PROBE = "fs.s3a.bucket.probe";
++
++  /**
++   * Default value of bucket validation parameter. An existence of bucket
++   * will be validated using {@code S3AFileSystem.verifyBucketExistsV2()}.
++   * Value: {@value}
++   */
++  public static final int S3A_BUCKET_PROBE_DEFAULT = 2;
++
+   /**
+    * How long a directory listing in the MS is considered as authoritative.
+    */
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
+index ce7729fa396e..1e5175c1545f 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
+@@ -173,6 +173,7 @@
+ import static org.apache.hadoop.fs.s3a.auth.delegation.S3ADelegationTokens.hasDelegationTokenBinding;
+ import static org.apache.hadoop.fs.s3a.impl.CallableSupplier.submit;
+ import static org.apache.hadoop.fs.s3a.impl.CallableSupplier.waitForCompletionIgnoringExceptions;
++import static org.apache.hadoop.fs.s3a.impl.ErrorTranslation.isUnknownBucket;
+ import static org.apache.hadoop.fs.s3a.impl.InternalConstants.SC_404;
+ import static org.apache.hadoop.fs.s3a.impl.NetworkBinding.fixBucketRegion;
+ import static org.apache.hadoop.io.IOUtils.cleanupWithLogger;
+@@ -392,9 +393,7 @@ public void initialize(URI name, Configuration originalConf)
+       initCannedAcls(conf);
+ 
+       // This initiates a probe against S3 for the bucket existing.
+-      // It is where all network and authentication configuration issues
+-      // surface, and is potentially slow.
+-      verifyBucketExists();
++      doBucketProbing();
+ 
+       inputPolicy = S3AInputPolicy.getPolicy(
+           conf.getTrimmed(INPUT_FADVISE, INPUT_FADV_NORMAL));
+@@ -463,6 +462,41 @@ public void initialize(URI name, Configuration originalConf)
+ 
+   }
+ 
++  /**
++   * Test bucket existence in S3.
++   * When the value of {@link Constants#S3A_BUCKET_PROBE} is set to 0,
++   * bucket existence check is not done to improve performance of
++   * S3AFileSystem initialization. When set to 1 or 2, bucket existence check
++   * will be performed which is potentially slow.
++   * If 3 or higher: warn and use the v2 check.
++   * @throws UnknownStoreException the bucket is absent
++   * @throws IOException any other problem talking to S3
++   */
++  @Retries.RetryTranslated
++  private void doBucketProbing() throws IOException {
++    int bucketProbe = getConf()
++            .getInt(S3A_BUCKET_PROBE, S3A_BUCKET_PROBE_DEFAULT);
++    Preconditions.checkArgument(bucketProbe >= 0,
++            "Value of " + S3A_BUCKET_PROBE + " should be >= 0");
++    switch (bucketProbe) {
++    case 0:
++      LOG.debug("skipping check for bucket existence");
++      break;
++    case 1:
++      verifyBucketExists();
++      break;
++    case 2:
++      verifyBucketExistsV2();
++      break;
++    default:
++      // we have no idea what this is, assume it is from a later release.
++      LOG.warn("Unknown bucket probe option {}: {}; falling back to check #2",
++          S3A_BUCKET_PROBE, bucketProbe);
++      verifyBucketExistsV2();
++      break;
++    }
++  }
++
+   /**
+    * Initialize the thread pool.
+    * This must be re-invoked after replacing the S3Client during test
+@@ -510,15 +544,31 @@ protected static S3AStorageStatistics createStorageStatistics() {
+    * Verify that the bucket exists. This does not check permissions,
+    * not even read access.
+    * Retry policy: retrying, translated.
+-   * @throws FileNotFoundException the bucket is absent
++   * @throws UnknownStoreException the bucket is absent
+    * @throws IOException any other problem talking to S3
+    */
+   @Retries.RetryTranslated
+   protected void verifyBucketExists()
+-      throws FileNotFoundException, IOException {
++      throws UnknownStoreException, IOException {
+     if (!invoker.retry("doesBucketExist", bucket, true,
+         () -> s3.doesBucketExist(bucket))) {
+-      throw new FileNotFoundException("Bucket " + bucket + " does not exist");
++      throw new UnknownStoreException("Bucket " + bucket + " does not exist");
++    }
++  }
++
++  /**
++   * Verify that the bucket exists. This will correctly throw an exception
++   * when credentials are invalid.
++   * Retry policy: retrying, translated.
++   * @throws UnknownStoreException the bucket is absent
++   * @throws IOException any other problem talking to S3
++   */
++  @Retries.RetryTranslated
++  protected void verifyBucketExistsV2()
++          throws UnknownStoreException, IOException {
++    if (!invoker.retry("doesBucketExistV2", bucket, true,
++        () -> s3.doesBucketExistV2(bucket))) {
++      throw new UnknownStoreException("Bucket " + bucket + " does not exist");
+     }
+   }
+ 
+@@ -2891,7 +2941,7 @@ S3AFileStatus s3GetFileStatus(final Path path,
+         } catch (AmazonServiceException e) {
+           // if the response is a 404 error, it just means that there is
+           // no file at that path...the remaining checks will be needed.
+-          if (e.getStatusCode() != SC_404) {
++          if (e.getStatusCode() != SC_404 || isUnknownBucket(e)) {
+             throw translateException("getFileStatus", path, e);
+           }
+         } catch (AmazonClientException e) {
+@@ -2923,7 +2973,7 @@ S3AFileStatus s3GetFileStatus(final Path path,
+                     meta.getVersionId());
+           }
+         } catch (AmazonServiceException e) {
+-          if (e.getStatusCode() != SC_404) {
++          if (e.getStatusCode() != SC_404 || isUnknownBucket(e)) {
+             throw translateException("getFileStatus", newKey, e);
+           }
+         } catch (AmazonClientException e) {
+@@ -2962,7 +3012,7 @@ S3AFileStatus s3GetFileStatus(final Path path,
+           return new S3AFileStatus(Tristate.TRUE, path, username);
+         }
+       } catch (AmazonServiceException e) {
+-        if (e.getStatusCode() != SC_404) {
++        if (e.getStatusCode() != SC_404 || isUnknownBucket(e)) {
+           throw translateException("getFileStatus", path, e);
+         }
+       } catch (AmazonClientException e) {
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3ARetryPolicy.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3ARetryPolicy.java
+index 09e9c993b065..d2954b3a9204 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3ARetryPolicy.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3ARetryPolicy.java
+@@ -188,6 +188,7 @@ protected Map<Class<? extends Exception>, RetryPolicy> createExceptionMap() {
+     policyMap.put(AccessDeniedException.class, fail);
+     policyMap.put(NoAuthWithAWSException.class, fail);
+     policyMap.put(FileNotFoundException.class, fail);
++    policyMap.put(UnknownStoreException.class, fail);
+     policyMap.put(InvalidRequestException.class, fail);
+ 
+     // metadata stores should do retries internally when it makes sense
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AUtils.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AUtils.java
+index e2a488e8fed9..3775848fc8da 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AUtils.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AUtils.java
+@@ -86,6 +86,7 @@
+ 
+ import static org.apache.commons.lang3.StringUtils.isEmpty;
+ import static org.apache.hadoop.fs.s3a.Constants.*;
++import static org.apache.hadoop.fs.s3a.impl.ErrorTranslation.isUnknownBucket;
+ import static org.apache.hadoop.fs.s3a.impl.MultiObjectDeleteSupport.translateDeleteException;
+ import static org.apache.hadoop.io.IOUtils.cleanupWithLogger;
+ 
+@@ -249,6 +250,18 @@ public static IOException translateException(@Nullable String operation,
+ 
+       // the object isn't there
+       case 404:
++        if (isUnknownBucket(ase)) {
++          // this is a missing bucket
++          ioe = new UnknownStoreException(path, ase);
++        } else {
++          // a normal unknown object
++          ioe = new FileNotFoundException(message);
++          ioe.initCause(ase);
++        }
++        break;
++
++      // this also surfaces sometimes and is considered to
++      // be ~ a not found exception.
+       case 410:
+         ioe = new FileNotFoundException(message);
+         ioe.initCause(ase);
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/UnknownStoreException.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/UnknownStoreException.java
+new file mode 100644
+index 000000000000..0129005e0674
+--- /dev/null
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/UnknownStoreException.java
+@@ -0,0 +1,57 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.fs.s3a;
++
++import java.io.IOException;
++
++import org.apache.hadoop.classification.InterfaceAudience;
++import org.apache.hadoop.classification.InterfaceStability;
++
++/**
++ * The bucket or other AWS resource is unknown.
++ *
++ * Why not a subclass of FileNotFoundException?
++ * There's too much code which caches an FNFE and infers that the file isn't
++ * there - a missing bucket is far more significant and generally should
++ * not be ignored.
++ */
++@InterfaceAudience.Public
++@InterfaceStability.Evolving
++public class UnknownStoreException extends IOException {
++
++  /**
++   * Constructor.
++   * @param message message
++   */
++  public UnknownStoreException(final String message) {
++    this(message, null);
++  }
++
++  /**
++   * Constructor.
++   * @param message message
++   * @param cause cause (may be null)
++   */
++  public UnknownStoreException(final String message, Throwable cause) {
++    super(message);
++    if (cause != null) {
++      initCause(cause);
++    }
++  }
++}
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/impl/ErrorTranslation.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/impl/ErrorTranslation.java
+new file mode 100644
+index 000000000000..d1baf3c89873
+--- /dev/null
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/impl/ErrorTranslation.java
+@@ -0,0 +1,73 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.fs.s3a.impl;
++
++import com.amazonaws.AmazonServiceException;
++
++import static org.apache.hadoop.fs.s3a.impl.InternalConstants.SC_404;
++
++/**
++ * Translate from AWS SDK-wrapped exceptions into IOExceptions with
++ * as much information as possible.
++ * The core of the translation logic is in S3AUtils, in
++ * {@code translateException} and nearby; that has grown to be
++ * a large a complex piece of logic, as it ties in with retry/recovery
++ * policies, throttling, etc.
++ *
++ * This class is where future expansion of that code should go so that we have
++ * an isolated place for all the changes..
++ * The existing code las been left in S3AUtils it is to avoid cherry-picking
++ * problems on backports.
++ */
++public class ErrorTranslation {
++
++  /**
++   * Private constructor for utility class.
++   */
++  private ErrorTranslation() {
++  }
++
++  /**
++   * Does this exception indicate that the AWS Bucket was unknown.
++   * @param e exception.
++   * @return true if the status code and error code mean that the
++   * remote bucket is unknown.
++   */
++  public static boolean isUnknownBucket(AmazonServiceException e) {
++    return e.getStatusCode() == SC_404
++        && AwsErrorCodes.E_NO_SUCH_BUCKET.equals(e.getErrorCode());
++  }
++
++  /**
++   * AWS error codes explicitly recognized and processes specially;
++   * kept in their own class for isolation.
++   */
++  public static final class AwsErrorCodes {
++
++    /**
++     * The AWS S3 error code used to recognize when a 404 means the bucket is
++     * unknown.
++     */
++    public static final String E_NO_SUCH_BUCKET = "NoSuchBucket";
++
++    /** private constructor. */
++    private AwsErrorCodes() {
++    }
++  }
++}
+diff --git a/hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/index.md b/hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/index.md
+index 9697e7ac40f1..aec778e96fb5 100644
+--- a/hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/index.md
++++ b/hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/index.md
+@@ -1000,6 +1000,26 @@ options are covered in [Testing](./testing.md).
+   converged to Integer.MAX_VALUE milliseconds
+   </description>
+ </property>
++
++<property>
++  <name>fs.s3a.bucket.probe</name>
++  <value>2</value>
++  <description>
++     The value can be 0, 1 or 2 (default).
++     When set to 0, bucket existence checks won't be done
++     during initialization thus making it faster.
++     Though it should be noted that when the bucket is not available in S3,
++     or if fs.s3a.endpoint points to the wrong instance of a private S3 store
++     consecutive calls like listing, read, write etc. will fail with
++     an UnknownStoreException.
++     When set to 1, the bucket existence check will be done using the
++     V1 API of the S3 protocol which doesn't verify the client's permissions
++     to list or read data in the bucket.
++     When set to 2, the bucket existence check will be done using the
++     V2 API of the S3 protocol which does verify that the
++     client has permission to read the bucket.
++  </description>
++</property>
+ ```
+ 
+ ## <a name="retry_and_recovery"></a>Retry and Recovery
+diff --git a/hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/performance.md b/hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/performance.md
+index 5543263471e7..6ca606081068 100644
+--- a/hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/performance.md
++++ b/hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/performance.md
+@@ -608,3 +608,19 @@ with HADOOP-15669.
+ 
+ Other options may be added to `fs.s3a.ssl.channel.mode` in the future as
+ further SSL optimizations are made.
++
++## Tuning FileSystem Initialization.
++
++When an S3A Filesystem instance is created and initialized, the client
++checks if the bucket provided is valid. This can be slow.
++You can ignore bucket validation by configuring `fs.s3a.bucket.probe` as follows:
++
++```xml
++<property>
++  <name>fs.s3a.bucket.probe</name>
++  <value>0</value>
++</property>
++```
++
++Note: if the bucket does not exist, this issue will surface when operations are performed
++on the filesystem; you will see `UnknownStoreException` stack traces.
+diff --git a/hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/troubleshooting_s3a.md b/hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/troubleshooting_s3a.md
+index 5408c44aea4a..47bc81e0ec4b 100644
+--- a/hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/troubleshooting_s3a.md
++++ b/hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/troubleshooting_s3a.md
+@@ -1203,29 +1203,44 @@ a new one than read to the end of a large file.
+ Note: the threshold when data is read rather than the stream aborted can be tuned
+ by `fs.s3a.readahead.range`; seek policy in `fs.s3a.experimental.input.fadvise`.
+ 
+-### <a name="no_such_bucket"></a> `FileNotFoundException` Bucket does not exist.
++### <a name="no_such_bucket"></a> `UnknownStoreException` Bucket does not exist.
+ 
+ The bucket does not exist.
+ 
+ ```
+-java.io.FileNotFoundException: Bucket stevel45r56666 does not exist
+-  at org.apache.hadoop.fs.s3a.S3AFileSystem.verifyBucketExists(S3AFileSystem.java:361)
+-  at org.apache.hadoop.fs.s3a.S3AFileSystem.initialize(S3AFileSystem.java:293)
+-  at org.apache.hadoop.fs.FileSystem.createFileSystem(FileSystem.java:3288)
+-  at org.apache.hadoop.fs.FileSystem.access$200(FileSystem.java:123)
+-  at org.apache.hadoop.fs.FileSystem$Cache.getInternal(FileSystem.java:3337)
+-  at org.apache.hadoop.fs.FileSystem$Cache.getUnique(FileSystem.java:3311)
+-  at org.apache.hadoop.fs.FileSystem.newInstance(FileSystem.java:529)
+-  at org.apache.hadoop.fs.s3a.s3guard.S3GuardTool$BucketInfo.run(S3GuardTool.java:997)
+-  at org.apache.hadoop.fs.s3a.s3guard.S3GuardTool.run(S3GuardTool.java:309)
+-  at org.apache.hadoop.util.ToolRunner.run(ToolRunner.java:76)
+-  at org.apache.hadoop.fs.s3a.s3guard.S3GuardTool.run(S3GuardTool.java:1218)
+-  at org.apache.hadoop.fs.s3a.s3guard.S3GuardTool.main(S3GuardTool.java:1227)
++org.apache.hadoop.fs.s3a.UnknownStoreException:
++        Bucket random-bucket-33013fb8-f7f7-4edb-9c26-16a6ed019184 does not exist
++    at org.apache.hadoop.fs.s3a.S3AFileSystem.verifyBucketExists(S3AFileSystem.java:537)
++    at org.apache.hadoop.fs.s3a.S3AFileSystem.doBucketProbing(S3AFileSystem.java:471)
++    at org.apache.hadoop.fs.s3a.S3AFileSystem.initialize(S3AFileSystem.java:387)
++    at org.apache.hadoop.fs.FileSystem.createFileSystem(FileSystem.java:3422)
++    at org.apache.hadoop.fs.FileSystem.get(FileSystem.java:502)
+ ```
+ 
++Check the URI is correct, and that the bucket actually exists.
+ 
+-Check the URI. If using a third-party store, verify that you've configured
++If using a third-party store, verify that you've configured
+ the client to talk to the specific server in `fs.s3a.endpoint`.
++Forgetting to update this value and asking the AWS S3 endpoint
++for a bucket is not an unusual occurrence.
++
++This can surface during filesystem API calls if the bucket is deleted while you are using it,
++ -or the startup check for bucket existence has been disabled by setting `fs.s3a.bucket.probe` to 0.
++
++```
++org.apache.hadoop.fs.s3a.UnknownStoreException: s3a://random-bucket-7d9217b0-b426-4344-82ea-25d6cbb316f1/
++
++    at org.apache.hadoop.fs.s3a.S3AUtils.translateException(S3AUtils.java:254)
++    at org.apache.hadoop.fs.s3a.S3AUtils.translateException(S3AUtils.java:167)
++    at org.apache.hadoop.fs.s3a.S3AFileSystem.innerListFiles(S3AFileSystem.java:4149)
++    at org.apache.hadoop.fs.s3a.S3AFileSystem.listFiles(S3AFileSystem.java:3983)
++Caused by: com.amazonaws.services.s3.model.AmazonS3Exception:
++The specified bucket does not exist
++ (Service: Amazon S3; Status Code: 404; Error Code: NoSuchBucket
++    at com.amazonaws.http.AmazonHttpClient$RequestExecutor.handleErrorResponse(AmazonHttpClient.java:1712)
++    at com.amazonaws.http.AmazonHttpClient$RequestExecutor.executeOneRequest(AmazonHttpClient.java:1367)
++```
++
+ 
+ ## Other Issues
+ 
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/AbstractS3AMockTest.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/AbstractS3AMockTest.java
+index 886795a9d90f..99bab73e71c3 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/AbstractS3AMockTest.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/AbstractS3AMockTest.java
+@@ -75,6 +75,7 @@ public Configuration createConfiguration() {
+     conf.setBoolean(CommitConstants.MAGIC_COMMITTER_ENABLED, true);
+     // use minimum multipart size for faster triggering
+     conf.setLong(Constants.MULTIPART_SIZE, MULTIPART_MIN_SIZE);
++    conf.setInt(Constants.S3A_BUCKET_PROBE, 1);
+     return conf;
+   }
+ 
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3ABucketExistence.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3ABucketExistence.java
+new file mode 100644
+index 000000000000..6be9003e4ec3
+--- /dev/null
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3ABucketExistence.java
+@@ -0,0 +1,170 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.fs.s3a;
++
++import java.net.URI;
++import java.util.UUID;
++import java.util.concurrent.Callable;
++
++import org.junit.Test;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.io.IOUtils;
++import org.apache.hadoop.test.LambdaTestUtils;
++
++import static org.apache.hadoop.fs.contract.ContractTestUtils.dataset;
++import static org.apache.hadoop.fs.contract.ContractTestUtils.writeDataset;
++import static org.apache.hadoop.fs.s3a.Constants.FS_S3A;
++import static org.apache.hadoop.fs.s3a.Constants.S3A_BUCKET_PROBE;
++import static org.apache.hadoop.fs.s3a.Constants.S3GUARD_METASTORE_NULL;
++import static org.apache.hadoop.fs.s3a.Constants.S3_METADATA_STORE_IMPL;
++import static org.apache.hadoop.test.LambdaTestUtils.intercept;
++
++/**
++ * Class to test bucket existence APIs.
++ */
++public class ITestS3ABucketExistence extends AbstractS3ATestBase {
++
++  private FileSystem fs;
++
++  private final String randomBucket =
++          "random-bucket-" + UUID.randomUUID().toString();
++
++  private final URI uri = URI.create(FS_S3A + "://" + randomBucket + "/");
++
++  @SuppressWarnings("deprecation")
++  @Test
++  public void testNoBucketProbing() throws Exception {
++    describe("Disable init-time probes and expect FS operations to fail");
++    Configuration conf = createConfigurationWithProbe(0);
++    // metastores can bypass S3 checks, so disable S3Guard, always
++    conf.set(S3_METADATA_STORE_IMPL, S3GUARD_METASTORE_NULL);
++
++    fs = FileSystem.get(uri, conf);
++
++    Path root = new Path(uri);
++
++    expectUnknownStore(
++        () -> fs.getFileStatus(root));
++
++    expectUnknownStore(
++        () -> fs.listStatus(root));
++
++    Path src = new Path(root, "testfile");
++    Path dest = new Path(root, "dst");
++    expectUnknownStore(
++        () -> fs.getFileStatus(src));
++
++    // the exception must not be caught and marked down to an FNFE
++    expectUnknownStore(() -> fs.exists(src));
++    expectUnknownStore(() -> fs.isFile(src));
++    expectUnknownStore(() -> fs.isDirectory(src));
++    expectUnknownStore(() -> fs.mkdirs(src));
++    expectUnknownStore(() -> fs.delete(src));
++    expectUnknownStore(() -> fs.rename(src, dest));
++
++    byte[] data = dataset(1024, 'a', 'z');
++    expectUnknownStore(
++        () -> writeDataset(fs, src, data, data.length, 1024 * 1024, true));
++  }
++
++  /**
++   * Expect an operation to raise an UnknownStoreException.
++   * @param eval closure
++   * @param <T> return type of closure
++   * @throws Exception anything else raised.
++   */
++  public static <T> void expectUnknownStore(
++      Callable<T> eval)
++      throws Exception {
++    intercept(UnknownStoreException.class, eval);
++  }
++
++  /**
++   * Expect an operation to raise an UnknownStoreException.
++   * @param eval closure
++   * @throws Exception anything else raised.
++   */
++  public static void expectUnknownStore(
++      LambdaTestUtils.VoidCallable eval)
++      throws Exception {
++    intercept(UnknownStoreException.class, eval);
++  }
++
++  /**
++   * Create a new configuration with the given bucket probe;
++   * we also disable FS caching.
++   * @param probe value to use as the bucket probe.
++   * @return a configuration.
++   */
++  private Configuration createConfigurationWithProbe(final int probe) {
++    Configuration conf = new Configuration(getFileSystem().getConf());
++    S3ATestUtils.disableFilesystemCaching(conf);
++    conf.setInt(S3A_BUCKET_PROBE, probe);
++    return conf;
++  }
++
++  @Test
++  public void testBucketProbingV1() throws Exception {
++    describe("Test the V1 bucket probe");
++    Configuration configuration = createConfigurationWithProbe(1);
++    expectUnknownStore(
++        () -> FileSystem.get(uri, configuration));
++  }
++
++  @Test
++  public void testBucketProbingV2() throws Exception {
++    describe("Test the V2 bucket probe");
++    Configuration configuration = createConfigurationWithProbe(2);
++    expectUnknownStore(
++        () -> FileSystem.get(uri, configuration));
++    /*
++     * Bucket probing should also be done when value of
++     * S3A_BUCKET_PROBE is greater than 2.
++     */
++    configuration.setInt(S3A_BUCKET_PROBE, 3);
++    expectUnknownStore(
++            () -> FileSystem.get(uri, configuration));
++  }
++
++  @Test
++  public void testBucketProbingParameterValidation() throws Exception {
++    describe("Test bucket probe parameter %s validation", S3A_BUCKET_PROBE);
++    Configuration configuration = createConfigurationWithProbe(-1);
++    intercept(IllegalArgumentException.class,
++            "Value of " + S3A_BUCKET_PROBE + " should be >= 0",
++            "Should throw IllegalArgumentException",
++        () -> FileSystem.get(uri, configuration));
++  }
++
++  @Override
++  protected Configuration getConfiguration() {
++    Configuration configuration = super.getConfiguration();
++    S3ATestUtils.disableFilesystemCaching(configuration);
++    return configuration;
++  }
++
++  @Override
++  public void teardown() throws Exception {
++    IOUtils.cleanupWithLogger(getLogger(), fs);
++    super.teardown();
++  }
++}
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/MockS3ClientFactory.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/MockS3ClientFactory.java
+index 2397f6cbafac..4644cf24764a 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/MockS3ClientFactory.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/MockS3ClientFactory.java
+@@ -41,6 +41,7 @@ public AmazonS3 createS3Client(URI name,
+       final String userAgentSuffix) {
+     AmazonS3 s3 = mock(AmazonS3.class);
+     when(s3.doesBucketExist(bucket)).thenReturn(true);
++    when(s3.doesBucketExistV2(bucket)).thenReturn(true);
+     // this listing is used in startup if purging is enabled, so
+     // return a stub value
+     MultipartUploadListing noUploads = new MultipartUploadListing();
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/TestS3AExceptionTranslation.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/TestS3AExceptionTranslation.java
+index 9b8659513004..95bd7c21b85a 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/TestS3AExceptionTranslation.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/TestS3AExceptionTranslation.java
+@@ -21,6 +21,7 @@
+ import static org.apache.hadoop.fs.s3a.Constants.*;
+ import static org.apache.hadoop.fs.s3a.S3ATestUtils.*;
+ import static org.apache.hadoop.fs.s3a.S3AUtils.*;
++import static org.apache.hadoop.fs.s3a.impl.InternalConstants.SC_404;
+ import static org.junit.Assert.*;
+ 
+ import java.io.EOFException;
+@@ -39,6 +40,8 @@
+ 
+ import org.junit.Test;
+ 
++import org.apache.hadoop.fs.s3a.impl.ErrorTranslation;
++
+ import static org.apache.hadoop.test.GenericTestUtils.assertExceptionContains;
+ 
+ /**
+@@ -98,9 +101,24 @@ public void test403isNotPermittedFound() throws Exception {
+     verifyTranslated(403, AccessDeniedException.class);
+   }
+ 
++  /**
++   * 404 defaults to FileNotFound.
++   */
+   @Test
+   public void test404isNotFound() throws Exception {
+-    verifyTranslated(404, FileNotFoundException.class);
++    verifyTranslated(SC_404, FileNotFoundException.class);
++  }
++
++  /**
++   * 404 + NoSuchBucket == Unknown bucket.
++   */
++  @Test
++  public void testUnknownBucketException() throws Exception {
++    AmazonS3Exception ex404 = createS3Exception(SC_404);
++    ex404.setErrorCode(ErrorTranslation.AwsErrorCodes.E_NO_SUCH_BUCKET);
++    verifyTranslated(
++        UnknownStoreException.class,
++        ex404);
+   }
+ 
+   @Test
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/AbstractS3GuardToolTestBase.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/AbstractS3GuardToolTestBase.java
+index 13d2646317df..aa74c002d4b3 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/AbstractS3GuardToolTestBase.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/AbstractS3GuardToolTestBase.java
+@@ -21,7 +21,6 @@
+ import java.io.BufferedReader;
+ import java.io.ByteArrayInputStream;
+ import java.io.ByteArrayOutputStream;
+-import java.io.FileNotFoundException;
+ import java.io.IOException;
+ import java.io.InputStreamReader;
+ import java.net.URI;
+@@ -36,6 +35,7 @@
+ import java.util.concurrent.TimeUnit;
+ 
+ import org.apache.hadoop.fs.s3a.S3AUtils;
++import org.apache.hadoop.fs.s3a.UnknownStoreException;
+ import org.apache.hadoop.util.StopWatch;
+ import com.google.common.base.Preconditions;
+ import org.apache.hadoop.fs.FileSystem;
+@@ -506,7 +506,7 @@ public void testToolsNoBucket() throws Throwable {
+           cmdR.getName(),
+           S3A_THIS_BUCKET_DOES_NOT_EXIST
+       };
+-      intercept(FileNotFoundException.class,
++      intercept(UnknownStoreException.class,
+           () -> cmdR.run(argsR));
+     }
+   }
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/ITestS3GuardToolDynamoDB.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/ITestS3GuardToolDynamoDB.java
+index 915f1cc190c5..ba93927e8dc8 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/ITestS3GuardToolDynamoDB.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/ITestS3GuardToolDynamoDB.java
+@@ -41,6 +41,7 @@
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.s3a.Constants;
+ import org.apache.hadoop.fs.s3a.S3AFileSystem;
++import org.apache.hadoop.fs.s3a.UnknownStoreException;
+ import org.apache.hadoop.fs.s3a.s3guard.S3GuardTool.Destroy;
+ import org.apache.hadoop.fs.s3a.s3guard.S3GuardTool.Init;
+ import org.apache.hadoop.util.ExitUtil;
+@@ -319,7 +320,7 @@ public void testCLIFsckWithParamParentOfRoot() throws Exception {
+ 
+   @Test
+   public void testCLIFsckFailInitializeFs() throws Exception {
+-    intercept(FileNotFoundException.class, "does not exist",
++    intercept(UnknownStoreException.class,
+         () -> run(S3GuardTool.Fsck.NAME, "-check",
+             "s3a://this-bucket-does-not-exist-" + UUID.randomUUID()));
+   }
+diff --git a/hadoop-tools/hadoop-aws/src/test/resources/core-site.xml b/hadoop-tools/hadoop-aws/src/test/resources/core-site.xml
+index 5fd7c25f2463..a90edbe24fc4 100644
+--- a/hadoop-tools/hadoop-aws/src/test/resources/core-site.xml
++++ b/hadoop-tools/hadoop-aws/src/test/resources/core-site.xml
+@@ -51,6 +51,12 @@
+         managed by s3guard</description>
+   </property>
+ 
++  <property>
++    <name>fs.s3a.bucket.landsat-pds.probe</name>
++    <value>0</value>
++    <description>Let's postpone existence checks to the first IO operation </description>
++  </property>
++
+   <!-- Convenience definitions. -->
+   <property>
+     <name>s3guard.null</name>

@@ -1,0 +1,266 @@
+
+package org.apache.hadoop.fs.viewfs;
+
+import static org.apache.hadoop.fs.viewfs.Constants.CONFIG_VIEWFS_IGNORE_PORT_IN_MOUNT_TABLE_NAME;
+import static org.apache.hadoop.fs.viewfs.Constants.CONFIG_VIEWFS_MOUNTTABLE_LOADER_IMPL;
+import static org.apache.hadoop.fs.viewfs.Constants.DEFAULT_MOUNT_TABLE_CONFIG_LOADER_IMPL;
+
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.InvocationTargetException;
+import java.net.URI;
+
+import org.apache.hadoop.classification.InterfaceAudience;
+import org.apache.hadoop.classification.InterfaceStability;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.FsConstants;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.UnsupportedFileSystemException;
+import org.apache.hadoop.util.ReflectionUtils;
+
+
+@InterfaceAudience.LimitedPrivate({ "MapReduce", "HBase", "Hive" })
+@InterfaceStability.Evolving
+public class ViewFileSystemOverloadScheme extends ViewFileSystem {
+  private URI myUri;
+  private boolean supportAutoAddingFallbackOnNoMounts = true;
+  public ViewFileSystemOverloadScheme() throws IOException {
+    super();
+  }
+
+  @Override
+  public String getScheme() {
+    return myUri.getScheme();
+  }
+
+  
+  public boolean supportAutoAddingFallbackOnNoMounts() {
+    return this.supportAutoAddingFallbackOnNoMounts;
+  }
+
+  
+  public void setSupportAutoAddingFallbackOnNoMounts(
+      boolean addAutoFallbackOnNoMounts) {
+    this.supportAutoAddingFallbackOnNoMounts = addAutoFallbackOnNoMounts;
+  }
+
+  @Override
+  public void initialize(URI theUri, Configuration conf) throws IOException {
+    this.myUri = theUri;
+    if (LOG.isDebugEnabled()) {
+      LOG.debug("Initializing the ViewFileSystemOverloadScheme with the uri: "
+          + theUri);
+    }
+    String mountTableConfigPath =
+        conf.get(Constants.CONFIG_VIEWFS_MOUNTTABLE_PATH);
+    
+    conf.setBoolean(Constants.CONFIG_VIEWFS_MOUNT_LINKS_AS_SYMLINKS,
+        conf.getBoolean(Constants.CONFIG_VIEWFS_MOUNT_LINKS_AS_SYMLINKS,
+            false));
+    
+    conf.setBoolean(CONFIG_VIEWFS_IGNORE_PORT_IN_MOUNT_TABLE_NAME,
+        conf.getBoolean(Constants.CONFIG_VIEWFS_IGNORE_PORT_IN_MOUNT_TABLE_NAME,
+            true));
+    if (null != mountTableConfigPath) {
+      MountTableConfigLoader loader = getMountTableConfigLoader(conf);
+      loader.load(mountTableConfigPath, conf);
+    } else {
+      
+      if (LOG.isDebugEnabled()) {
+        LOG.debug(
+            "Missing configuration for fs.viewfs.mounttable.path. Proceeding"
+                + "with core-site.xml mount-table information if avaialable.");
+      }
+    }
+    super.initialize(theUri, conf);
+  }
+
+  private MountTableConfigLoader getMountTableConfigLoader(
+      final Configuration conf) {
+    Class<? extends MountTableConfigLoader> clazz =
+        conf.getClass(CONFIG_VIEWFS_MOUNTTABLE_LOADER_IMPL,
+            DEFAULT_MOUNT_TABLE_CONFIG_LOADER_IMPL,
+                MountTableConfigLoader.class);
+
+    if (clazz == null) {
+      throw new RuntimeException(
+          String.format("Errors on getting mount table loader class. "
+              + "The fs.viewfs.mounttable.config.loader.impl conf is %s. ",
+                  conf.get(CONFIG_VIEWFS_MOUNTTABLE_LOADER_IMPL,
+                      DEFAULT_MOUNT_TABLE_CONFIG_LOADER_IMPL.getName())));
+    }
+
+    try {
+      MountTableConfigLoader mountTableConfigLoader =
+          ReflectionUtils.newInstance(clazz, conf);
+      return mountTableConfigLoader;
+    } catch (Exception e) {
+      throw new RuntimeException(e);
+    }
+  }
+
+  
+  @Override
+  protected FsGetter fsGetter() {
+    return new ChildFsGetter(getScheme());
+  }
+
+  
+  static class ChildFsGetter extends FsGetter {
+
+    private final String rootScheme;
+
+    ChildFsGetter(String rootScheme) {
+      this.rootScheme = rootScheme;
+    }
+
+    @Override
+    public FileSystem getNewInstance(URI uri, Configuration conf)
+        throws IOException {
+      if (uri.getScheme().equals(this.rootScheme)) {
+        if (LOG.isDebugEnabled()) {
+          LOG.debug(
+              "The file system initialized uri scheme is matching with the "
+                  + "given target uri scheme. The target uri is: " + uri);
+        }
+        
+        return createFileSystem(uri, conf);
+      } else {
+        return FileSystem.newInstance(uri, conf);
+      }
+    }
+
+    
+    @Override
+    public FileSystem get(URI uri, Configuration conf) throws IOException {
+      if (uri.getScheme().equals(this.rootScheme)) {
+        
+        
+        if (LOG.isDebugEnabled()) {
+          LOG.debug(
+              "The file system initialized uri scheme is matching with the "
+                  + "given target uri scheme. So, the target file system "
+                  + "instances will not be cached. To cache fs instances, "
+                  + "please set fs.viewfs.enable.inner.cache to true. "
+                  + "The target uri is: " + uri);
+        }
+        return createFileSystem(uri, conf);
+      } else {
+        return FileSystem.get(uri, conf);
+      }
+    }
+
+    private FileSystem createFileSystem(URI uri, Configuration conf)
+        throws IOException {
+      final String fsImplConf = String.format(
+          FsConstants.FS_VIEWFS_OVERLOAD_SCHEME_TARGET_FS_IMPL_PATTERN,
+          uri.getScheme());
+      Class<?> clazz = conf.getClass(fsImplConf, null);
+      if (clazz == null) {
+        throw new UnsupportedFileSystemException(
+            String.format("%s=null: %s: %s", fsImplConf,
+                "No overload scheme fs configured", uri.getScheme()));
+      }
+      FileSystem fs = (FileSystem) newInstance(clazz, uri, conf);
+      fs.initialize(uri, conf);
+      return fs;
+    }
+
+    private <T> T newInstance(Class<T> theClass, URI uri, Configuration conf) {
+      T result;
+      try {
+        Constructor<T> meth = theClass.getConstructor();
+        meth.setAccessible(true);
+        result = meth.newInstance();
+      } catch (InvocationTargetException e) {
+        Throwable cause = e.getCause();
+        if (cause instanceof RuntimeException) {
+          throw (RuntimeException) cause;
+        } else {
+          throw new RuntimeException(cause);
+        }
+      } catch (Exception e) {
+        throw new RuntimeException(e);
+      }
+      return result;
+    }
+
+  }
+
+  
+  public FileSystem getRawFileSystem(Path path, Configuration conf)
+      throws IOException {
+    InodeTree.ResolveResult<FileSystem> res;
+    try {
+      res = fsState.resolve(getUriPath(path), true);
+      return res.isInternalDir() ? fsGetter().get(path.toUri(), conf)
+          : ((ChRootedFileSystem) res.targetFileSystem).getMyFs();
+    } catch (FileNotFoundException e) {
+      
+      throw new NotInMountpointException(path,
+          "No link found for the given path.");
+    }
+  }
+
+  
+  public MountPathInfo<FileSystem> getMountPathInfo(Path path,
+      Configuration conf) throws IOException {
+    InodeTree.ResolveResult<FileSystem> res;
+    try {
+      res = fsState.resolve(getUriPath(path), true);
+      FileSystem fs = res.isInternalDir() ?
+          (fsState.getRootFallbackLink() != null ?
+              ((ChRootedFileSystem) fsState
+                  .getRootFallbackLink().getTargetFileSystem()).getMyFs() :
+              fsGetter().get(path.toUri(), conf)) :
+          ((ChRootedFileSystem) res.targetFileSystem).getMyFs();
+      return new MountPathInfo<FileSystem>(res.remainingPath, res.resolvedPath,
+          fs);
+    } catch (FileNotFoundException e) {
+      
+      throw new NotInMountpointException(path,
+          "No link found for the given path.");
+    }
+  }
+
+  
+  public static class MountPathInfo<T> {
+    private Path pathOnTarget;
+    private T targetFs;
+
+    public MountPathInfo(Path pathOnTarget, String resolvedPath, T targetFs) {
+      this.pathOnTarget = pathOnTarget;
+      this.targetFs = targetFs;
+    }
+
+    public Path getPathOnTarget() {
+      return this.pathOnTarget;
+    }
+
+    public T getTargetFs() {
+      return this.targetFs;
+    }
+  }
+
+  
+  public FileSystem getFallbackFileSystem() {
+    if (fsState.getRootFallbackLink() == null) {
+      return null;
+    }
+    try {
+      return ((ChRootedFileSystem) fsState.getRootFallbackLink()
+          .getTargetFileSystem()).getMyFs();
+    } catch (IOException ex) {
+      LOG.error("Could not get fallback filesystem ");
+    }
+    return null;
+  }
+
+  @Override
+  @InterfaceAudience.LimitedPrivate("HDFS")
+  public URI canonicalizeUri(URI uri) {
+    return super.canonicalizeUri(uri);
+  }
+}

@@ -1,0 +1,503 @@
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFileSystem.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFileSystem.java
+index 39d78cf65012..cb3696507afd 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFileSystem.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFileSystem.java
+@@ -41,6 +41,7 @@
+ import java.util.Objects;
+ import java.util.Set;
+ 
++import com.google.common.base.Preconditions;
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.classification.InterfaceStability;
+ import org.apache.hadoop.conf.Configuration;
+@@ -1180,7 +1181,41 @@ public FSDataOutputStream append(final Path f, final int bufferSize,
+     public FSDataOutputStream create(final Path f,
+         final FsPermission permission, final boolean overwrite,
+         final int bufferSize, final short replication, final long blockSize,
+-        final Progressable progress) throws AccessControlException {
++        final Progressable progress) throws IOException {
++      Preconditions.checkNotNull(f, "File cannot be null.");
++      if (InodeTree.SlashPath.equals(f)) {
++        throw new FileAlreadyExistsException(
++            "/ is not a file. The directory / already exist at: "
++                + theInternalDir.fullPath);
++      }
++
++      if (this.fsState.getRootFallbackLink() != null) {
++
++        if (theInternalDir.getChildren().containsKey(f.getName())) {
++          throw new FileAlreadyExistsException(
++              "A mount path(file/dir) already exist with the requested path: "
++                  + theInternalDir.getChildren().get(f.getName()).fullPath);
++        }
++
++        FileSystem linkedFallbackFs =
++            this.fsState.getRootFallbackLink().getTargetFileSystem();
++        Path parent = Path.getPathWithoutSchemeAndAuthority(
++            new Path(theInternalDir.fullPath));
++        String leaf = f.getName();
++        Path fileToCreate = new Path(parent, leaf);
++
++        try {
++          return linkedFallbackFs
++              .create(fileToCreate, permission, overwrite, bufferSize,
++                  replication, blockSize, progress);
++        } catch (IOException e) {
++          StringBuilder msg =
++              new StringBuilder("Failed to create file:").append(fileToCreate)
++                  .append(" at fallback : ").append(linkedFallbackFs.getUri());
++          LOG.error(msg.toString(), e);
++          throw e;
++        }
++      }
+       throw readOnlyMountTable("create", f);
+     }
+ 
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFs.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFs.java
+index c769003aacff..a63960c55de0 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFs.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFs.java
+@@ -33,6 +33,8 @@
+ import java.util.Map.Entry;
+ 
+ import java.util.Set;
++
++import com.google.common.base.Preconditions;
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.classification.InterfaceStability;
+ import org.apache.hadoop.conf.Configuration;
+@@ -919,6 +921,41 @@ public FSDataOutputStream createInternal(final Path f,
+         FileAlreadyExistsException, FileNotFoundException,
+         ParentNotDirectoryException, UnsupportedFileSystemException,
+         UnresolvedLinkException, IOException {
++      Preconditions.checkNotNull(f, "File cannot be null.");
++      if (InodeTree.SlashPath.equals(f)) {
++        throw new FileAlreadyExistsException(
++            "/ is not a file. The directory / already exist at: "
++                + theInternalDir.fullPath);
++      }
++
++      if (this.fsState.getRootFallbackLink() != null) {
++        if (theInternalDir.getChildren().containsKey(f.getName())) {
++          throw new FileAlreadyExistsException(
++              "A mount path(file/dir) already exist with the requested path: "
++                  + theInternalDir.getChildren().get(f.getName()).fullPath);
++        }
++
++        AbstractFileSystem linkedFallbackFs =
++            this.fsState.getRootFallbackLink().getTargetFileSystem();
++        Path parent = Path.getPathWithoutSchemeAndAuthority(
++            new Path(theInternalDir.fullPath));
++        String leaf = f.getName();
++        Path fileToCreate = new Path(parent, leaf);
++
++        try {
++          return linkedFallbackFs
++              .createInternal(fileToCreate, flag, absolutePermission,
++                  bufferSize, replication, blockSize, progress, checksumOpt,
++                  true);
++        } catch (IOException e) {
++          StringBuilder msg =
++              new StringBuilder("Failed to create file:").append(fileToCreate)
++                  .append(" at fallback : ").append(linkedFallbackFs.getUri());
++          LOG.error(msg.toString(), e);
++          throw e;
++        }
++      }
++
+       throw readOnlyMountTable("create", f);
+     }
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/fs/viewfs/TestViewFileSystemLinkFallback.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/fs/viewfs/TestViewFileSystemLinkFallback.java
+index bec261cf3eb3..bd2b5af02ad8 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/fs/viewfs/TestViewFileSystemLinkFallback.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/fs/viewfs/TestViewFileSystemLinkFallback.java
+@@ -33,6 +33,7 @@
+ 
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FSDataOutputStream;
++import org.apache.hadoop.fs.FileAlreadyExistsException;
+ import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.FileSystemTestHelper;
+@@ -765,4 +766,151 @@ public void testMkdirsShouldReturnFalseWhenFallbackFSNotAvailable()
+       assertTrue(fsTarget.exists(test));
+     }
+   }
++
++  /**
++   * Tests that the create file should be successful when the parent directory
++   * is same as the existent fallback directory. The new file should be created
++   * in fallback.
++   */
++  @Test
++  public void testCreateFileOnInternalMountDirWithSameDirTreeExistInFallback()
++      throws Exception {
++    Configuration conf = new Configuration();
++    ConfigUtil.addLink(conf, "/user1/hive/warehouse/partition-0",
++        new Path(targetTestRoot.toString()).toUri());
++    Path fallbackTarget = new Path(targetTestRoot, "fallbackDir");
++    Path dir1 = new Path(fallbackTarget, "user1/hive/warehouse/partition-0");
++    fsTarget.mkdirs(dir1);
++    ConfigUtil.addLinkFallback(conf, fallbackTarget.toUri());
++
++    try (FileSystem vfs = FileSystem.get(viewFsDefaultClusterUri, conf)) {
++      Path vfsTestFile = new Path("/user1/hive/warehouse/test.file");
++      Path testFileInFallback = Path.mergePaths(fallbackTarget, vfsTestFile);
++      assertFalse(fsTarget.exists(testFileInFallback));
++      assertTrue(fsTarget.exists(testFileInFallback.getParent()));
++      vfs.create(vfsTestFile).close();
++      assertTrue(fsTarget.exists(testFileInFallback));
++    }
++  }
++
++  /**
++   * Tests the making of a new directory which is not matching to any of
++   * internal directory.
++   */
++  @Test
++  public void testCreateNewFileWithOutMatchingToMountDirOrFallbackDirPath()
++      throws Exception {
++    Configuration conf = new Configuration();
++    ConfigUtil.addLink(conf, "/user1/hive/warehouse/partition-0",
++        new Path(targetTestRoot.toString()).toUri());
++    Path fallbackTarget = new Path(targetTestRoot, "fallbackDir");
++    fsTarget.mkdirs(fallbackTarget);
++    ConfigUtil.addLinkFallback(conf, fallbackTarget.toUri());
++    try (FileSystem vfs = FileSystem.get(viewFsDefaultClusterUri, conf)) {
++      Path vfsTestFile = new Path("/user2/test.file");
++      Path testFileInFallback = Path.mergePaths(fallbackTarget, vfsTestFile);
++      assertFalse(fsTarget.exists(testFileInFallback));
++      // user2 does not exist in fallback
++      assertFalse(fsTarget.exists(testFileInFallback.getParent()));
++      vfs.create(vfsTestFile).close();
++      // /user2/test.file should be created in fallback
++      assertTrue(fsTarget.exists(testFileInFallback));
++    }
++  }
++
++  /**
++   * Tests the making of a new file on root which is not matching to any of
++   * fallback files on root.
++   */
++  @Test
++  public void testCreateFileOnRootWithFallbackEnabled() throws Exception {
++    Configuration conf = new Configuration();
++    Path fallbackTarget = new Path(targetTestRoot, "fallbackDir");
++    fsTarget.mkdirs(fallbackTarget);
++
++    ConfigUtil.addLink(conf, "/user1/hive/",
++        new Path(targetTestRoot.toString()).toUri());
++    ConfigUtil.addLinkFallback(conf, fallbackTarget.toUri());
++
++    try (FileSystem vfs = FileSystem.get(viewFsDefaultClusterUri, conf)) {
++      Path vfsTestFile = new Path("/test.file");
++      Path testFileInFallback = Path.mergePaths(fallbackTarget, vfsTestFile);
++      assertFalse(fsTarget.exists(testFileInFallback));
++      vfs.create(vfsTestFile).close();
++      // /test.file should be created in fallback
++      assertTrue(fsTarget.exists(testFileInFallback));
++    }
++  }
++
++  /**
++   * Tests the create of a file on root where the path is matching to an
++   * existing file on fallback's file on root.
++   */
++  @Test (expected = FileAlreadyExistsException.class)
++  public void testCreateFileOnRootWithFallbackWithFileAlreadyExist()
++      throws Exception {
++    Configuration conf = new Configuration();
++    Path fallbackTarget = new Path(targetTestRoot, "fallbackDir");
++    Path testFile = new Path(fallbackTarget, "test.file");
++    // pre-creating test file in fallback.
++    fsTarget.create(testFile).close();
++
++    ConfigUtil.addLink(conf, "/user1/hive/",
++        new Path(targetTestRoot.toString()).toUri());
++    ConfigUtil.addLinkFallback(conf, fallbackTarget.toUri());
++
++    try (FileSystem vfs = FileSystem.get(viewFsDefaultClusterUri, conf)) {
++      Path vfsTestFile = new Path("/test.file");
++      assertTrue(fsTarget.exists(testFile));
++      vfs.create(vfsTestFile, false).close();
++    }
++  }
++
++  /**
++   * Tests the creating of a file where the path is same as mount link path.
++   */
++  @Test(expected= FileAlreadyExistsException.class)
++  public void testCreateFileWhereThePathIsSameAsItsMountLinkPath()
++      throws Exception {
++    Configuration conf = new Configuration();
++    Path fallbackTarget = new Path(targetTestRoot, "fallbackDir");
++    fsTarget.mkdirs(fallbackTarget);
++
++    ConfigUtil.addLink(conf, "/user1/hive/",
++        new Path(targetTestRoot.toString()).toUri());
++    ConfigUtil.addLinkFallback(conf, fallbackTarget.toUri());
++
++    try (FileSystem vfs = FileSystem.get(viewFsDefaultClusterUri, conf)) {
++      Path vfsTestDir = new Path("/user1/hive");
++      assertFalse(fsTarget.exists(Path.mergePaths(fallbackTarget, vfsTestDir)));
++      vfs.create(vfsTestDir).close();
++    }
++  }
++
++  /**
++   * Tests the create of a file where the path is same as one of of the internal
++   * dir path should fail.
++   */
++  @Test
++  public void testCreateFileSameAsInternalDirPath() throws Exception {
++    Configuration conf = new Configuration();
++    Path fallbackTarget = new Path(targetTestRoot, "fallbackDir");
++    fsTarget.mkdirs(fallbackTarget);
++    ConfigUtil.addLink(conf, "/user1/hive/",
++        new Path(targetTestRoot.toString()).toUri());
++    ConfigUtil.addLinkFallback(conf, fallbackTarget.toUri());
++
++    try (FileSystem vfs = FileSystem.get(viewFsDefaultClusterUri, conf)) {
++      Path vfsTestDir = new Path("/user1");
++      assertFalse(fsTarget.exists(Path.mergePaths(fallbackTarget, vfsTestDir)));
++      try {
++        vfs.create(vfsTestDir);
++        Assert.fail("Should fail to create file as this is an internal dir.");
++      } catch (NotInMountpointException e){
++        // This tree is part of internal tree. The above exception will be
++        // thrown from getDefaultReplication, getDefaultBlockSize APIs which was
++        // called in create API.
++      }
++    }
++  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/fs/viewfs/TestViewFileSystemOverloadSchemeWithHdfsScheme.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/fs/viewfs/TestViewFileSystemOverloadSchemeWithHdfsScheme.java
+index f0f3aae1ba6c..a44af768bdcd 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/fs/viewfs/TestViewFileSystemOverloadSchemeWithHdfsScheme.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/fs/viewfs/TestViewFileSystemOverloadSchemeWithHdfsScheme.java
+@@ -39,7 +39,6 @@
+ import org.apache.hadoop.hdfs.DFSConfigKeys;
+ import org.apache.hadoop.hdfs.DistributedFileSystem;
+ import org.apache.hadoop.hdfs.MiniDFSCluster;
+-import org.apache.hadoop.security.AccessControlException;
+ import org.apache.hadoop.test.PathUtils;
+ import org.junit.After;
+ import org.junit.Assert;
+@@ -346,33 +345,6 @@ public void testCreateOnRootShouldFailWhenMountLinkConfigured()
+     }
+   }
+ 
+-  /**
+-   * Create mount links as follows
+-   * hdfs://localhost:xxx/HDFSUser --> hdfs://localhost:xxx/HDFSUser/
+-   * hdfs://localhost:xxx/local --> file://TEST_ROOT_DIR/root/
+-   * fallback --> hdfs://localhost:xxx/HDFSUser/
+-   *
+-   * It will find fallback link, but root is not accessible and read only.
+-   */
+-  @Test(expected = AccessControlException.class, timeout = 30000)
+-  public void testCreateOnRootShouldFailEvenFallBackMountLinkConfigured()
+-      throws Exception {
+-    final Path hdfsTargetPath = new Path(defaultFSURI + HDFS_USER_FOLDER);
+-    addMountLinks(defaultFSURI.getAuthority(),
+-        new String[] {HDFS_USER_FOLDER, LOCAL_FOLDER,
+-            Constants.CONFIG_VIEWFS_LINK_FALLBACK },
+-        new String[] {hdfsTargetPath.toUri().toString(),
+-            localTargetDir.toURI().toString(),
+-            hdfsTargetPath.toUri().toString() },
+-        conf);
+-    try (FileSystem fs = FileSystem.get(conf)) {
+-      fs.createNewFile(new Path("/onRootWhenFallBack"));
+-      Assert.fail(
+-          "It should fail as root is read only in viewFS, even when configured"
+-              + " with fallback.");
+-    }
+-  }
+-
+   /**
+    * Create mount links as follows
+    * hdfs://localhost:xxx/HDFSUser --> hdfs://localhost:xxx/HDFSUser/
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/fs/viewfs/TestViewFsLinkFallback.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/fs/viewfs/TestViewFsLinkFallback.java
+index 49c0957c446d..04d26b983ed6 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/fs/viewfs/TestViewFsLinkFallback.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/fs/viewfs/TestViewFsLinkFallback.java
+@@ -17,6 +17,7 @@
+  */
+ package org.apache.hadoop.fs.viewfs;
+ 
++import static org.apache.hadoop.fs.CreateFlag.CREATE;
+ import static org.junit.Assert.assertFalse;
+ import static org.junit.Assert.assertNotNull;
+ import static org.junit.Assert.assertTrue;
+@@ -24,12 +25,15 @@
+ import java.io.IOException;
+ import java.net.URI;
+ import java.net.URISyntaxException;
++import java.util.EnumSet;
+ 
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.AbstractFileSystem;
++import org.apache.hadoop.fs.FileAlreadyExistsException;
+ import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.FsConstants;
++import org.apache.hadoop.fs.Options;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.permission.FsPermission;
+ import org.apache.hadoop.hdfs.DFSConfigKeys;
+@@ -294,4 +298,154 @@ public void testMkdirShouldFailWhenFallbackFSNotAvailable()
+     assertTrue(fsTarget.exists(test));
+   }
+ 
++  /**
++   * Tests that the create file should be successful when the parent directory
++   * is same as the existent fallback directory. The new file should be created
++   * in fallback.
++   */
++  @Test
++  public void testCreateFileOnInternalMountDirWithSameDirTreeExistInFallback()
++      throws Exception {
++    Configuration conf = new Configuration();
++    ConfigUtil.addLink(conf, "/user1/hive/warehouse/partition-0",
++        new Path(targetTestRoot.toString()).toUri());
++    Path fallbackTarget = new Path(targetTestRoot, "fallbackDir");
++    Path dir1 = new Path(fallbackTarget, "user1/hive/warehouse/partition-0");
++    fsTarget.mkdirs(dir1);
++    ConfigUtil.addLinkFallback(conf, fallbackTarget.toUri());
++
++    AbstractFileSystem vfs =
++        AbstractFileSystem.get(viewFsDefaultClusterUri, conf);
++    Path vfsTestFile = new Path("/user1/hive/warehouse/test.file");
++    Path testFileInFallback = Path.mergePaths(fallbackTarget, vfsTestFile);
++    assertFalse(fsTarget.exists(testFileInFallback));
++    assertTrue(fsTarget.exists(testFileInFallback.getParent()));
++    vfs.create(vfsTestFile, EnumSet.of(CREATE),
++        Options.CreateOpts.perms(FsPermission.getDefault())).close();
++    assertTrue(fsTarget.exists(testFileInFallback));
++
++  }
++
++  /**
++   * Tests the making of a new directory which is not matching to any of
++   * internal directory.
++   */
++  @Test
++  public void testCreateNewFileWithOutMatchingToMountDirOrFallbackDirPath()
++      throws Exception {
++    Configuration conf = new Configuration();
++    ConfigUtil.addLink(conf, "/user1/hive/warehouse/partition-0",
++        new Path(targetTestRoot.toString()).toUri());
++    Path fallbackTarget = new Path(targetTestRoot, "fallbackDir");
++    fsTarget.mkdirs(fallbackTarget);
++    ConfigUtil.addLinkFallback(conf, fallbackTarget.toUri());
++    AbstractFileSystem vfs =
++        AbstractFileSystem.get(viewFsDefaultClusterUri, conf);
++    Path vfsTestFile = new Path("/user2/test.file");
++    Path testFileInFallback = Path.mergePaths(fallbackTarget, vfsTestFile);
++    assertFalse(fsTarget.exists(testFileInFallback));
++    // user2 does not exist in fallback
++    assertFalse(fsTarget.exists(testFileInFallback.getParent()));
++    vfs.create(vfsTestFile, EnumSet.of(CREATE),
++        Options.CreateOpts.perms(FsPermission.getDefault()),
++        Options.CreateOpts.createParent()).close();
++    // /user2/test.file should be created in fallback
++    assertTrue(fsTarget.exists(testFileInFallback));
++  }
++
++  /**
++   * Tests the making of a new file on root which is not matching to any of
++   * fallback files on root.
++   */
++  @Test
++  public void testCreateFileOnRootWithFallbackEnabled()
++      throws Exception {
++    Configuration conf = new Configuration();
++    Path fallbackTarget = new Path(targetTestRoot, "fallbackDir");
++    fsTarget.mkdirs(fallbackTarget);
++
++    ConfigUtil.addLink(conf, "/user1/hive/",
++        new Path(targetTestRoot.toString()).toUri());
++    ConfigUtil.addLinkFallback(conf, fallbackTarget.toUri());
++
++    AbstractFileSystem vfs =
++        AbstractFileSystem.get(viewFsDefaultClusterUri, conf);
++    Path vfsTestFile = new Path("/test.file");
++    Path testFileInFallback = Path.mergePaths(fallbackTarget, vfsTestFile);
++    assertFalse(fsTarget.exists(testFileInFallback));
++    vfs.create(vfsTestFile, EnumSet.of(CREATE),
++        Options.CreateOpts.perms(FsPermission.getDefault())).close();
++    // /test.file should be created in fallback
++    assertTrue(fsTarget.exists(testFileInFallback));
++
++  }
++
++  /**
++   * Tests the create of a file on root where the path is matching to an
++   * existing file on fallback's file on root.
++   */
++  @Test (expected = FileAlreadyExistsException.class)
++  public void testCreateFileOnRootWithFallbackWithFileAlreadyExist()
++      throws Exception {
++    Configuration conf = new Configuration();
++    Path fallbackTarget = new Path(targetTestRoot, "fallbackDir");
++    Path testFile = new Path(fallbackTarget, "test.file");
++    // pre-creating test file in fallback.
++    fsTarget.create(testFile).close();
++
++    ConfigUtil.addLink(conf, "/user1/hive/",
++        new Path(targetTestRoot.toString()).toUri());
++    ConfigUtil.addLinkFallback(conf, fallbackTarget.toUri());
++
++    AbstractFileSystem vfs =
++        AbstractFileSystem.get(viewFsDefaultClusterUri, conf);
++    Path vfsTestFile = new Path("/test.file");
++    assertTrue(fsTarget.exists(testFile));
++    vfs.create(vfsTestFile, EnumSet.of(CREATE),
++        Options.CreateOpts.perms(FsPermission.getDefault())).close();
++  }
++
++  /**
++   * Tests the creating of a file where the path is same as mount link path.
++   */
++  @Test(expected= FileAlreadyExistsException.class)
++  public void testCreateFileWhereThePathIsSameAsItsMountLinkPath()
++      throws Exception {
++    Configuration conf = new Configuration();
++    Path fallbackTarget = new Path(targetTestRoot, "fallbackDir");
++    fsTarget.mkdirs(fallbackTarget);
++
++    ConfigUtil.addLink(conf, "/user1/hive/",
++        new Path(targetTestRoot.toString()).toUri());
++    ConfigUtil.addLinkFallback(conf, fallbackTarget.toUri());
++
++    AbstractFileSystem vfs =
++        AbstractFileSystem.get(viewFsDefaultClusterUri, conf);
++    Path vfsTestDir = new Path("/user1/hive");
++    assertFalse(fsTarget.exists(Path.mergePaths(fallbackTarget, vfsTestDir)));
++    vfs.create(vfsTestDir, EnumSet.of(CREATE),
++        Options.CreateOpts.perms(FsPermission.getDefault())).close();
++  }
++
++  /**
++   * Tests the create of a file where the path is same as one of of the internal
++   * dir path should fail.
++   */
++  @Test(expected = FileAlreadyExistsException.class)
++  public void testCreateFileSameAsInternalDirPath()
++      throws Exception {
++    Configuration conf = new Configuration();
++    Path fallbackTarget = new Path(targetTestRoot, "fallbackDir");
++    fsTarget.mkdirs(fallbackTarget);
++    ConfigUtil.addLink(conf, "/user1/hive/",
++        new Path(targetTestRoot.toString()).toUri());
++    ConfigUtil.addLinkFallback(conf, fallbackTarget.toUri());
++
++    AbstractFileSystem vfs =
++        AbstractFileSystem.get(viewFsDefaultClusterUri, conf);
++    Path vfsTestDir = new Path("/user1");
++    assertFalse(fsTarget.exists(Path.mergePaths(fallbackTarget, vfsTestDir)));
++    vfs.create(vfsTestDir, EnumSet.of(CREATE),
++        Options.CreateOpts.perms(FsPermission.getDefault())).close();
++  }
+ }

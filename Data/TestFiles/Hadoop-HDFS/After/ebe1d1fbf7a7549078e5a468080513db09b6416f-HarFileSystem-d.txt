@@ -1,0 +1,1127 @@
+
+package org.apache.hadoop.fs;
+
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.permission.FsPermission;
+import org.apache.hadoop.fs.Options.HandleOpt;
+import org.apache.hadoop.io.IOUtils;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.util.LineReader;
+import org.apache.hadoop.util.Progressable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.EOFException;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.io.UnsupportedEncodingException;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.net.URLDecoder;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+
+import static org.apache.hadoop.fs.impl.PathCapabilitiesSupport.validatePathCapabilityArgs;
+
+
+
+public class HarFileSystem extends FileSystem {
+
+  private static final Logger LOG =
+      LoggerFactory.getLogger(HarFileSystem.class);
+
+  public static final String METADATA_CACHE_ENTRIES_KEY = "fs.har.metadatacache.entries";
+  public static final int METADATA_CACHE_ENTRIES_DEFAULT = 10;
+
+  public static final int VERSION = 3;
+
+  private static Map<URI, HarMetaData> harMetaCache;
+
+  
+  private URI uri;
+  
+  
+  private Path archivePath;
+  
+  private String harAuth;
+
+  
+  private HarMetaData metadata;
+
+  private FileSystem fs;
+
+  
+  public HarFileSystem() {
+    
+  }
+
+  
+  @Override
+  public String getScheme() {
+    return "har";
+  }
+
+  
+  public HarFileSystem(FileSystem fs) {
+    this.fs = fs;
+    this.statistics = fs.statistics;
+  }
+ 
+  private synchronized void initializeMetadataCache(Configuration conf) {
+    if (harMetaCache == null) {
+      int cacheSize = conf.getInt(METADATA_CACHE_ENTRIES_KEY, METADATA_CACHE_ENTRIES_DEFAULT);
+      harMetaCache = Collections.synchronizedMap(new LruCache<URI, HarMetaData>(cacheSize));
+    }
+  }
+ 
+  
+  @Override
+  public void initialize(URI name, Configuration conf) throws IOException {
+    
+    initializeMetadataCache(conf);
+
+    
+    URI underLyingURI = decodeHarURI(name, conf);
+    
+    
+    Path harPath = archivePath(
+      new Path(name.getScheme(), name.getAuthority(), name.getPath()));
+    if (harPath == null) { 
+      throw new IOException("Invalid path for the Har Filesystem. " + 
+                           name.toString());
+    }
+    if (fs == null) {
+      fs = FileSystem.get(underLyingURI, conf);
+    }
+    uri = harPath.toUri();
+    archivePath = new Path(uri.getPath());
+    harAuth = getHarAuth(underLyingURI);
+    
+    
+    Path masterIndexPath = new Path(archivePath, "_masterindex");
+    Path archiveIndexPath = new Path(archivePath, "_index");
+    if (!fs.exists(masterIndexPath) || !fs.exists(archiveIndexPath)) {
+      throw new IOException("Invalid path for the Har Filesystem. " +
+          "No index file in " + harPath);
+    }
+
+    metadata = harMetaCache.get(uri);
+    if (metadata != null) {
+      FileStatus mStat = fs.getFileStatus(masterIndexPath);
+      FileStatus aStat = fs.getFileStatus(archiveIndexPath);
+      if (mStat.getModificationTime() != metadata.getMasterIndexTimestamp() ||
+          aStat.getModificationTime() != metadata.getArchiveIndexTimestamp()) {
+        
+        
+        metadata = null;
+        harMetaCache.remove(uri);
+      }
+    }
+    if (metadata == null) {
+      metadata = new HarMetaData(fs, masterIndexPath, archiveIndexPath);
+      metadata.parseMetaData();
+      harMetaCache.put(uri, metadata);
+    }
+  }
+
+  @Override
+  public Configuration getConf() {
+    return fs.getConf();
+  }
+
+  
+  
+  
+  public int getHarVersion() throws IOException {
+    if (metadata != null) {
+      return metadata.getVersion();
+    }
+    else {
+      throw new IOException("Invalid meta data for the Har Filesystem");
+    }
+  }
+
+  
+  private Path archivePath(Path p) {
+    Path retPath = null;
+    Path tmp = p;
+    for (int i=0; i< p.depth(); i++) {
+      if (tmp.toString().endsWith(".har")) {
+        retPath = tmp;
+        break;
+      }
+      tmp = tmp.getParent();
+    }
+    return retPath;
+  }
+
+  
+  private URI decodeHarURI(URI rawURI, Configuration conf) throws IOException {
+    String tmpAuth = rawURI.getAuthority();
+    
+    
+    
+    
+    if (tmpAuth == null) {
+      
+      return FileSystem.getDefaultUri(conf);
+    }
+    String authority = rawURI.getAuthority();
+
+    int i = authority.indexOf('-');
+    if (i < 0) {
+      throw new IOException("URI: " + rawURI
+          + " is an invalid Har URI since '-' not found."
+          + "  Expecting har://<scheme>-<host>/<path>.");
+    }
+ 
+    if (rawURI.getQuery() != null) {
+      
+      throw new IOException("query component in Path not supported  " + rawURI);
+    }
+ 
+    URI tmp;
+    try {
+      
+      URI baseUri = new URI(authority.replaceFirst("-", "://"));
+ 
+      tmp = new URI(baseUri.getScheme(), baseUri.getAuthority(),
+            rawURI.getPath(), rawURI.getQuery(), rawURI.getFragment());
+    } catch (URISyntaxException e) {
+      throw new IOException("URI: " + rawURI
+          + " is an invalid Har URI. Expecting har://<scheme>-<host>/<path>.");
+    }
+    return tmp;
+  }
+
+  private static String decodeString(String str)
+    throws UnsupportedEncodingException {
+    return URLDecoder.decode(str, "UTF-8");
+  }
+
+  private String decodeFileName(String fname)
+    throws UnsupportedEncodingException {
+    int version = metadata.getVersion();
+    if (version == 2 || version == 3){
+      return decodeString(fname);
+    }
+    return fname;
+  }
+
+  
+  @Override
+  public Path getWorkingDirectory() {
+    return new Path(uri.toString());
+  }
+
+  @Override
+  public Path getInitialWorkingDirectory() {
+    return getWorkingDirectory();
+  }
+
+  @Override
+  public FsStatus getStatus(Path p) throws IOException {
+    return fs.getStatus(p);
+  }
+
+  
+  private String getHarAuth(URI underLyingUri) {
+    String auth = underLyingUri.getScheme() + "-";
+    if (underLyingUri.getHost() != null) {
+      if (underLyingUri.getUserInfo() != null) {
+        auth += underLyingUri.getUserInfo();
+        auth += "@";
+      }
+      auth += underLyingUri.getHost();
+      if (underLyingUri.getPort() != -1) {
+        auth += ":";
+        auth +=  underLyingUri.getPort();
+      }
+    }
+    else {
+      auth += ":";
+    }
+    return auth;
+  }
+
+  
+  @Override
+  protected URI getCanonicalUri() {
+    return fs.getCanonicalUri();
+  }
+
+  @Override
+  protected URI canonicalizeUri(URI uri) {
+    return fs.canonicalizeUri(uri);
+  }
+
+  
+  @Override
+  public URI getUri() {
+    return this.uri;
+  }
+  
+  @Override
+  protected void checkPath(Path path) {
+    fs.checkPath(path);
+  }
+
+  @Override
+  public Path resolvePath(Path p) throws IOException {
+    return fs.resolvePath(p);
+  }
+
+  
+  private Path getPathInHar(Path path) {
+    Path harPath = new Path(path.toUri().getPath());
+    if (archivePath.compareTo(harPath) == 0)
+      return new Path(Path.SEPARATOR);
+    Path tmp = new Path(harPath.getName());
+    Path parent = harPath.getParent();
+    while (!(parent.compareTo(archivePath) == 0)) {
+      if (parent.toString().equals(Path.SEPARATOR)) {
+        tmp = null;
+        break;
+      }
+      tmp = new Path(parent.getName(), tmp);
+      parent = parent.getParent();
+    }
+    if (tmp != null) 
+      tmp = new Path(Path.SEPARATOR, tmp);
+    return tmp;
+  }
+  
+  
+  
+  
+  
+  private Path makeRelative(String initial, Path p) {
+    String scheme = this.uri.getScheme();
+    String authority = this.uri.getAuthority();
+    Path root = new Path(Path.SEPARATOR);
+    if (root.compareTo(p) == 0)
+      return new Path(scheme, authority, initial);
+    Path retPath = new Path(p.getName());
+    Path parent = p.getParent();
+    for (int i=0; i < p.depth()-1; i++) {
+      retPath = new Path(parent.getName(), retPath);
+      parent = parent.getParent();
+    }
+    return new Path(new Path(scheme, authority, initial),
+      retPath.toString());
+  }
+  
+  
+  @Override
+  public Path makeQualified(Path path) {
+    
+    
+    Path fsPath = path;
+    if (!path.isAbsolute()) {
+      fsPath = new Path(archivePath, path);
+    }
+
+    URI tmpURI = fsPath.toUri();
+    
+    return new Path(uri.getScheme(), harAuth, tmpURI.getPath());
+  }
+
+    
+  static BlockLocation[] fixBlockLocations(BlockLocation[] locations,
+                                          long start,
+                                          long len,
+                                          long fileOffsetInHar) {
+    
+    long end = start + len;
+
+    for (BlockLocation location : locations) {
+      
+      
+      long harBlockStart = location.getOffset() - fileOffsetInHar;
+      
+      
+      long harBlockEnd = harBlockStart + location.getLength();
+      
+      if (start > harBlockStart) {
+        
+        
+        location.setOffset(start);
+        
+        location.setLength(location.getLength() - (start - harBlockStart));
+      } else {
+        
+        location.setOffset(harBlockStart);
+      }
+      
+      if (harBlockEnd > end) {
+        
+        
+        location.setLength(location.getLength() - (harBlockEnd - end));
+      }
+    }
+    
+    return locations;
+  }
+  
+  
+  @Override
+  public BlockLocation[] getFileBlockLocations(FileStatus file, long start,
+                                               long len) throws IOException {
+    HarStatus hstatus = getFileHarStatus(file.getPath());
+    Path partPath = new Path(archivePath, hstatus.getPartName());
+    FileStatus partStatus = metadata.getPartFileStatus(partPath);
+
+    
+    BlockLocation[] locations = 
+      fs.getFileBlockLocations(partStatus,
+                               hstatus.getStartIndex() + start, len);
+
+    return fixBlockLocations(locations, start, len, hstatus.getStartIndex());
+  }
+  
+  
+  public static int getHarHash(Path p) {
+    return (p.toString().hashCode() & 0x7fffffff);
+  }
+  
+  static class Store {
+    public Store(long begin, long end) {
+      this.begin = begin;
+      this.end = end;
+    }
+    public long begin;
+    public long end;
+  }
+  
+  
+  private void fileStatusesInIndex(HarStatus parent, List<FileStatus> statuses)
+          throws IOException {
+    String parentString = parent.getName();
+    if (!parentString.endsWith(Path.SEPARATOR)){
+        parentString += Path.SEPARATOR;
+    }
+
+    for (String child: parent.children) {
+      Path p = new Path(parentString + child);
+      statuses.add(toFileStatus(metadata.archive.get(p)));
+    }
+  }
+
+  
+  private FileStatus toFileStatus(HarStatus h) throws IOException {
+    final Path p = h.isDir ? archivePath : new Path(archivePath, h.partName);
+    FileStatus underlying = metadata.getPartFileStatus(p);
+
+    long modTime = 0;
+    int version = metadata.getVersion();
+    if (version < 3) {
+      modTime = underlying.getModificationTime();
+    } else if (version == 3) {
+      modTime = h.getModificationTime();
+    }
+
+    return new FileStatus(
+        h.isDir()? 0L: h.getLength(),
+        h.isDir(),
+        underlying.getReplication(),
+        underlying.getBlockSize(),
+        modTime,
+        underlying.getAccessTime(),
+        underlying.getPermission(),
+        underlying.getOwner(),
+        underlying.getGroup(),
+        makeRelative(this.uri.getPath(), new Path(h.name)));
+  }
+
+  
+  
+  
+  
+  
+  private class HarStatus {
+    boolean isDir;
+    String name;
+    List<String> children;
+    String partName;
+    long startIndex;
+    long length;
+    long modificationTime = 0;
+
+    public HarStatus(String harString) throws UnsupportedEncodingException {
+      String[] splits = harString.split(" ");
+      this.name = decodeFileName(splits[0]);
+      this.isDir = "dir".equals(splits[1]);
+      
+      this.partName = splits[2];
+      this.startIndex = Long.parseLong(splits[3]);
+      this.length = Long.parseLong(splits[4]);
+
+      int version = metadata.getVersion();
+      String[] propSplits = null;
+      
+      
+      
+      
+      
+      
+      
+      
+      
+      if (isDir) {
+        if (version == 3){
+          propSplits = decodeString(this.partName).split(" ");
+        }
+        children = new ArrayList<String>();
+        for (int i = 5; i < splits.length; i++) {
+          children.add(decodeFileName(splits[i]));
+        }
+      } else if (version == 3) {
+        propSplits = decodeString(splits[5]).split(" ");
+      }
+
+      if (propSplits != null && propSplits.length >= 4) {
+        modificationTime = Long.parseLong(propSplits[0]);
+        
+        
+        
+        
+        
+      }
+    }
+    public boolean isDir() {
+      return isDir;
+    }
+    
+    public String getName() {
+      return name;
+    }
+    public String getPartName() {
+      return partName;
+    }
+    public long getStartIndex() {
+      return startIndex;
+    }
+    public long getLength() {
+      return length;
+    }
+    public long getModificationTime() {
+      return modificationTime;
+    }
+  }
+  
+  
+  @Override
+  public FileStatus getFileStatus(Path f) throws IOException {
+    HarStatus hstatus = getFileHarStatus(f);
+    return toFileStatus(hstatus);
+  }
+
+  private HarStatus getFileHarStatus(Path f) throws IOException {
+    
+    
+    Path p = makeQualified(f);
+    Path harPath = getPathInHar(p);
+    if (harPath == null) {
+      throw new IOException("Invalid file name: " + f + " in " + uri);
+    }
+    HarStatus hstatus = metadata.archive.get(harPath);
+    if (hstatus == null) {
+      throw new FileNotFoundException("File: " +  f + " does not exist in " + uri);
+    }
+    return hstatus;
+  }
+
+  @Override
+  public void msync() throws IOException, UnsupportedOperationException {
+    fs.msync();
+  }
+
+  
+  @Override
+  public FileChecksum getFileChecksum(Path f, long length) {
+    return null;
+  }
+
+  
+  @Override
+  public FSDataInputStream open(Path f, int bufferSize) throws IOException {
+    
+    HarStatus hstatus = getFileHarStatus(f);
+    if (hstatus.isDir()) {
+      throw new FileNotFoundException(f + " : not a file in " +
+                archivePath);
+    }
+    return new HarFSDataInputStream(fs, new Path(archivePath, 
+        hstatus.getPartName()),
+        hstatus.getStartIndex(), hstatus.getLength(), bufferSize);
+  }
+
+  @Override
+  protected PathHandle createPathHandle(FileStatus stat, HandleOpt... opts) {
+    
+    
+    throw new UnsupportedOperationException();
+  }
+
+  @Override
+  public FSDataInputStream open(PathHandle fd, int bufferSize)
+      throws IOException {
+    throw new UnsupportedOperationException();
+  }
+
+  
+  @Override
+  public FileSystem[] getChildFileSystems() {
+    return new FileSystem[]{fs};
+  }
+
+  @Override
+  public FSDataOutputStream create(Path f, FsPermission permission,
+      boolean overwrite, int bufferSize, short replication, long blockSize,
+      Progressable progress) throws IOException {
+    throw new IOException("Har: create not allowed.");
+  }
+
+  @Override
+  public FSDataOutputStream createNonRecursive(Path f, boolean overwrite,
+      int bufferSize, short replication, long blockSize, Progressable progress)
+      throws IOException {
+    throw new IOException("Har: create not allowed.");
+  }
+
+  @Override
+  public FSDataOutputStream append(Path f, int bufferSize, Progressable progress) throws IOException {
+    throw new IOException("Har: append not allowed.");
+  }
+
+  @Override
+  public void close() throws IOException {
+    super.close();
+    if (fs != null) {
+      try {
+        fs.close();
+      } catch(IOException ie) {
+        
+        
+      }
+    }
+  }
+  
+  
+  @Override
+  public boolean setReplication(Path src, short replication) throws IOException{
+    throw new IOException("Har: setReplication not allowed");
+  }
+
+  @Override
+  public boolean rename(Path src, Path dst) throws IOException {
+    throw new IOException("Har: rename not allowed");
+  }
+
+  @Override
+  public FSDataOutputStream append(Path f) throws IOException {
+    throw new IOException("Har: append not allowed");
+  }
+
+  
+  @Override
+  public boolean truncate(Path f, long newLength) throws IOException {
+    throw new IOException("Har: truncate not allowed");
+  }
+
+  
+  @Override
+  public boolean delete(Path f, boolean recursive) throws IOException { 
+    throw new IOException("Har: delete not allowed");
+  }
+
+  
+  @Override
+  public FileStatus[] listStatus(Path f) throws IOException {
+    
+    
+    
+    
+    List<FileStatus> statuses = new ArrayList<FileStatus>();
+    Path tmpPath = makeQualified(f);
+    Path harPath = getPathInHar(tmpPath);
+    HarStatus hstatus = metadata.archive.get(harPath);
+    if (hstatus == null) {
+      throw new FileNotFoundException("File " + f + " not found in " + archivePath);
+    }
+    if (hstatus.isDir()) {
+      fileStatusesInIndex(hstatus, statuses);
+    } else {
+      statuses.add(toFileStatus(hstatus));
+    }
+    
+    return statuses.toArray(new FileStatus[statuses.size()]);
+  }
+  
+  
+  @Override
+  public Path getHomeDirectory() {
+    return new Path(uri.toString());
+  }
+
+  @Override
+  public void setWorkingDirectory(Path newDir) {
+    
+  }
+  
+  
+  @Override
+  public boolean mkdirs(Path f, FsPermission permission) throws IOException {
+    throw new IOException("Har: mkdirs not allowed");
+  }
+  
+  
+  @Override
+  public void copyFromLocalFile(boolean delSrc, boolean overwrite,
+      Path src, Path dst) throws IOException {
+    throw new IOException("Har: copyfromlocalfile not allowed");
+  }
+
+  @Override
+  public void copyFromLocalFile(boolean delSrc, boolean overwrite,
+      Path[] srcs, Path dst) throws IOException {
+    throw new IOException("Har: copyfromlocalfile not allowed");
+  }
+
+  
+  @Override
+  public void copyToLocalFile(boolean delSrc, Path src, Path dst) 
+    throws IOException {
+    FileUtil.copy(this, src, getLocal(getConf()), dst, false, getConf());
+  }
+  
+  
+  @Override
+  public Path startLocalOutput(Path fsOutputFile, Path tmpLocalFile) 
+    throws IOException {
+    throw new IOException("Har: startLocalOutput not allowed");
+  }
+  
+  
+  @Override
+  public void completeLocalOutput(Path fsOutputFile, Path tmpLocalFile) 
+    throws IOException {
+    throw new IOException("Har: completeLocalOutput not allowed");
+  }
+  
+  
+  @Override
+  public void setOwner(Path p, String username, String groupname)
+    throws IOException {
+    throw new IOException("Har: setowner not allowed");
+  }
+
+  @Override
+  public void setTimes(Path p, long mtime, long atime) throws IOException {
+    throw new IOException("Har: setTimes not allowed");
+  }
+
+  
+  @Override
+  public void setPermission(Path p, FsPermission permission)
+    throws IOException {
+    throw new IOException("Har: setPermission not allowed");
+  }
+
+  
+  @Override
+  public boolean hasPathCapability(final Path path, final String capability)
+      throws IOException {
+    switch (validatePathCapabilityArgs(path, capability)) {
+    case CommonPathCapabilities.FS_READ_ONLY_CONNECTOR:
+      return true;
+    default:
+      return false;
+    }
+  }
+
+  
+  private static class HarFSDataInputStream extends FSDataInputStream {
+    
+    private static class HarFsInputStream extends FSInputStream
+        implements CanSetDropBehind, CanSetReadahead {
+      private long position, start, end;
+      
+      
+      private final FSDataInputStream underLyingStream;
+      
+      private final byte[] oneBytebuff = new byte[1];
+      
+      HarFsInputStream(FileSystem fs, Path path, long start,
+          long length, int bufferSize) throws IOException {
+        if (length < 0) {
+          throw new IllegalArgumentException("Negative length ["+length+"]");
+        }
+        underLyingStream = fs.open(path, bufferSize);
+        underLyingStream.seek(start);
+        
+        this.start = start;
+        
+        this.position = start;
+        
+        this.end = start + length;
+      }
+      
+      @Override
+      public synchronized int available() throws IOException {
+        long remaining = end - underLyingStream.getPos();
+        if (remaining > Integer.MAX_VALUE) {
+          return Integer.MAX_VALUE;
+        }
+        return (int) remaining;
+      }
+      
+      @Override
+      public synchronized  void close() throws IOException {
+        underLyingStream.close();
+        super.close();
+      }
+      
+      
+      @Override
+      public void mark(int readLimit) {
+        
+      }
+      
+      
+      @Override
+      public void reset() throws IOException {
+        throw new IOException("reset not implemented.");
+      }
+      
+      @Override
+      public synchronized int read() throws IOException {
+        int ret = read(oneBytebuff, 0, 1);
+        return (ret <= 0) ? -1: (oneBytebuff[0] & 0xff);
+      }
+      
+      
+      
+      
+      
+      @Override
+      public synchronized int read(byte[] b) throws IOException {
+        final int ret = read(b, 0, b.length);
+        return ret;
+      }
+      
+      
+      @Override
+      public synchronized int read(byte[] b, int offset, int len) 
+        throws IOException {
+        if (len == 0) {
+          return 0;
+        }
+        int newlen = len;
+        int ret = -1;
+        if (position + len > end) {
+          newlen = (int) (end - position);
+        }
+        
+        if (newlen == 0)
+          return ret;
+        ret = underLyingStream.read(b, offset, newlen);
+        position += ret;
+        return ret;
+      }
+      
+      @Override
+      public synchronized long skip(long n) throws IOException {
+        long tmpN = n;
+        if (tmpN > 0) {
+          final long actualRemaining = end - position; 
+          if (tmpN > actualRemaining) {
+            tmpN = actualRemaining;
+          }   
+          underLyingStream.seek(tmpN + position);
+          position += tmpN;
+          return tmpN;
+        }   
+        
+        
+        
+        return 0;
+      }   
+      
+      @Override
+      public synchronized long getPos() throws IOException {
+        return (position - start);
+      }
+      
+      @Override
+      public synchronized void seek(final long pos) throws IOException {
+        validatePosition(pos);
+        position = start + pos;
+        underLyingStream.seek(position);
+      }
+
+      private void validatePosition(final long pos) throws IOException {
+        if (pos < 0) {
+          throw new IOException("Negative position: "+pos);
+         }
+         final long length = end - start;
+         if (pos > length) {
+           throw new IOException("Position behind the end " +
+               "of the stream (length = "+length+"): " + pos);
+         }
+      }
+
+      @Override
+      public boolean seekToNewSource(long targetPos) throws IOException {
+        
+        
+        
+        return false;
+      }
+      
+      
+      @Override
+      public int read(long pos, byte[] b, int offset, int length) 
+      throws IOException {
+        int nlength = length;
+        if (start + nlength + pos > end) {
+          
+          nlength = (int) (end - start - pos);
+        }
+        if (nlength <= 0) {
+          
+          return -1;
+        }
+        return underLyingStream.read(pos + start , b, offset, nlength);
+      }
+      
+      
+      @Override
+      public void readFully(long pos, byte[] b, int offset, int length) 
+      throws IOException {
+        validatePositionedReadArgs(pos, b, offset, length);
+        if (length == 0) {
+          return;
+        }
+        if (start + length + pos > end) {
+          throw new EOFException("Not enough bytes to read.");
+        }
+        underLyingStream.readFully(pos + start, b, offset, length);
+      }
+
+      @Override
+      public void setReadahead(Long readahead) throws IOException {
+        underLyingStream.setReadahead(readahead);
+      }
+
+      @Override
+      public void setDropBehind(Boolean dropBehind) throws IOException {
+        underLyingStream.setDropBehind(dropBehind);
+      }
+    }
+  
+    
+    public HarFSDataInputStream(FileSystem fs, Path  p, long start, 
+        long length, int bufsize) throws IOException {
+        super(new HarFsInputStream(fs, p, start, length, bufsize));
+    }
+  }
+
+  private class HarMetaData {
+    private FileSystem fs;
+    private int version;
+    
+    private Path masterIndexPath;
+    
+    private Path archiveIndexPath;
+
+    private long masterIndexTimestamp;
+    private long archiveIndexTimestamp;
+
+    List<Store> stores = new ArrayList<Store>();
+    Map<Path, HarStatus> archive = new HashMap<Path, HarStatus>();
+    
+    private Map<Path, FileStatus> partFileStatuses = new ConcurrentHashMap<>();
+
+    public HarMetaData(FileSystem fs, Path masterIndexPath, Path archiveIndexPath) {
+      this.fs = fs;
+      this.masterIndexPath = masterIndexPath;
+      this.archiveIndexPath = archiveIndexPath;
+    }
+
+    public FileStatus getPartFileStatus(Path path) throws IOException {
+      Path partPath = getPathInHar(path);
+      FileStatus status;
+      status = partFileStatuses.get(partPath);
+      if (status == null) {
+        status = fs.getFileStatus(path);
+        partFileStatuses.put(partPath, status);
+      }
+      return status;
+    }
+
+    private void addPartFileStatuses(Path path) throws IOException {
+      for (FileStatus stat : fs.listStatus(path)) {
+        partFileStatuses.put(getPathInHar(stat.getPath()), stat);
+      }
+    }
+
+    public long getMasterIndexTimestamp() {
+      return masterIndexTimestamp;
+    }
+
+    public long getArchiveIndexTimestamp() {
+      return archiveIndexTimestamp;
+    }
+
+    private int getVersion() {
+      return version;
+    }
+
+    private void parseMetaData() throws IOException {
+      Text line = new Text();
+      long read;
+      FSDataInputStream in = null;
+      LineReader lin = null;
+
+      try {
+        in = fs.open(masterIndexPath);
+        FileStatus masterStat = fs.getFileStatus(masterIndexPath);
+        masterIndexTimestamp = masterStat.getModificationTime();
+        lin = new LineReader(in, getConf());
+        read = lin.readLine(line);
+
+        
+        String versionLine = line.toString();
+        String[] arr = versionLine.split(" ");
+        version = Integer.parseInt(arr[0]);
+        
+        if (this.version > HarFileSystem.VERSION) {
+          throw new IOException("Invalid version " + 
+              this.version + " expected " + HarFileSystem.VERSION);
+        }
+
+        
+        String[] readStr;
+        while(read < masterStat.getLen()) {
+          int b = lin.readLine(line);
+          read += b;
+          readStr = line.toString().split(" ");
+          stores.add(new Store(Long.parseLong(readStr[2]), 
+              Long.parseLong(readStr[3])));
+          line.clear();
+        }
+      } catch (IOException ioe) {
+        LOG.warn("Encountered exception ", ioe);
+        throw ioe;
+      } finally {
+        IOUtils.cleanupWithLogger(LOG, lin, in);
+      }
+
+      FSDataInputStream aIn = fs.open(archiveIndexPath);
+      try {
+        FileStatus archiveStat = fs.getFileStatus(archiveIndexPath);
+        archiveIndexTimestamp = archiveStat.getModificationTime();
+
+        
+        addPartFileStatuses(archiveIndexPath.getParent());
+        LineReader aLin = null;
+
+        
+        long pos = -1;
+        for (Store s: stores) {
+          if (pos != s.begin) {
+            pos = s.begin;
+            aIn.seek(s.begin);
+            aLin = new LineReader(aIn, getConf());
+          }
+
+          while (pos < s.end) {
+            pos += aLin.readLine(line);
+            String lineFeed = line.toString();
+            String[] parsed = lineFeed.split(" ");
+            parsed[0] = decodeFileName(parsed[0]);
+            archive.put(new Path(parsed[0]), new HarStatus(lineFeed));
+            line.clear();
+          }
+        }
+      } finally {
+        IOUtils.cleanupWithLogger(LOG, aIn);
+      }
+    }
+  }
+  
+  
+  HarMetaData getMetadata() {
+    return metadata;
+  }
+
+  private static class LruCache<K, V> extends LinkedHashMap<K, V> {
+    private final int MAX_ENTRIES;
+
+    public LruCache(int maxEntries) {
+        super(maxEntries + 1, 1.0f, true);
+        MAX_ENTRIES = maxEntries;
+    }
+
+    @Override
+    protected boolean removeEldestEntry(Map.Entry<K, V> eldest) {
+        return size() > MAX_ENTRIES;
+    }
+  }
+
+  @SuppressWarnings("deprecation")
+  @Override
+  public FsServerDefaults getServerDefaults() throws IOException {
+    return fs.getServerDefaults();
+  }
+
+  @Override
+  public FsServerDefaults getServerDefaults(Path f) throws IOException {
+    return fs.getServerDefaults(f);
+  }
+
+  @Override
+  public long getUsed() throws IOException{
+    return fs.getUsed();
+  }
+
+  
+  @Override
+  public long getUsed(Path path) throws IOException {
+    return fs.getUsed(path);
+  }
+
+  @SuppressWarnings("deprecation")
+  @Override
+  public long getDefaultBlockSize() {
+    return fs.getDefaultBlockSize();
+  }
+
+  @SuppressWarnings("deprecation")
+  @Override
+  public long getDefaultBlockSize(Path f) {
+    return fs.getDefaultBlockSize(f);
+  }
+
+  @SuppressWarnings("deprecation")
+  @Override
+  public short getDefaultReplication() {
+    return fs.getDefaultReplication();
+  }
+
+  @Override
+  public short getDefaultReplication(Path f) {
+    return fs.getDefaultReplication(f);
+  }
+
+  @Override
+  public FSDataOutputStreamBuilder createFile(Path path) {
+    return fs.createFile(path);
+  }
+
+  @Override
+  public FSDataOutputStreamBuilder appendFile(Path path) {
+    return fs.appendFile(path);
+  }
+}

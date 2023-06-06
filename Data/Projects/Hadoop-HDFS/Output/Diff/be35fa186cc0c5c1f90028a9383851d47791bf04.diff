@@ -1,0 +1,162 @@
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+index 630b5500c064..f54f9ecaf527 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+@@ -6323,13 +6323,19 @@ boolean isExternalInvocation() {
+   private static UserGroupInformation getRemoteUser() throws IOException {
+     return NameNode.getRemoteUser();
+   }
+-  
++
+   /**
+-   * Log fsck event in the audit log 
++   * Log fsck event in the audit log.
++   *
++   * @param succeeded Whether authorization succeeded.
++   * @param src Path of affected source file.
++   * @param remoteAddress Remote address of the request.
++   * @throws IOException if {@link #getRemoteUser()} fails.
+    */
+-  void logFsckEvent(String src, InetAddress remoteAddress) throws IOException {
++  void logFsckEvent(boolean succeeded, String src, InetAddress remoteAddress)
++      throws IOException {
+     if (isAuditEnabled()) {
+-      logAuditEvent(true, getRemoteUser(),
++      logAuditEvent(succeeded, getRemoteUser(),
+                     remoteAddress,
+                     "fsck", src, null, null);
+     }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FsckServlet.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FsckServlet.java
+index 5fae9cd48901..e5c02e81dccf 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FsckServlet.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FsckServlet.java
+@@ -55,21 +55,25 @@ public void doGet(HttpServletRequest request, HttpServletResponse response
+ 
+     final UserGroupInformation ugi = getUGI(request, conf);
+     try {
+-      ugi.doAs(new PrivilegedExceptionAction<Object>() {
+-        @Override
+-        public Object run() throws Exception {
+-          NameNode nn = NameNodeHttpServer.getNameNodeFromContext(context);
+-          
+-          final FSNamesystem namesystem = nn.getNamesystem();
+-          final BlockManager bm = namesystem.getBlockManager();
+-          final int totalDatanodes = 
+-              namesystem.getNumberOfDatanodes(DatanodeReportType.LIVE); 
+-          new NamenodeFsck(conf, nn,
+-              bm.getDatanodeManager().getNetworkTopology(), pmap, out,
+-              totalDatanodes, remoteAddress).fsck();
+-          
+-          return null;
++      ugi.doAs((PrivilegedExceptionAction<Object>) () -> {
++        NameNode nn = NameNodeHttpServer.getNameNodeFromContext(context);
++
++        final FSNamesystem namesystem = nn.getNamesystem();
++        final BlockManager bm = namesystem.getBlockManager();
++        final int totalDatanodes =
++            namesystem.getNumberOfDatanodes(DatanodeReportType.LIVE);
++        NamenodeFsck fsck = new NamenodeFsck(conf, nn,
++            bm.getDatanodeManager().getNetworkTopology(), pmap, out,
++            totalDatanodes, remoteAddress);
++        String auditSource = fsck.getAuditSource();
++        boolean success = false;
++        try {
++          fsck.fsck();
++          success = true;
++        } finally {
++          namesystem.logFsckEvent(success, auditSource, remoteAddress);
+         }
++        return null;
+       });
+     } catch (InterruptedException e) {
+       response.sendError(400, e.getMessage());
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeFsck.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeFsck.java
+index 370c1b2b4813..342cd96290e0 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeFsck.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeFsck.java
+@@ -155,6 +155,7 @@ public class NamenodeFsck implements DataEncryptionKeyFactory {
+   private boolean showMaintenanceState = false;
+   private long staleInterval;
+   private Tracer tracer;
++  private String auditSource;
+ 
+   /**
+    * True if we encountered an internal error during FSCK, such as not being
+@@ -186,7 +187,7 @@ public class NamenodeFsck implements DataEncryptionKeyFactory {
+ 
+   String path = "/";
+ 
+-  private String blockIds = null;
++  private String[] blockIds = null;
+ 
+   // We return back N files that are corrupt; the list of files returned is
+   // ordered by block id; to allow continuation support, pass in the last block
+@@ -262,11 +263,17 @@ else if (key.equals("replicadetails")) {
+       } else if (key.equals("includeSnapshots")) {
+         this.snapshottableDirs = new ArrayList<String>();
+       } else if (key.equals("blockId")) {
+-        this.blockIds = pmap.get("blockId")[0];
++        this.blockIds = pmap.get("blockId")[0].split(" ");
+       } else if (key.equals("replicate")) {
+         this.doReplicate = true;
+       }
+     }
++    this.auditSource = (blockIds != null)
++        ? "blocksIds=" + Arrays.asList(blockIds) : path;
++  }
++
++  public String getAuditSource() {
++    return auditSource;
+   }
+ 
+   /**
+@@ -368,18 +375,18 @@ private void printDatanodeReplicaStatus(Block block,
+   /**
+    * Check files on DFS, starting from the indicated path.
+    */
+-  public void fsck() {
++  public void fsck() throws AccessControlException {
+     final long startTime = Time.monotonicNow();
+     try {
+       if(blockIds != null) {
+-        String[] blocks = blockIds.split(" ");
++        namenode.getNamesystem().checkSuperuserPrivilege();
+         StringBuilder sb = new StringBuilder();
+         sb.append("FSCK started by " +
+             UserGroupInformation.getCurrentUser() + " from " +
+             remoteAddress + " at " + new Date());
+         out.println(sb);
+         sb.append(" for blockIds: \n");
+-        for (String blk: blocks) {
++        for (String blk: blockIds) {
+           if(blk == null || !blk.contains(Block.BLOCK_FILE_PREFIX)) {
+             out.println("Incorrect blockId format: " + blk);
+             continue;
+@@ -389,7 +396,6 @@ public void fsck() {
+           sb.append(blk + "\n");
+         }
+         LOG.info("{}", sb.toString());
+-        namenode.getNamesystem().logFsckEvent("/", remoteAddress);
+         out.flush();
+         return;
+       }
+@@ -398,7 +404,6 @@ public void fsck() {
+           + " from " + remoteAddress + " for path " + path + " at " + new Date();
+       LOG.info(msg);
+       out.println(msg);
+-      namenode.getNamesystem().logFsckEvent(path, remoteAddress);
+ 
+       if (snapshottableDirs != null) {
+         SnapshottableDirectoryStatus[] snapshotDirs =
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFsck.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFsck.java
+index 37715ced4aa5..d89bb6b4332c 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFsck.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFsck.java
+@@ -254,6 +254,7 @@ private void setupAuditLogs() throws IOException {
+       file.delete();
+     }
+     Logger logger = ((Log4JLogger) FSNamesystem.auditLog).getLogger();
++    logger.removeAllAppenders();
+     logger.setLevel(Level.INFO);
+     PatternLayout layout = new PatternLayout("%m%n");
+     RollingFileAppender appender =

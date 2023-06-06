@@ -1,0 +1,4048 @@
+
+
+package org.apache.hadoop.fs.s3a;
+
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.io.InterruptedIOException;
+import java.net.URI;
+import java.nio.file.AccessDeniedException;
+import java.text.DateFormat;
+import java.text.SimpleDateFormat;
+import java.time.Instant;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Date;
+import java.util.EnumSet;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import javax.annotation.Nullable;
+
+import com.amazonaws.AmazonClientException;
+import com.amazonaws.AmazonServiceException;
+import com.amazonaws.SdkBaseException;
+import com.amazonaws.services.s3.AmazonS3;
+import com.amazonaws.services.s3.model.CannedAccessControlList;
+import com.amazonaws.services.s3.model.CopyObjectRequest;
+import com.amazonaws.services.s3.model.DeleteObjectsRequest;
+import com.amazonaws.services.s3.model.DeleteObjectsResult;
+import com.amazonaws.services.s3.model.GetObjectMetadataRequest;
+import com.amazonaws.services.s3.model.GetObjectRequest;
+import com.amazonaws.services.s3.model.InitiateMultipartUploadRequest;
+import com.amazonaws.services.s3.model.InitiateMultipartUploadResult;
+import com.amazonaws.services.s3.model.ListMultipartUploadsRequest;
+import com.amazonaws.services.s3.model.ListObjectsRequest;
+import com.amazonaws.services.s3.model.ListObjectsV2Request;
+import com.amazonaws.services.s3.model.MultiObjectDeleteException;
+import com.amazonaws.services.s3.model.MultipartUpload;
+import com.amazonaws.services.s3.model.ObjectMetadata;
+import com.amazonaws.services.s3.model.PutObjectRequest;
+import com.amazonaws.services.s3.model.PutObjectResult;
+import com.amazonaws.services.s3.model.S3Object;
+import com.amazonaws.services.s3.model.UploadPartRequest;
+import com.amazonaws.services.s3.model.UploadPartResult;
+import com.amazonaws.services.s3.transfer.Copy;
+import com.amazonaws.services.s3.transfer.TransferManager;
+import com.amazonaws.services.s3.transfer.TransferManagerConfiguration;
+import com.amazonaws.services.s3.transfer.Upload;
+import com.amazonaws.services.s3.transfer.model.CopyResult;
+import com.amazonaws.services.s3.transfer.model.UploadResult;
+import com.amazonaws.event.ProgressListener;
+
+import org.apache.hadoop.fs.s3a.audit.AuditSpanS3A;
+import org.apache.hadoop.fs.store.audit.ActiveThreadSpanSource;
+import org.apache.hadoop.thirdparty.com.google.common.annotations.VisibleForTesting;
+import org.apache.hadoop.thirdparty.com.google.common.base.Preconditions;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.commons.lang3.tuple.Pair;
+import org.apache.commons.lang3.tuple.Triple;
+import org.apache.hadoop.classification.InterfaceAudience;
+import org.apache.hadoop.classification.InterfaceStability;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.CommonPathCapabilities;
+import org.apache.hadoop.fs.ContentSummary;
+import org.apache.hadoop.fs.CreateFlag;
+import org.apache.hadoop.fs.FSDataInputStream;
+import org.apache.hadoop.fs.FSDataOutputStream;
+import org.apache.hadoop.fs.Globber;
+import org.apache.hadoop.fs.impl.OpenFileParameters;
+import org.apache.hadoop.fs.permission.FsAction;
+import org.apache.hadoop.fs.s3a.auth.SignerManager;
+import org.apache.hadoop.fs.s3a.auth.delegation.DelegationOperations;
+import org.apache.hadoop.fs.s3a.auth.delegation.DelegationTokenProvider;
+import org.apache.hadoop.fs.s3a.impl.BulkDeleteRetryHandler;
+import org.apache.hadoop.fs.s3a.impl.ChangeDetectionPolicy;
+import org.apache.hadoop.fs.s3a.impl.ContextAccessors;
+import org.apache.hadoop.fs.s3a.impl.CopyOutcome;
+import org.apache.hadoop.fs.s3a.impl.DeleteOperation;
+import org.apache.hadoop.fs.s3a.impl.DirectoryPolicy;
+import org.apache.hadoop.fs.s3a.impl.DirectoryPolicyImpl;
+import org.apache.hadoop.fs.s3a.impl.GetContentSummaryOperation;
+import org.apache.hadoop.fs.s3a.impl.HeaderProcessing;
+import org.apache.hadoop.fs.s3a.impl.InternalConstants;
+import org.apache.hadoop.fs.s3a.impl.ListingOperationCallbacks;
+import org.apache.hadoop.fs.s3a.impl.MkdirOperation;
+import org.apache.hadoop.fs.s3a.impl.MultiObjectDeleteSupport;
+import org.apache.hadoop.fs.s3a.impl.OperationCallbacks;
+import org.apache.hadoop.fs.s3a.impl.RenameOperation;
+import org.apache.hadoop.fs.s3a.impl.RequestFactoryImpl;
+import org.apache.hadoop.fs.s3a.impl.S3AMultipartUploaderBuilder;
+import org.apache.hadoop.fs.s3a.impl.StatusProbeEnum;
+import org.apache.hadoop.fs.s3a.impl.StoreContext;
+import org.apache.hadoop.fs.s3a.impl.StoreContextBuilder;
+import org.apache.hadoop.fs.s3a.s3guard.BulkOperationState;
+import org.apache.hadoop.fs.s3a.select.InternalSelectConstants;
+import org.apache.hadoop.fs.s3a.tools.MarkerToolOperations;
+import org.apache.hadoop.fs.s3a.tools.MarkerToolOperationsImpl;
+import org.apache.hadoop.fs.statistics.DurationTracker;
+import org.apache.hadoop.fs.statistics.DurationTrackerFactory;
+import org.apache.hadoop.fs.statistics.IOStatistics;
+import org.apache.hadoop.fs.statistics.IOStatisticsLogging;
+import org.apache.hadoop.fs.statistics.IOStatisticsSource;
+import org.apache.hadoop.fs.store.audit.AuditEntryPoint;
+import org.apache.hadoop.fs.store.audit.AuditSpan;
+import org.apache.hadoop.fs.store.audit.AuditSpanSource;
+import org.apache.hadoop.io.IOUtils;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.security.AccessControlException;
+import org.apache.hadoop.security.token.DelegationTokenIssuer;
+import org.apache.hadoop.security.token.TokenIdentifier;
+import org.apache.hadoop.util.DurationInfo;
+import org.apache.hadoop.util.LambdaUtils;
+import org.apache.hadoop.fs.FileAlreadyExistsException;
+import org.apache.hadoop.fs.FileStatus;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.GlobalStorageStatistics;
+import org.apache.hadoop.fs.InvalidRequestException;
+import org.apache.hadoop.fs.LocalDirAllocator;
+import org.apache.hadoop.fs.LocalFileSystem;
+import org.apache.hadoop.fs.LocatedFileStatus;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.PathFilter;
+import org.apache.hadoop.fs.PathIOException;
+import org.apache.hadoop.fs.RemoteIterator;
+import org.apache.hadoop.fs.StreamCapabilities;
+import org.apache.hadoop.fs.permission.FsPermission;
+import org.apache.hadoop.fs.s3a.api.RequestFactory;
+import org.apache.hadoop.fs.s3a.audit.AuditManagerS3A;
+import org.apache.hadoop.fs.s3a.audit.AuditIntegration;
+import org.apache.hadoop.fs.s3a.audit.OperationAuditor;
+import org.apache.hadoop.fs.s3a.auth.RoleModel;
+import org.apache.hadoop.fs.s3a.auth.delegation.AWSPolicyProvider;
+import org.apache.hadoop.fs.s3a.auth.delegation.EncryptionSecrets;
+import org.apache.hadoop.fs.s3a.auth.delegation.S3ADelegationTokens;
+import org.apache.hadoop.fs.s3a.auth.delegation.AbstractS3ATokenIdentifier;
+import org.apache.hadoop.fs.s3a.commit.CommitConstants;
+import org.apache.hadoop.fs.s3a.commit.PutTracker;
+import org.apache.hadoop.fs.s3a.commit.MagicCommitIntegration;
+import org.apache.hadoop.fs.s3a.impl.ChangeTracker;
+import org.apache.hadoop.fs.s3a.select.SelectBinding;
+import org.apache.hadoop.fs.s3a.select.SelectConstants;
+import org.apache.hadoop.fs.s3a.s3guard.DirListingMetadata;
+import org.apache.hadoop.fs.s3a.s3guard.MetadataStore;
+import org.apache.hadoop.fs.s3a.s3guard.PathMetadata;
+import org.apache.hadoop.fs.s3a.s3guard.S3Guard;
+import org.apache.hadoop.fs.s3a.s3guard.ITtlTimeProvider;
+import org.apache.hadoop.fs.s3a.statistics.BlockOutputStreamStatistics;
+import org.apache.hadoop.fs.s3a.statistics.CommitterStatistics;
+import org.apache.hadoop.fs.s3a.statistics.S3AStatisticsContext;
+import org.apache.hadoop.fs.s3a.statistics.impl.BondedS3AStatisticsContext;
+import org.apache.hadoop.fs.s3native.S3xLoginHelper;
+import org.apache.hadoop.io.retry.RetryPolicies;
+import org.apache.hadoop.fs.store.EtagChecksum;
+import org.apache.hadoop.security.UserGroupInformation;
+import org.apache.hadoop.util.BlockingThreadPoolExecutorService;
+import org.apache.hadoop.security.token.Token;
+import org.apache.hadoop.util.Progressable;
+import org.apache.hadoop.util.ReflectionUtils;
+import org.apache.hadoop.util.SemaphoredDelegatingExecutor;
+import org.apache.hadoop.util.concurrent.HadoopExecutors;
+import org.apache.hadoop.util.functional.CallableRaisingIOE;
+
+import static java.util.Objects.requireNonNull;
+import static org.apache.hadoop.fs.CommonConfigurationKeys.IOSTATISTICS_LOGGING_LEVEL;
+import static org.apache.hadoop.fs.CommonConfigurationKeys.IOSTATISTICS_LOGGING_LEVEL_DEFAULT;
+import static org.apache.hadoop.fs.impl.AbstractFSBuilderImpl.rejectUnknownMandatoryKeys;
+import static org.apache.hadoop.fs.impl.PathCapabilitiesSupport.validatePathCapabilityArgs;
+import static org.apache.hadoop.fs.s3a.Constants.*;
+import static org.apache.hadoop.fs.s3a.Invoker.*;
+import static org.apache.hadoop.fs.s3a.Listing.toLocatedFileStatusIterator;
+import static org.apache.hadoop.fs.s3a.S3AUtils.*;
+import static org.apache.hadoop.fs.s3a.Statistic.*;
+import static org.apache.hadoop.fs.s3a.audit.S3AAuditConstants.INITIALIZE_SPAN;
+import static org.apache.hadoop.fs.s3a.auth.RolePolicies.STATEMENT_ALLOW_SSE_KMS_RW;
+import static org.apache.hadoop.fs.s3a.auth.RolePolicies.allowS3Operations;
+import static org.apache.hadoop.fs.s3a.auth.delegation.S3ADelegationTokens.TokenIssuingPolicy.NoTokensAvailable;
+import static org.apache.hadoop.fs.s3a.auth.delegation.S3ADelegationTokens.hasDelegationTokenBinding;
+import static org.apache.hadoop.fs.s3a.commit.CommitConstants.FS_S3A_COMMITTER_ABORT_PENDING_UPLOADS;
+import static org.apache.hadoop.fs.s3a.commit.CommitConstants.FS_S3A_COMMITTER_STAGING_ABORT_PENDING_UPLOADS;
+import static org.apache.hadoop.fs.s3a.impl.CallableSupplier.submit;
+import static org.apache.hadoop.fs.s3a.impl.CallableSupplier.waitForCompletionIgnoringExceptions;
+import static org.apache.hadoop.fs.s3a.impl.ErrorTranslation.isObjectNotFound;
+import static org.apache.hadoop.fs.s3a.impl.ErrorTranslation.isUnknownBucket;
+import static org.apache.hadoop.fs.s3a.impl.InternalConstants.DEFAULT_UPLOAD_PART_COUNT_LIMIT;
+import static org.apache.hadoop.fs.s3a.impl.InternalConstants.DELETE_CONSIDERED_IDEMPOTENT;
+import static org.apache.hadoop.fs.s3a.impl.InternalConstants.SC_404;
+import static org.apache.hadoop.fs.s3a.impl.InternalConstants.UPLOAD_PART_COUNT_LIMIT;
+import static org.apache.hadoop.fs.s3a.impl.NetworkBinding.fixBucketRegion;
+import static org.apache.hadoop.fs.s3a.impl.NetworkBinding.logDnsLookup;
+import static org.apache.hadoop.fs.s3a.s3guard.S3Guard.dirMetaToStatuses;
+import static org.apache.hadoop.fs.statistics.IOStatisticsLogging.logIOStatisticsAtLevel;
+import static org.apache.hadoop.fs.statistics.StoreStatisticNames.OBJECT_CONTINUE_LIST_REQUEST;
+import static org.apache.hadoop.fs.statistics.StoreStatisticNames.OBJECT_LIST_REQUEST;
+import static org.apache.hadoop.fs.statistics.impl.IOStatisticsBinding.pairedTrackerFactory;
+import static org.apache.hadoop.fs.statistics.impl.IOStatisticsBinding.trackDuration;
+import static org.apache.hadoop.fs.statistics.impl.IOStatisticsBinding.trackDurationOfInvocation;
+import static org.apache.hadoop.fs.statistics.impl.IOStatisticsBinding.trackDurationOfOperation;
+import static org.apache.hadoop.fs.statistics.impl.IOStatisticsBinding.trackDurationOfSupplier;
+import static org.apache.hadoop.io.IOUtils.cleanupWithLogger;
+import static org.apache.hadoop.util.functional.RemoteIterators.typeCastingRemoteIterator;
+
+
+@InterfaceAudience.Private
+@InterfaceStability.Evolving
+public class S3AFileSystem extends FileSystem implements StreamCapabilities,
+    AWSPolicyProvider, DelegationTokenProvider, IOStatisticsSource,
+    AuditSpanSource<AuditSpanS3A>, ActiveThreadSpanSource<AuditSpanS3A> {
+
+  
+  public static final int DEFAULT_BLOCKSIZE = 32 * 1024 * 1024;
+
+  private URI uri;
+  private Path workingDir;
+  private String username;
+  private AmazonS3 s3;
+  
+  
+  
+  private Invoker invoker = new Invoker(RetryPolicies.TRY_ONCE_THEN_FAIL,
+      Invoker.LOG_EVENT);
+  
+  
+  private Invoker s3guardInvoker = new Invoker(RetryPolicies.TRY_ONCE_THEN_FAIL,
+      Invoker.LOG_EVENT);
+  private final Retried onRetry = this::operationRetried;
+  private String bucket;
+  private int maxKeys;
+  private Listing listing;
+  private long partSize;
+  private boolean enableMultiObjectsDelete;
+  private TransferManager transfers;
+  private ExecutorService boundedThreadPool;
+  private ThreadPoolExecutor unboundedThreadPool;
+  private int executorCapacity;
+  private long multiPartThreshold;
+  public static final Logger LOG = LoggerFactory.getLogger(S3AFileSystem.class);
+  private static final Logger PROGRESS =
+      LoggerFactory.getLogger("org.apache.hadoop.fs.s3a.S3AFileSystem.Progress");
+  private LocalDirAllocator directoryAllocator;
+  private CannedAccessControlList cannedACL;
+  private boolean failOnMetadataWriteError;
+
+  
+  private EncryptionSecrets encryptionSecrets = new EncryptionSecrets();
+  
+  private S3AInstrumentation instrumentation;
+  
+  private S3AStatisticsContext statisticsContext;
+  
+  private S3AStorageStatistics storageStatistics;
+
+  private long readAhead;
+  private S3AInputPolicy inputPolicy;
+  private ChangeDetectionPolicy changeDetectionPolicy;
+  private final AtomicBoolean closed = new AtomicBoolean(false);
+  private volatile boolean isClosed = false;
+  private MetadataStore metadataStore;
+  private boolean allowAuthoritativeMetadataStore;
+  private Collection<String> allowAuthoritativePaths;
+
+  
+  private Optional<S3ADelegationTokens> delegationTokens = Optional.empty();
+
+  
+  private UserGroupInformation owner;
+
+  private String blockOutputBuffer;
+  private S3ADataBlocks.BlockFactory blockFactory;
+  private int blockOutputActiveBlocks;
+  private WriteOperationHelper writeHelper;
+  private boolean useListV1;
+  private MagicCommitIntegration committerIntegration;
+
+  private AWSCredentialProviderList credentials;
+  private SignerManager signerManager;
+
+  private ITtlTimeProvider ttlTimeProvider;
+
+  
+  private int pageSize;
+
+  private final ListingOperationCallbacks listingOperationCallbacks =
+          new ListingOperationCallbacksImpl();
+  
+  private DirectoryPolicy directoryPolicy;
+
+  
+  private final ContextAccessors contextAccessors = new ContextAccessorsImpl();
+
+  
+  private RequestFactory requestFactory;
+
+  
+  private AuditManagerS3A auditManager =
+      AuditIntegration.stubAuditManager();
+
+  
+  @SuppressWarnings("deprecation")
+  private static void addDeprecatedKeys() {
+    Configuration.DeprecationDelta[] deltas = {
+        new Configuration.DeprecationDelta(
+            FS_S3A_COMMITTER_STAGING_ABORT_PENDING_UPLOADS,
+            FS_S3A_COMMITTER_ABORT_PENDING_UPLOADS)
+    };
+
+    if (deltas.length > 0) {
+      Configuration.addDeprecations(deltas);
+      Configuration.reloadExistingConfigurations();
+    }
+  }
+
+  static {
+    addDeprecatedKeys();
+  }
+
+  
+  public void initialize(URI name, Configuration originalConf)
+      throws IOException {
+    
+    bucket = name.getHost();
+    AuditSpan span = null;
+    try {
+      LOG.debug("Initializing S3AFileSystem for {}", bucket);
+      
+      Configuration conf = propagateBucketOptions(originalConf, bucket);
+      
+      
+      
+      conf.setClassLoader(this.getClass().getClassLoader());
+
+      
+      patchSecurityCredentialProviders(conf);
+      
+      boolean delegationTokensEnabled = hasDelegationTokenBinding(conf);
+      if (delegationTokensEnabled) {
+        LOG.debug("Using delegation tokens");
+      }
+      
+      
+      setUri(name, delegationTokensEnabled);
+      super.initialize(uri, conf);
+      setConf(conf);
+
+      
+      
+      setEncryptionSecrets(new EncryptionSecrets(
+          getEncryptionAlgorithm(bucket, conf),
+          getServerSideEncryptionKey(bucket, getConf())));
+
+      invoker = new Invoker(new S3ARetryPolicy(getConf()), onRetry);
+      instrumentation = new S3AInstrumentation(uri);
+      initializeStatisticsBinding();
+
+      
+      owner = UserGroupInformation.getCurrentUser();
+      username = owner.getShortUserName();
+      workingDir = new Path("/user", username)
+          .makeQualified(this.uri, this.getWorkingDirectory());
+
+      s3guardInvoker = new Invoker(new S3GuardExistsRetryPolicy(getConf()),
+          onRetry);
+
+      failOnMetadataWriteError = conf.getBoolean(FAIL_ON_METADATA_WRITE_ERROR,
+          FAIL_ON_METADATA_WRITE_ERROR_DEFAULT);
+
+      maxKeys = intOption(conf, MAX_PAGING_KEYS, DEFAULT_MAX_PAGING_KEYS, 1);
+      partSize = getMultipartSizeProperty(conf,
+          MULTIPART_SIZE, DEFAULT_MULTIPART_SIZE);
+      multiPartThreshold = getMultipartSizeProperty(conf,
+          MIN_MULTIPART_THRESHOLD, DEFAULT_MIN_MULTIPART_THRESHOLD);
+
+      
+      longBytesOption(conf, FS_S3A_BLOCK_SIZE, DEFAULT_BLOCKSIZE, 1);
+      enableMultiObjectsDelete = conf.getBoolean(ENABLE_MULTI_DELETE, true);
+
+      readAhead = longBytesOption(conf, READAHEAD_RANGE,
+          DEFAULT_READAHEAD_RANGE, 0);
+
+      initThreadPools(conf);
+
+      int listVersion = conf.getInt(LIST_VERSION, DEFAULT_LIST_VERSION);
+      if (listVersion < 1 || listVersion > 2) {
+        LOG.warn("Configured fs.s3a.list.version {} is invalid, forcing " +
+            "version 2", listVersion);
+      }
+      useListV1 = (listVersion == 1);
+
+      signerManager = new SignerManager(bucket, this, conf, owner);
+      signerManager.initCustomSigners();
+
+      
+      initializeAuditService();
+
+      
+      
+      requestFactory = createRequestFactory();
+
+      
+      
+      
+      writeHelper = createWriteOperationHelper(getActiveAuditSpan());
+
+      
+      span = createSpan(INITIALIZE_SPAN, bucket, null);
+
+      
+      
+      
+      
+      bindAWSClient(name, delegationTokensEnabled);
+
+      initTransferManager();
+
+      initCannedAcls(conf);
+
+      
+      doBucketProbing();
+
+      inputPolicy = S3AInputPolicy.getPolicy(
+          conf.getTrimmed(INPUT_FADVISE, INPUT_FADV_NORMAL));
+      LOG.debug("Input fadvise policy = {}", inputPolicy);
+      changeDetectionPolicy = ChangeDetectionPolicy.getPolicy(conf);
+      LOG.debug("Change detection policy = {}", changeDetectionPolicy);
+      boolean magicCommitterEnabled = conf.getBoolean(
+          CommitConstants.MAGIC_COMMITTER_ENABLED,
+          CommitConstants.DEFAULT_MAGIC_COMMITTER_ENABLED);
+      LOG.debug("Filesystem support for magic committers {} enabled",
+          magicCommitterEnabled ? "is" : "is not");
+      committerIntegration = new MagicCommitIntegration(
+          this, magicCommitterEnabled);
+
+      boolean blockUploadEnabled = conf.getBoolean(FAST_UPLOAD, true);
+
+      if (!blockUploadEnabled) {
+        LOG.warn("The \"slow\" output stream is no longer supported");
+      }
+      blockOutputBuffer = conf.getTrimmed(FAST_UPLOAD_BUFFER,
+          DEFAULT_FAST_UPLOAD_BUFFER);
+      partSize = ensureOutputParameterInRange(MULTIPART_SIZE, partSize);
+      blockFactory = S3ADataBlocks.createFactory(this, blockOutputBuffer);
+      blockOutputActiveBlocks = intOption(conf,
+          FAST_UPLOAD_ACTIVE_BLOCKS, DEFAULT_FAST_UPLOAD_ACTIVE_BLOCKS, 1);
+      LOG.debug("Using S3ABlockOutputStream with buffer = {}; block={};" +
+              " queue limit={}",
+          blockOutputBuffer, partSize, blockOutputActiveBlocks);
+      long authDirTtl = conf.getTimeDuration(METADATASTORE_METADATA_TTL,
+          DEFAULT_METADATASTORE_METADATA_TTL, TimeUnit.MILLISECONDS);
+      ttlTimeProvider = new S3Guard.TtlTimeProvider(authDirTtl);
+
+      setMetadataStore(S3Guard.getMetadataStore(this, ttlTimeProvider));
+      allowAuthoritativeMetadataStore = conf.getBoolean(METADATASTORE_AUTHORITATIVE,
+          DEFAULT_METADATASTORE_AUTHORITATIVE);
+      allowAuthoritativePaths = S3Guard.getAuthoritativePaths(this);
+
+      if (hasMetadataStore()) {
+        LOG.debug("Using metadata store {}, authoritative store={}, authoritative path={}",
+            getMetadataStore(), allowAuthoritativeMetadataStore, allowAuthoritativePaths);
+      }
+
+      
+      if (!hasMetadataStore()) {
+        String warnLevel = conf.getTrimmed(S3GUARD_DISABLED_WARN_LEVEL,
+            DEFAULT_S3GUARD_DISABLED_WARN_LEVEL);
+        S3Guard.logS3GuardDisabled(LOG, warnLevel, bucket);
+      }
+      
+      directoryPolicy = DirectoryPolicyImpl.getDirectoryPolicy(conf,
+          this::allowAuthoritative);
+      LOG.debug("Directory marker retention policy is {}", directoryPolicy);
+
+      initMultipartUploads(conf);
+
+      pageSize = intOption(getConf(), BULK_DELETE_PAGE_SIZE,
+          BULK_DELETE_PAGE_SIZE_DEFAULT, 0);
+      listing = new Listing(listingOperationCallbacks, createStoreContext());
+    } catch (AmazonClientException e) {
+      
+      cleanupWithLogger(LOG, span);
+      stopAllServices();
+      throw translateException("initializing ", new Path(name), e);
+    } catch (IOException | RuntimeException e) {
+      
+      cleanupWithLogger(LOG, span);
+      stopAllServices();
+      throw e;
+    }
+
+  }
+
+  
+  @Retries.RetryTranslated
+  private void doBucketProbing() throws IOException {
+    int bucketProbe = getConf()
+            .getInt(S3A_BUCKET_PROBE, S3A_BUCKET_PROBE_DEFAULT);
+    Preconditions.checkArgument(bucketProbe >= 0,
+            "Value of " + S3A_BUCKET_PROBE + " should be >= 0");
+    switch (bucketProbe) {
+    case 0:
+      LOG.debug("skipping check for bucket existence");
+      break;
+    case 1:
+      logDnsLookup(getConf());
+      verifyBucketExists();
+      break;
+    case 2:
+      logDnsLookup(getConf());
+      verifyBucketExistsV2();
+      break;
+    default:
+      
+      LOG.warn("Unknown bucket probe option {}: {}; falling back to check #2",
+          S3A_BUCKET_PROBE, bucketProbe);
+      verifyBucketExistsV2();
+      break;
+    }
+  }
+
+  
+  protected void initializeStatisticsBinding() {
+    storageStatistics = createStorageStatistics(
+        requireNonNull(getIOStatistics()));
+    statisticsContext = new BondedS3AStatisticsContext(
+        new BondedS3AStatisticsContext.S3AFSStatisticsSource() {
+
+          @Override
+          public S3AInstrumentation getInstrumentation() {
+            return S3AFileSystem.this.getInstrumentation();
+          }
+
+          @Override
+          public Statistics getInstanceStatistics() {
+            return S3AFileSystem.this.statistics;
+          }
+        });
+  }
+
+  
+  private void initThreadPools(Configuration conf) {
+    final String name = "s3a-transfer-" + getBucket();
+    int maxThreads = conf.getInt(MAX_THREADS, DEFAULT_MAX_THREADS);
+    if (maxThreads < 2) {
+      LOG.warn(MAX_THREADS + " must be at least 2: forcing to 2.");
+      maxThreads = 2;
+    }
+    int totalTasks = intOption(conf,
+        MAX_TOTAL_TASKS, DEFAULT_MAX_TOTAL_TASKS, 1);
+    long keepAliveTime = longOption(conf, KEEPALIVE_TIME,
+        DEFAULT_KEEPALIVE_TIME, 0);
+    boundedThreadPool = BlockingThreadPoolExecutorService.newInstance(
+        maxThreads,
+        maxThreads + totalTasks,
+        keepAliveTime, TimeUnit.SECONDS,
+        name + "-bounded");
+    unboundedThreadPool = new ThreadPoolExecutor(
+        maxThreads, Integer.MAX_VALUE,
+        keepAliveTime, TimeUnit.SECONDS,
+        new LinkedBlockingQueue<>(),
+        BlockingThreadPoolExecutorService.newDaemonThreadFactory(
+            name + "-unbounded"));
+    unboundedThreadPool.allowCoreThreadTimeOut(true);
+    executorCapacity = intOption(conf,
+        EXECUTOR_CAPACITY, DEFAULT_EXECUTOR_CAPACITY, 1);
+  }
+
+  
+  protected static S3AStorageStatistics createStorageStatistics(
+      final IOStatistics ioStatistics) {
+    return (S3AStorageStatistics)
+        GlobalStorageStatistics.INSTANCE
+            .put(S3AStorageStatistics.NAME,
+                () -> new S3AStorageStatistics(ioStatistics));
+  }
+
+  
+  @Retries.RetryTranslated
+  protected void verifyBucketExists()
+      throws UnknownStoreException, IOException {
+    if (!invoker.retry("doesBucketExist", bucket, true,
+        trackDurationOfOperation(getDurationTrackerFactory(),
+            STORE_EXISTS_PROBE.getSymbol(),
+            () -> s3.doesBucketExist(bucket)))) {
+      throw new UnknownStoreException("s3a://" + bucket + "/", " Bucket does "
+          + "not exist");
+    }
+  }
+
+  
+  @Retries.RetryTranslated
+  protected void verifyBucketExistsV2()
+          throws UnknownStoreException, IOException {
+    if (!invoker.retry("doesBucketExistV2", bucket, true,
+        trackDurationOfOperation(getDurationTrackerFactory(),
+            STORE_EXISTS_PROBE.getSymbol(),
+            () -> s3.doesBucketExistV2(bucket)))) {
+      throw new UnknownStoreException("s3a://" + bucket + "/", " Bucket does "
+          + "not exist");
+    }
+  }
+
+  
+  @VisibleForTesting
+  public S3AInstrumentation getInstrumentation() {
+    return instrumentation;
+  }
+
+  
+  @VisibleForTesting
+  public FileSystem.Statistics getFsStatistics() {
+    return statistics;
+  }
+
+  
+  public Listing getListing() {
+    return listing;
+  }
+
+  
+  private void bindAWSClient(URI name, boolean dtEnabled) throws IOException {
+    Configuration conf = getConf();
+    credentials = null;
+    String uaSuffix = "";
+
+    if (dtEnabled) {
+      
+      
+      
+      
+
+      LOG.debug("Using delegation tokens");
+      S3ADelegationTokens tokens = new S3ADelegationTokens();
+      this.delegationTokens = Optional.of(tokens);
+      tokens.bindToFileSystem(getCanonicalUri(),
+          createStoreContext(),
+          createDelegationOperations());
+      tokens.init(conf);
+      tokens.start();
+      
+      
+      if (tokens.isBoundToDT()) {
+        
+        LOG.debug("Using existing delegation token");
+        
+      } else {
+        LOG.debug("No delegation token for this instance");
+      }
+      
+      credentials = tokens.getCredentialProviders();
+      
+      tokens.getEncryptionSecrets()
+          .ifPresent(this::setEncryptionSecrets);
+      
+      
+      uaSuffix = tokens.getUserAgentField();
+    } else {
+      
+      credentials = createAWSCredentialProviderSet(name, conf);
+    }
+    LOG.debug("Using credential provider {}", credentials);
+    Class<? extends S3ClientFactory> s3ClientFactoryClass = conf.getClass(
+        S3_CLIENT_FACTORY_IMPL, DEFAULT_S3_CLIENT_FACTORY_IMPL,
+        S3ClientFactory.class);
+
+    S3ClientFactory.S3ClientCreationParameters parameters = null;
+    parameters = new S3ClientFactory.S3ClientCreationParameters()
+        .withCredentialSet(credentials)
+        .withEndpoint(conf.getTrimmed(ENDPOINT, DEFAULT_ENDPOINT))
+        .withMetrics(statisticsContext.newStatisticsFromAwsSdk())
+        .withPathStyleAccess(conf.getBoolean(PATH_STYLE_ACCESS, false))
+        .withUserAgentSuffix(uaSuffix)
+        .withRequestHandlers(auditManager.createRequestHandlers());
+
+    s3 = ReflectionUtils.newInstance(s3ClientFactoryClass, conf)
+        .createS3Client(getUri(),
+            parameters);
+  }
+
+  
+  protected void initializeAuditService() throws IOException {
+    auditManager = AuditIntegration.createAndStartAuditManager(
+        getConf(),
+        instrumentation.createMetricsUpdatingStore());
+  }
+
+  
+  @InterfaceAudience.Private
+  public AuditManagerS3A getAuditManager() {
+    return auditManager;
+  }
+
+  
+  @InterfaceAudience.Private
+  public OperationAuditor getAuditor() {
+    return getAuditManager().getAuditor();
+  }
+
+  
+  @InterfaceAudience.Private
+  @Override
+  public AuditSpanS3A getActiveAuditSpan() {
+    return getAuditManager().getActiveAuditSpan();
+  }
+
+  
+  @InterfaceAudience.Private
+  public AuditSpanSource getAuditSpanSource() {
+    return this;
+  }
+
+  
+  public AuditSpanS3A createSpan(String operation,
+      @Nullable String path1,
+      @Nullable String path2)
+      throws IOException {
+
+    return getAuditManager().createSpan(operation, path1, path2);
+  }
+
+  
+  protected RequestFactory createRequestFactory() {
+    long partCountLimit = longOption(getConf(),
+        UPLOAD_PART_COUNT_LIMIT,
+        DEFAULT_UPLOAD_PART_COUNT_LIMIT,
+        1);
+    if (partCountLimit != DEFAULT_UPLOAD_PART_COUNT_LIMIT) {
+      LOG.warn("Configuration property {} shouldn't be overridden by client",
+          UPLOAD_PART_COUNT_LIMIT);
+    }
+
+    return RequestFactoryImpl.builder()
+        .withBucket(requireNonNull(bucket))
+        .withCannedACL(getCannedACL())
+        .withEncryptionSecrets(requireNonNull(encryptionSecrets))
+        .withMultipartPartCountLimit(partCountLimit)
+        .withRequestPreparer(getAuditManager()::requestCreated)
+        .build();
+  }
+
+  
+  @VisibleForTesting
+  public RequestFactory getRequestFactory() {
+    return requestFactory;
+  }
+
+  
+  private class DelegationOperationsImpl implements DelegationOperations {
+
+    @Override
+    public List<RoleModel.Statement> listAWSPolicyRules(final Set<AccessLevel> access) {
+      return S3AFileSystem.this.listAWSPolicyRules(access);
+    }
+  }
+
+  
+  @VisibleForTesting
+  public DelegationOperations createDelegationOperations() {
+    return new DelegationOperationsImpl();
+  }
+
+  
+  protected void setEncryptionSecrets(final EncryptionSecrets secrets) {
+    this.encryptionSecrets = secrets;
+    if (requestFactory != null) {
+      requestFactory.setEncryptionSecrets(secrets);
+    }
+  }
+
+  
+  public EncryptionSecrets getEncryptionSecrets() {
+    return encryptionSecrets;
+  }
+
+  private void initTransferManager() {
+    TransferManagerConfiguration transferConfiguration =
+        new TransferManagerConfiguration();
+    transferConfiguration.setMinimumUploadPartSize(partSize);
+    transferConfiguration.setMultipartUploadThreshold(multiPartThreshold);
+    transferConfiguration.setMultipartCopyPartSize(partSize);
+    transferConfiguration.setMultipartCopyThreshold(multiPartThreshold);
+
+    transfers = new TransferManager(s3, unboundedThreadPool);
+    transfers.setConfiguration(transferConfiguration);
+  }
+
+  private void initCannedAcls(Configuration conf) {
+    String cannedACLName = conf.get(CANNED_ACL, DEFAULT_CANNED_ACL);
+    if (!cannedACLName.isEmpty()) {
+      cannedACL = CannedAccessControlList.valueOf(cannedACLName);
+    } else {
+      cannedACL = null;
+    }
+  }
+
+  @Retries.RetryTranslated
+  private void initMultipartUploads(Configuration conf) throws IOException {
+    boolean purgeExistingMultipart = conf.getBoolean(PURGE_EXISTING_MULTIPART,
+        DEFAULT_PURGE_EXISTING_MULTIPART);
+    long purgeExistingMultipartAge = longOption(conf,
+        PURGE_EXISTING_MULTIPART_AGE, DEFAULT_PURGE_EXISTING_MULTIPART_AGE, 0);
+
+    if (purgeExistingMultipart) {
+      try {
+        abortOutstandingMultipartUploads(purgeExistingMultipartAge);
+      } catch (AccessDeniedException e) {
+        instrumentation.errorIgnored();
+        LOG.debug("Failed to purge multipart uploads against {}," +
+            " FS may be read only", bucket);
+      }
+    }
+  }
+
+  
+  @Retries.RetryTranslated
+  public void abortOutstandingMultipartUploads(long seconds)
+      throws IOException {
+    Preconditions.checkArgument(seconds >= 0);
+    Date purgeBefore =
+        new Date(new Date().getTime() - seconds * 1000);
+    LOG.debug("Purging outstanding multipart uploads older than {}",
+        purgeBefore);
+    invoker.retry("Purging multipart uploads", bucket, true,
+        () -> transfers.abortMultipartUploads(bucket, purgeBefore));
+  }
+
+  
+  @Override
+  public String getScheme() {
+    return "s3a";
+  }
+
+  
+  @Override
+  public URI getUri() {
+    return uri;
+  }
+
+  
+  @VisibleForTesting
+  protected void setUri(URI fsUri, boolean canonicalize) {
+    URI u = S3xLoginHelper.buildFSURI(fsUri);
+    this.uri = canonicalize ? u : canonicalizeUri(u);
+  }
+
+  
+  public URI getCanonicalUri() {
+    return uri;
+  }
+
+  @VisibleForTesting
+  @Override
+  public int getDefaultPort() {
+    return 0;
+  }
+
+  
+  AmazonS3 getAmazonS3Client() {
+    return s3;
+  }
+
+  
+  @VisibleForTesting
+  public AmazonS3 getAmazonS3ClientForTesting(String reason) {
+    LOG.warn("Access to S3A client requested, reason {}", reason);
+    return s3;
+  }
+
+  
+  protected void setAmazonS3Client(AmazonS3 client) {
+    Preconditions.checkNotNull(client, "client");
+    LOG.debug("Setting S3 client to {}", client);
+    s3 = client;
+
+    
+    
+    
+    
+    initThreadPools(getConf());
+    initTransferManager();
+  }
+
+  
+  @Retries.RetryTranslated
+  @InterfaceAudience.LimitedPrivate("diagnostics")
+  public String getBucketLocation() throws IOException {
+    return getBucketLocation(bucket);
+  }
+
+  
+  @VisibleForTesting
+  @AuditEntryPoint
+  @Retries.RetryTranslated
+  public String getBucketLocation(String bucketName) throws IOException {
+    final String region = trackDurationAndSpan(
+        STORE_EXISTS_PROBE, bucketName, null, () ->
+            invoker.retry("getBucketLocation()", bucketName, true, () ->
+                s3.getBucketLocation(bucketName)));
+    return fixBucketRegion(region);
+  }
+
+  
+  @VisibleForTesting
+  long getReadAheadRange() {
+    return readAhead;
+  }
+
+  
+  @InterfaceStability.Unstable
+  public S3AInputPolicy getInputPolicy() {
+    return inputPolicy;
+  }
+
+  
+  @VisibleForTesting
+  public ChangeDetectionPolicy getChangeDetectionPolicy() {
+    return changeDetectionPolicy;
+  }
+
+  
+  public S3AEncryptionMethods getServerSideEncryptionAlgorithm() {
+    return encryptionSecrets.getEncryptionMethod();
+  }
+
+  
+  File createTmpFileForWrite(String pathStr, long size,
+      Configuration conf) throws IOException {
+    if (directoryAllocator == null) {
+      synchronized (this) {
+        String bufferDir = conf.get(BUFFER_DIR) != null
+            ? BUFFER_DIR : HADOOP_TMP_DIR;
+        directoryAllocator = new LocalDirAllocator(bufferDir);
+      }
+    }
+    Path path = directoryAllocator.getLocalPathForWrite(pathStr,
+        size, conf);
+    File dir = new File(path.getParent().toUri().getPath());
+    String prefix = path.getName();
+    
+    return File.createTempFile(prefix, null, dir);
+  }
+
+  
+  public String getBucket() {
+    return bucket;
+  }
+
+  
+  @VisibleForTesting
+  protected void setBucket(String bucket) {
+    this.bucket = bucket;
+  }
+
+  
+  CannedAccessControlList getCannedACL() {
+    return cannedACL;
+  }
+
+  
+  @InterfaceStability.Unstable
+  public void setInputPolicy(S3AInputPolicy inputPolicy) {
+    Objects.requireNonNull(inputPolicy, "Null inputStrategy");
+    LOG.debug("Setting input strategy: {}", inputPolicy);
+    this.inputPolicy = inputPolicy;
+  }
+
+  
+  @VisibleForTesting
+  public String pathToKey(Path path) {
+    if (!path.isAbsolute()) {
+      path = new Path(workingDir, path);
+    }
+
+    if (path.toUri().getScheme() != null && path.toUri().getPath().isEmpty()) {
+      return "";
+    }
+
+    return path.toUri().getPath().substring(1);
+  }
+
+  
+  @InterfaceAudience.Private
+  public String maybeAddTrailingSlash(String key) {
+    return S3AUtils.maybeAddTrailingSlash(key);
+  }
+
+  
+  Path keyToPath(String key) {
+    return new Path("/" + key);
+  }
+
+  
+  public Path keyToQualifiedPath(String key) {
+    return qualify(keyToPath(key));
+  }
+
+  @Override
+  public Path makeQualified(final Path path) {
+    Path q = super.makeQualified(path);
+    if (!q.isRoot()) {
+      String urlString = q.toUri().toString();
+      if (urlString.endsWith(Path.SEPARATOR)) {
+        
+        
+        LOG.debug("Stripping trailing '/' from {}", q);
+        
+        
+        q = new Path(urlString.substring(0, urlString.length() - 1));
+      }
+    }
+    if (!q.isRoot() && q.getName().isEmpty()) {
+      q = q.getParent();
+    }
+    return q;
+  }
+
+  
+  public Path qualify(Path path) {
+    return makeQualified(path);
+  }
+
+  
+  @Override
+  public void checkPath(Path path) {
+    S3xLoginHelper.checkPath(getConf(), getUri(), path, getDefaultPort());
+  }
+
+  
+  @Override
+  protected URI canonicalizeUri(URI rawUri) {
+    return S3xLoginHelper.canonicalizeUri(rawUri, getDefaultPort());
+  }
+
+  
+  @Retries.RetryTranslated
+  public FSDataInputStream open(Path f, int bufferSize)
+      throws IOException {
+    return open(f, Optional.empty(), Optional.empty());
+  }
+
+  
+  @Retries.RetryTranslated
+  @AuditEntryPoint
+  private FSDataInputStream open(
+      final Path file,
+      final Optional<Configuration> options,
+      final Optional<S3AFileStatus> providedStatus)
+      throws IOException {
+
+    final Path path = qualify(file);
+    
+    final AuditSpan auditSpan = entryPoint(INVOCATION_OPEN, path);
+    S3AFileStatus fileStatus = extractOrFetchSimpleFileStatus(path,
+        providedStatus);
+
+    S3AReadOpContext readContext;
+    if (options.isPresent()) {
+      Configuration o = options.get();
+      
+      
+      
+      S3AInputPolicy policy = S3AInputPolicy.getPolicy(
+          o.get(INPUT_FADVISE, inputPolicy.toString()));
+      long readAheadRange2 = o.getLong(READAHEAD_RANGE, readAhead);
+      
+      readContext = createReadContext(
+          fileStatus,
+          policy,
+          changeDetectionPolicy,
+          readAheadRange2,
+          auditSpan);
+    } else {
+      readContext = createReadContext(
+          fileStatus,
+          inputPolicy,
+          changeDetectionPolicy,
+          readAhead,
+          auditSpan);
+    }
+    LOG.debug("Opening '{}'", readContext);
+
+    return new FSDataInputStream(
+        new S3AInputStream(
+            readContext,
+            createObjectAttributes(fileStatus),
+            createInputStreamCallbacks(auditSpan)));
+  }
+
+  
+  private S3AInputStream.InputStreamCallbacks createInputStreamCallbacks(
+      final AuditSpan auditSpan) {
+    return new InputStreamCallbacksImpl(auditSpan);
+  }
+
+  
+  private final class InputStreamCallbacksImpl implements
+      S3AInputStream.InputStreamCallbacks {
+
+    
+    private final AuditSpan auditSpan;
+
+    
+    private InputStreamCallbacksImpl(final AuditSpan auditSpan) {
+      this.auditSpan = requireNonNull(auditSpan);
+    }
+
+    
+    @Override
+    public void close()  {
+      auditSpan.close();
+    }
+
+    @Override
+    public GetObjectRequest newGetRequest(final String key) {
+      
+      try (AuditSpan span = auditSpan.activate()) {
+        return getRequestFactory().newGetObjectRequest(key);
+      }
+    }
+
+    @Override
+    public S3Object getObject(GetObjectRequest request) {
+      
+      try (AuditSpan span = auditSpan.activate()) {
+        return s3.getObject(request);
+      }
+    }
+  }
+
+  
+  @VisibleForTesting
+  protected S3AReadOpContext createReadContext(
+      final FileStatus fileStatus,
+      final S3AInputPolicy seekPolicy,
+      final ChangeDetectionPolicy changePolicy,
+      final long readAheadRange,
+      final AuditSpan auditSpan) {
+    return new S3AReadOpContext(fileStatus.getPath(),
+        hasMetadataStore(),
+        invoker,
+        s3guardInvoker,
+        statistics,
+        statisticsContext,
+        fileStatus,
+        seekPolicy,
+        changePolicy,
+        readAheadRange,
+        auditSpan);
+  }
+
+  
+  private S3ObjectAttributes createObjectAttributes(
+      final Path f,
+      final String eTag,
+      final String versionId,
+      final long len) {
+    return new S3ObjectAttributes(bucket,
+        f,
+        pathToKey(f),
+        getServerSideEncryptionAlgorithm(),
+        encryptionSecrets.getEncryptionKey(),
+        eTag,
+        versionId,
+        len);
+  }
+
+  
+  private S3ObjectAttributes createObjectAttributes(
+      final S3AFileStatus fileStatus) {
+    return createObjectAttributes(
+        fileStatus.getPath(),
+        fileStatus.getETag(),
+        fileStatus.getVersionId(),
+        fileStatus.getLen());
+  }
+
+  
+  @Override
+  @AuditEntryPoint
+  @SuppressWarnings("IOResourceOpenedButNotSafelyClosed")
+  public FSDataOutputStream create(Path f, FsPermission permission,
+      boolean overwrite, int bufferSize, short replication, long blockSize,
+      Progressable progress) throws IOException {
+    final Path path = qualify(f);
+    
+    return trackDurationAndSpan(INVOCATION_CREATE, path, () ->
+        innerCreateFile(path, permission, overwrite, bufferSize, replication,
+            blockSize, progress));
+  }
+
+  
+  @SuppressWarnings("IOResourceOpenedButNotSafelyClosed")
+  @Retries.RetryTranslated
+  private FSDataOutputStream innerCreateFile(Path path,
+      FsPermission permission,
+      boolean overwrite,
+      int bufferSize,
+      short replication,
+      long blockSize,
+      Progressable progress) throws IOException {
+    String key = pathToKey(path);
+    FileStatus status = null;
+    try {
+      
+      
+      
+      
+      status = innerGetFileStatus(path, false,
+          overwrite
+              ? StatusProbeEnum.DIRECTORIES
+              : StatusProbeEnum.ALL);
+
+      
+      if (status.isDirectory()) {
+        
+        throw new FileAlreadyExistsException(path + " is a directory");
+      }
+      if (!overwrite) {
+        
+        throw new FileAlreadyExistsException(path + " already exists");
+      }
+      LOG.debug("Overwriting file {}", path);
+    } catch (FileNotFoundException e) {
+      
+
+    }
+    instrumentation.fileCreated();
+    PutTracker putTracker =
+        committerIntegration.createTracker(path, key);
+    String destKey = putTracker.getDestKey();
+    final BlockOutputStreamStatistics outputStreamStatistics
+        = statisticsContext.newOutputStreamStatistics();
+    final S3ABlockOutputStream.BlockOutputStreamBuilder builder =
+        S3ABlockOutputStream.builder()
+        .withKey(destKey)
+        .withBlockFactory(blockFactory)
+        .withBlockSize(partSize)
+        .withStatistics(outputStreamStatistics)
+        .withProgress(progress)
+        .withPutTracker(putTracker)
+        .withWriteOperations(
+            createWriteOperationHelper(getActiveAuditSpan()))
+        .withExecutorService(
+            new SemaphoredDelegatingExecutor(
+                boundedThreadPool,
+                blockOutputActiveBlocks,
+                true,
+                outputStreamStatistics))
+        .withDowngradeSyncableExceptions(
+            getConf().getBoolean(
+                DOWNGRADE_SYNCABLE_EXCEPTIONS,
+                DOWNGRADE_SYNCABLE_EXCEPTIONS_DEFAULT));
+    return new FSDataOutputStream(
+        new S3ABlockOutputStream(builder),
+        null);
+  }
+
+  
+  @InterfaceAudience.Private
+  public WriteOperationHelper getWriteOperationHelper() {
+    return createWriteOperationHelper(getActiveAuditSpan());
+  }
+
+  
+  @InterfaceAudience.Private
+  public WriteOperationHelper createWriteOperationHelper(AuditSpan auditSpan) {
+    return new WriteOperationHelper(this,
+        getConf(),
+        statisticsContext,
+        getAuditSpanSource(),
+        auditSpan);
+  }
+
+  
+  @Override
+  @AuditEntryPoint
+  public FSDataOutputStream createNonRecursive(Path p,
+      FsPermission permission,
+      EnumSet<CreateFlag> flags,
+      int bufferSize,
+      short replication,
+      long blockSize,
+      Progressable progress) throws IOException {
+    final Path path = makeQualified(p);
+    
+    try (AuditSpan span = entryPoint(INVOCATION_CREATE_NON_RECURSIVE, path)) {
+      Path parent = path.getParent();
+      
+      if (parent != null && !parent.isRoot()) {
+        S3AFileStatus status;
+        try {
+          
+          status = innerGetFileStatus(parent, false,
+              StatusProbeEnum.DIRECTORIES);
+        } catch (FileNotFoundException e) {
+          
+          
+          status = innerGetFileStatus(parent, false,
+              StatusProbeEnum.HEAD_ONLY);
+        }
+        if (!status.isDirectory()) {
+          throw new FileAlreadyExistsException("Not a directory: " + parent);
+        }
+      }
+      return innerCreateFile(path, permission,
+          flags.contains(CreateFlag.OVERWRITE), bufferSize,
+          replication, blockSize, progress);
+    }
+  }
+
+  
+  public FSDataOutputStream append(Path f, int bufferSize,
+      Progressable progress) throws IOException {
+    throw new UnsupportedOperationException("Append is not supported "
+        + "by S3AFileSystem");
+  }
+
+
+  
+  @AuditEntryPoint
+  @Retries.RetryTranslated
+  public boolean rename(Path src, Path dst) throws IOException {
+    try {
+      long bytesCopied = trackDurationAndSpan(
+          INVOCATION_RENAME, src.toString(), dst.toString(), () ->
+          innerRename(src, dst));
+      LOG.debug("Copied {} bytes", bytesCopied);
+      return true;
+    } catch (AmazonClientException e) {
+      throw translateException("rename(" + src +", " + dst + ")", src, e);
+    } catch (RenameFailedException e) {
+      LOG.info("{}", e.getMessage());
+      LOG.debug("rename failure", e);
+      return e.getExitCode();
+    }
+  }
+
+  
+  @Retries.RetryTranslated
+  private Pair<S3AFileStatus, S3AFileStatus> initiateRename(
+      final Path src,
+      final Path dst) throws IOException {
+    String srcKey = pathToKey(src);
+    String dstKey = pathToKey(dst);
+
+    if (srcKey.isEmpty()) {
+      throw new RenameFailedException(src, dst, "source is root directory");
+    }
+    if (dstKey.isEmpty()) {
+      throw new RenameFailedException(src, dst, "dest is root directory");
+    }
+
+    
+    
+    S3AFileStatus srcStatus = innerGetFileStatus(src, true,
+        StatusProbeEnum.ALL);
+
+    if (srcKey.equals(dstKey)) {
+      LOG.debug("rename: src and dest refer to the same file or directory: {}",
+          dst);
+      throw new RenameFailedException(src, dst,
+          "source and dest refer to the same file or directory")
+          .withExitCode(srcStatus.isFile());
+    }
+
+    S3AFileStatus dstStatus = null;
+    try {
+      dstStatus = innerGetFileStatus(dst, true, StatusProbeEnum.ALL);
+      
+      
+      
+      
+      if (srcStatus.isDirectory()) {
+        if (dstStatus.isFile()) {
+          throw new FileAlreadyExistsException(
+              "Failed to rename " + src + " to " + dst
+               +"; source is a directory and dest is a file");
+        } else if (dstStatus.isEmptyDirectory() != Tristate.TRUE) {
+          throw new RenameFailedException(src, dst,
+              "Destination is a non-empty directory")
+              .withExitCode(false);
+        }
+        
+      } else {
+        
+        
+        if (dstStatus.isFile()) {
+          throw new FileAlreadyExistsException(
+              "Failed to rename " + src + " to " + dst
+                  + "; destination file exists");
+        }
+      }
+
+    } catch (FileNotFoundException e) {
+      LOG.debug("rename: destination path {} not found", dst);
+      
+      Path parent = dst.getParent();
+      if (!pathToKey(parent).isEmpty()
+          && !parent.equals(src.getParent())) {
+        try {
+          
+          
+          
+          
+          S3AFileStatus dstParentStatus = innerGetFileStatus(parent,
+              false, StatusProbeEnum.FILE);
+          
+          
+          
+          if (!dstParentStatus.isDirectory()) {
+            throw new RenameFailedException(src, dst,
+                "destination parent is not a directory");
+          }
+        } catch (FileNotFoundException expected) {
+          
+          
+          
+
+        }
+      }
+    }
+    return Pair.of(srcStatus, dstStatus);
+  }
+
+  
+  @Retries.RetryMixed
+  private long innerRename(Path source, Path dest)
+      throws RenameFailedException, FileNotFoundException, IOException,
+        AmazonClientException {
+    Path src = qualify(source);
+    Path dst = qualify(dest);
+
+    LOG.debug("Rename path {} to {}", src, dst);
+
+    String srcKey = pathToKey(src);
+    String dstKey = pathToKey(dst);
+
+    Pair<S3AFileStatus, S3AFileStatus> p = initiateRename(src, dst);
+
+    
+    
+    
+    RenameOperation renameOperation = new RenameOperation(
+        createStoreContext(),
+        src, srcKey, p.getLeft(),
+        dst, dstKey, p.getRight(),
+        new OperationCallbacksImpl(),
+        pageSize);
+    return renameOperation.execute();
+  }
+
+  @Override public Token<? extends TokenIdentifier> getFsDelegationToken()
+      throws IOException {
+    return getDelegationToken(null);
+  }
+
+  
+  private final class OperationCallbacksImpl implements OperationCallbacks {
+
+    
+    private final AuditSpan auditSpan;
+
+    private OperationCallbacksImpl() {
+      auditSpan = getActiveAuditSpan();
+    }
+
+    @Override
+    public S3ObjectAttributes createObjectAttributes(final Path path,
+        final String eTag,
+        final String versionId,
+        final long len) {
+      return S3AFileSystem.this.createObjectAttributes(path, eTag, versionId,
+          len);
+    }
+
+    @Override
+    public S3ObjectAttributes createObjectAttributes(
+        final S3AFileStatus fileStatus) {
+      return S3AFileSystem.this.createObjectAttributes(fileStatus);
+    }
+
+    @Override
+    public S3AReadOpContext createReadContext(final FileStatus fileStatus) {
+      return S3AFileSystem.this.createReadContext(fileStatus,
+          inputPolicy,
+          changeDetectionPolicy, readAhead,
+          auditSpan);
+    }
+
+    @Override
+    @Retries.RetryTranslated
+    public void deleteObjectAtPath(final Path path,
+        final String key,
+        final boolean isFile,
+        final BulkOperationState operationState)
+        throws IOException {
+      auditSpan.activate();
+      once("delete", path.toString(), () ->
+          S3AFileSystem.this.deleteObjectAtPath(path, key, isFile,
+              operationState));
+    }
+
+    @Override
+    @Retries.RetryTranslated
+    public RemoteIterator<S3ALocatedFileStatus> listFilesAndDirectoryMarkers(
+        final Path path,
+        final S3AFileStatus status,
+        final boolean collectTombstones,
+        final boolean includeSelf) throws IOException {
+      auditSpan.activate();
+      return innerListFiles(
+          path,
+          true,
+          includeSelf
+              ? Listing.ACCEPT_ALL_BUT_S3N
+              : new Listing.AcceptAllButSelfAndS3nDirs(path),
+          status,
+          collectTombstones,
+          true);
+    }
+
+    @Override
+    public CopyResult copyFile(final String srcKey,
+        final String destKey,
+        final S3ObjectAttributes srcAttributes,
+        final S3AReadOpContext readContext) throws IOException {
+      auditSpan.activate();
+      return S3AFileSystem.this.copyFile(srcKey, destKey,
+          srcAttributes.getLen(), srcAttributes, readContext);
+    }
+
+    @Override
+    public DeleteObjectsResult removeKeys(
+        final List<DeleteObjectsRequest.KeyVersion> keysToDelete,
+        final boolean deleteFakeDir,
+        final List<Path> undeletedObjectsOnFailure,
+        final BulkOperationState operationState,
+        final boolean quiet)
+        throws MultiObjectDeleteException, AmazonClientException, IOException {
+      auditSpan.activate();
+      return S3AFileSystem.this.removeKeys(keysToDelete, deleteFakeDir,
+          undeletedObjectsOnFailure, operationState, quiet);
+    }
+
+    @Override
+    public void finishRename(final Path sourceRenamed, final Path destCreated)
+        throws IOException {
+      auditSpan.activate();
+      Path destParent = destCreated.getParent();
+      if (!sourceRenamed.getParent().equals(destParent)) {
+        LOG.debug("source & dest parents are different; fix up dir markers");
+        if (!keepDirectoryMarkers(destParent)) {
+          deleteUnnecessaryFakeDirectories(destParent, null);
+        }
+        maybeCreateFakeParentDirectory(sourceRenamed);
+      }
+    }
+
+    @Override
+    public boolean allowAuthoritative(final Path p) {
+      return S3AFileSystem.this.allowAuthoritative(p);
+    }
+
+    @Override
+    @Retries.RetryTranslated
+    public RemoteIterator<S3AFileStatus> listObjects(
+        final Path path,
+        final String key)
+        throws IOException {
+      return once("listObjects", key, () ->
+          listing.createFileStatusListingIterator(path,
+              createListObjectsRequest(key, null),
+              ACCEPT_ALL,
+              Listing.ACCEPT_ALL_BUT_S3N,
+              null,
+              auditSpan));
+    }
+  }
+
+  
+  protected class ListingOperationCallbacksImpl implements
+          ListingOperationCallbacks {
+
+    @Override
+    @Retries.RetryRaw
+    public CompletableFuture<S3ListResult> listObjectsAsync(
+        S3ListRequest request,
+        DurationTrackerFactory trackerFactory,
+        AuditSpan span)
+            throws IOException {
+      return submit(unboundedThreadPool, span, () ->
+          listObjects(request,
+              pairedTrackerFactory(trackerFactory,
+                  getDurationTrackerFactory())));
+    }
+
+    @Override
+    @Retries.RetryRaw
+    public CompletableFuture<S3ListResult> continueListObjectsAsync(
+        S3ListRequest request,
+        S3ListResult prevResult,
+        DurationTrackerFactory trackerFactory,
+        AuditSpan span)
+            throws IOException {
+      return submit(unboundedThreadPool, span,
+          () -> continueListObjects(request, prevResult,
+              pairedTrackerFactory(trackerFactory,
+                  getDurationTrackerFactory())));
+    }
+
+    @Override
+    public S3ALocatedFileStatus toLocatedFileStatus(
+            S3AFileStatus status)
+            throws IOException {
+      return S3AFileSystem.this.toLocatedFileStatus(status);
+    }
+
+    @Override
+    public S3ListRequest createListObjectsRequest(
+        String key,
+        String delimiter,
+        AuditSpan span) {
+      span.activate();
+      return S3AFileSystem.this.createListObjectsRequest(key, delimiter);
+    }
+
+    @Override
+    public long getDefaultBlockSize(Path path) {
+      return S3AFileSystem.this.getDefaultBlockSize(path);
+    }
+
+    @Override
+    public int getMaxKeys() {
+      return S3AFileSystem.this.getMaxKeys();
+    }
+
+    @Override
+    public ITtlTimeProvider getUpdatedTtlTimeProvider() {
+      return S3AFileSystem.this.ttlTimeProvider;
+    }
+
+    @Override
+    public boolean allowAuthoritative(final Path p) {
+      return S3AFileSystem.this.allowAuthoritative(p);
+    }
+  }
+
+  
+  @VisibleForTesting
+  @AuditEntryPoint
+  @InterfaceAudience.LimitedPrivate("utilities")
+  @Retries.RetryTranslated
+  @InterfaceStability.Evolving
+  public ObjectMetadata getObjectMetadata(Path path) throws IOException {
+    return trackDurationAndSpan(INVOCATION_GET_FILE_STATUS, path, () ->
+        getObjectMetadata(makeQualified(path), null, invoker,
+            "getObjectMetadata"));
+  }
+
+  
+  @Retries.RetryTranslated
+  private ObjectMetadata getObjectMetadata(Path path,
+      ChangeTracker changeTracker, Invoker changeInvoker, String operation)
+      throws IOException {
+    String key = pathToKey(path);
+    return once(operation, path.toString(),
+        () ->
+            
+            getObjectMetadata(
+                key, changeTracker, changeInvoker, operation));
+  }
+
+  
+  public boolean hasMetadataStore() {
+    return !S3Guard.isNullMetadataStore(metadataStore);
+  }
+
+  
+  @VisibleForTesting
+  public boolean hasAuthoritativeMetadataStore() {
+    return hasMetadataStore() && allowAuthoritativeMetadataStore;
+  }
+
+  
+  @VisibleForTesting
+  public MetadataStore getMetadataStore() {
+    return metadataStore;
+  }
+
+  
+  @VisibleForTesting
+  void setMetadataStore(MetadataStore ms) {
+    Preconditions.checkNotNull(ms);
+    metadataStore = ms;
+  }
+
+  
+  protected AuditSpan entryPoint(Statistic operation,
+      Path path) throws IOException {
+    return entryPoint(operation,
+        (path != null ? pathToKey(path): null),
+        null);
+  }
+
+  
+  protected AuditSpan entryPoint(Statistic operation,
+      @Nullable String path1,
+      @Nullable String path2) throws IOException {
+    checkNotClosed();
+    incrementStatistic(operation);
+    return createSpan(operation.getSymbol(),
+        path1, path2);
+  }
+
+  
+  private <B> B trackDurationAndSpan(
+      Statistic statistic, String path, String path2,
+      CallableRaisingIOE<B> input) throws IOException {
+    checkNotClosed();
+    try (AuditSpan span = createSpan(statistic.getSymbol(),
+        path, path2)) {
+      return trackDuration(getDurationTrackerFactory(),
+          statistic.getSymbol(), input);
+    }
+  }
+
+  
+  private <B> B trackDurationAndSpan(
+      Statistic statistic,
+      @Nullable Path path,
+      CallableRaisingIOE<B> input) throws IOException {
+    return trackDurationAndSpan(statistic,
+        path != null ? pathToKey(path): null,
+        null, input);
+  }
+
+  
+  protected void incrementStatistic(Statistic statistic) {
+    incrementStatistic(statistic, 1);
+  }
+
+  
+  protected void incrementStatistic(Statistic statistic, long count) {
+    statisticsContext.incrementCounter(statistic, count);
+  }
+
+  
+  protected void decrementGauge(Statistic statistic, long count) {
+    statisticsContext.decrementGauge(statistic, count);
+  }
+
+  
+  protected void incrementGauge(Statistic statistic, long count) {
+    statisticsContext.incrementGauge(statistic, count);
+  }
+
+  
+  public void operationRetried(Exception ex) {
+    if (isThrottleException(ex)) {
+      operationThrottled(false);
+    } else {
+      incrementStatistic(STORE_IO_RETRY);
+      incrementStatistic(IGNORED_ERRORS);
+    }
+  }
+
+  
+  public void operationRetried(
+      String text,
+      Exception ex,
+      int retries,
+      boolean idempotent) {
+    operationRetried(ex);
+  }
+
+  
+  public void metastoreOperationRetried(Exception ex,
+      int retries,
+      boolean idempotent) {
+    incrementStatistic(S3GUARD_METADATASTORE_RETRY);
+    if (isThrottleException(ex)) {
+      operationThrottled(true);
+    } else {
+      incrementStatistic(IGNORED_ERRORS);
+    }
+  }
+
+  
+  private void operationThrottled(boolean metastore) {
+    LOG.debug("Request throttled on {}", metastore ? "S3": "DynamoDB");
+    if (metastore) {
+      incrementStatistic(S3GUARD_METADATASTORE_THROTTLED);
+      statisticsContext.addValueToQuantiles(S3GUARD_METADATASTORE_THROTTLE_RATE,
+          1);
+    } else {
+      incrementStatistic(STORE_IO_THROTTLED);
+      statisticsContext.addValueToQuantiles(STORE_IO_THROTTLE_RATE, 1);
+    }
+  }
+
+  
+  @Override
+  public S3AStorageStatistics getStorageStatistics() {
+    return storageStatistics;
+  }
+
+  
+  @Override
+  public IOStatistics getIOStatistics() {
+    return instrumentation != null
+        ? instrumentation.getIOStatistics()
+        : null;
+  }
+
+  
+  protected DurationTrackerFactory getDurationTrackerFactory() {
+    return instrumentation != null ?
+        instrumentation.getDurationTrackerFactory()
+        : null;
+  }
+
+  
+  @Retries.RetryRaw
+  @VisibleForTesting
+  @InterfaceAudience.LimitedPrivate("external utilities")
+  ObjectMetadata getObjectMetadata(String key) throws IOException {
+    return getObjectMetadata(key, null, invoker, "getObjectMetadata");
+  }
+
+  
+  @Retries.RetryRaw
+  protected ObjectMetadata getObjectMetadata(String key,
+      ChangeTracker changeTracker,
+      Invoker changeInvoker,
+      String operation) throws IOException {
+    ObjectMetadata meta = changeInvoker.retryUntranslated("GET " + key, true,
+        () -> {
+          GetObjectMetadataRequest request
+              = getRequestFactory().newGetObjectMetadataRequest(key);
+          incrementStatistic(OBJECT_METADATA_REQUESTS);
+          DurationTracker duration = getDurationTrackerFactory()
+              .trackDuration(ACTION_HTTP_HEAD_REQUEST.getSymbol());
+          try {
+            LOG.debug("HEAD {} with change tracker {}", key, changeTracker);
+            if (changeTracker != null) {
+              changeTracker.maybeApplyConstraint(request);
+            }
+            ObjectMetadata objectMetadata = s3.getObjectMetadata(request);
+            if (changeTracker != null) {
+              changeTracker.processMetadata(objectMetadata, operation);
+            }
+            return objectMetadata;
+          } catch(AmazonServiceException ase) {
+            if (!isObjectNotFound(ase)) {
+              
+              
+              
+              duration.failed();
+            }
+            throw ase;
+          } finally {
+            
+            duration.close();
+          }
+        });
+    incrementReadOperations();
+    return meta;
+  }
+
+  
+  @Retries.RetryRaw
+  protected S3ListResult listObjects(S3ListRequest request,
+      @Nullable final DurationTrackerFactory trackerFactory)
+      throws IOException {
+    incrementReadOperations();
+    LOG.debug("LIST {}", request);
+    validateListArguments(request);
+    try(DurationInfo ignored =
+            new DurationInfo(LOG, false, "LIST")) {
+      return invoker.retryUntranslated(
+          request.toString(),
+          true,
+          trackDurationOfOperation(trackerFactory,
+              OBJECT_LIST_REQUEST,
+              () -> {
+                if (useListV1) {
+                  return S3ListResult.v1(s3.listObjects(request.getV1()));
+                } else {
+                  return S3ListResult.v2(s3.listObjectsV2(request.getV2()));
+                }
+              }));
+    }
+  }
+
+  
+  private void validateListArguments(S3ListRequest request) {
+    if (useListV1) {
+      Preconditions.checkArgument(request.isV1());
+    } else {
+      Preconditions.checkArgument(!request.isV1());
+    }
+  }
+
+  
+  @Retries.RetryRaw
+  protected S3ListResult continueListObjects(S3ListRequest request,
+      S3ListResult prevResult,
+      final DurationTrackerFactory trackerFactory) throws IOException {
+    incrementReadOperations();
+    validateListArguments(request);
+    try(DurationInfo ignored =
+            new DurationInfo(LOG, false, "LIST (continued)")) {
+      return invoker.retryUntranslated(
+          request.toString(),
+          true,
+          trackDurationOfOperation(
+              trackerFactory,
+              OBJECT_CONTINUE_LIST_REQUEST,
+              () -> {
+                if (useListV1) {
+                  return S3ListResult.v1(
+                      s3.listNextBatchOfObjects(
+                          getRequestFactory()
+                              .newListNextBatchOfObjectsRequest(
+                                  prevResult.getV1())));
+                } else {
+                  request.getV2().setContinuationToken(prevResult.getV2()
+                      .getNextContinuationToken());
+                  return S3ListResult.v2(s3.listObjectsV2(request.getV2()));
+                }
+              }));
+    }
+  }
+
+  
+  public void incrementReadOperations() {
+    statistics.incrementReadOps(1);
+  }
+
+  
+  public void incrementWriteOperations() {
+    statistics.incrementWriteOps(1);
+  }
+
+  
+  @VisibleForTesting
+  @Retries.RetryRaw
+  protected void deleteObject(String key)
+      throws AmazonClientException, IOException {
+    blockRootDelete(key);
+    incrementWriteOperations();
+    try (DurationInfo ignored =
+             new DurationInfo(LOG, false,
+                 "deleting %s", key)) {
+      invoker.retryUntranslated(String.format("Delete %s:/%s", bucket, key),
+          DELETE_CONSIDERED_IDEMPOTENT,
+          ()-> {
+            incrementStatistic(OBJECT_DELETE_OBJECTS);
+            trackDurationOfInvocation(getDurationTrackerFactory(),
+                OBJECT_DELETE_REQUEST.getSymbol(),
+                () -> s3.deleteObject(getRequestFactory()
+                    .newDeleteObjectRequest(key)));
+            return null;
+          });
+    }
+  }
+
+  
+  @Retries.RetryMixed
+  void deleteObjectAtPath(Path f,
+      String key,
+      boolean isFile,
+      @Nullable final BulkOperationState operationState)
+      throws AmazonClientException, IOException {
+    if (isFile) {
+      instrumentation.fileDeleted(1);
+    } else {
+      instrumentation.directoryDeleted();
+    }
+    deleteObject(key);
+    metadataStore.delete(f, operationState);
+  }
+
+  
+  private void blockRootDelete(String key) throws InvalidRequestException {
+    if (key.isEmpty() || "/".equals(key)) {
+      throw new InvalidRequestException("Bucket "+ bucket
+          +" cannot be deleted");
+    }
+  }
+
+  
+  @Retries.RetryRaw
+  private DeleteObjectsResult deleteObjects(DeleteObjectsRequest deleteRequest)
+      throws MultiObjectDeleteException, AmazonClientException, IOException {
+    incrementWriteOperations();
+    BulkDeleteRetryHandler retryHandler =
+        new BulkDeleteRetryHandler(createStoreContext());
+    int keyCount = deleteRequest.getKeys().size();
+    try(DurationInfo ignored =
+            new DurationInfo(LOG, false, "DELETE %d keys",
+                keyCount)) {
+      return invoker.retryUntranslated("delete",
+          DELETE_CONSIDERED_IDEMPOTENT,
+          (text, e, r, i) -> {
+            
+            retryHandler.bulkDeleteRetried(deleteRequest, e);
+          },
+          
+          trackDurationOfOperation(getDurationTrackerFactory(),
+              OBJECT_BULK_DELETE_REQUEST.getSymbol(), () -> {
+                incrementStatistic(OBJECT_DELETE_OBJECTS, keyCount);
+                return s3.deleteObjects(deleteRequest);
+            }));
+    } catch (MultiObjectDeleteException e) {
+      
+      
+      List<MultiObjectDeleteException.DeleteError> errors = e.getErrors();
+      LOG.debug("Partial failure of delete, {} errors", errors.size(), e);
+      for (MultiObjectDeleteException.DeleteError error : errors) {
+        LOG.debug("{}: \"{}\" - {}",
+            error.getKey(), error.getCode(), error.getMessage());
+      }
+      throw e;
+    }
+  }
+
+  
+  public PutObjectRequest newPutObjectRequest(String key,
+      ObjectMetadata metadata, File srcfile) {
+    return requestFactory.newPutObjectRequest(key, metadata, srcfile);
+  }
+
+  
+  public ObjectMetadata newObjectMetadata(long length) {
+    return requestFactory.newObjectMetadata(length);
+  }
+
+  
+  @Retries.OnceRaw
+  public UploadInfo putObject(PutObjectRequest putObjectRequest) {
+    long len = getPutRequestLength(putObjectRequest);
+    LOG.debug("PUT {} bytes to {} via transfer manager ",
+        len, putObjectRequest.getKey());
+    incrementPutStartStatistics(len);
+    Upload upload = transfers.upload(putObjectRequest);
+    return new UploadInfo(upload, len);
+  }
+
+  
+  @VisibleForTesting
+  @Retries.OnceRaw("For PUT; post-PUT actions are RetryTranslated")
+  PutObjectResult putObjectDirect(PutObjectRequest putObjectRequest)
+      throws AmazonClientException, MetadataPersistenceException {
+    long len = getPutRequestLength(putObjectRequest);
+    LOG.debug("PUT {} bytes to {}", len, putObjectRequest.getKey());
+    incrementPutStartStatistics(len);
+    try {
+      PutObjectResult result = trackDurationOfSupplier(
+          getDurationTrackerFactory(),
+          OBJECT_PUT_REQUESTS.getSymbol(), () ->
+              s3.putObject(putObjectRequest));
+      incrementPutCompletedStatistics(true, len);
+      
+      finishedWrite(putObjectRequest.getKey(), len,
+          result.getETag(), result.getVersionId(), null);
+      return result;
+    } catch (SdkBaseException e) {
+      incrementPutCompletedStatistics(false, len);
+      throw e;
+    }
+  }
+
+  
+  private long getPutRequestLength(PutObjectRequest putObjectRequest) {
+    long len;
+    if (putObjectRequest.getFile() != null) {
+      len = putObjectRequest.getFile().length();
+    } else {
+      len = putObjectRequest.getMetadata().getContentLength();
+    }
+    Preconditions.checkState(len >= 0, "Cannot PUT object of unknown length");
+    return len;
+  }
+
+  
+  @Retries.OnceRaw
+  UploadPartResult uploadPart(UploadPartRequest request)
+      throws AmazonClientException {
+    long len = request.getPartSize();
+    incrementPutStartStatistics(len);
+    try {
+      UploadPartResult uploadPartResult = s3.uploadPart(request);
+      incrementPutCompletedStatistics(true, len);
+      return uploadPartResult;
+    } catch (AmazonClientException e) {
+      incrementPutCompletedStatistics(false, len);
+      throw e;
+    }
+  }
+
+  
+  public void incrementPutStartStatistics(long bytes) {
+    LOG.debug("PUT start {} bytes", bytes);
+    incrementWriteOperations();
+    incrementGauge(OBJECT_PUT_REQUESTS_ACTIVE, 1);
+    if (bytes > 0) {
+      incrementGauge(OBJECT_PUT_BYTES_PENDING, bytes);
+    }
+  }
+
+  
+  public void incrementPutCompletedStatistics(boolean success, long bytes) {
+    LOG.debug("PUT completed success={}; {} bytes", success, bytes);
+    if (bytes > 0) {
+      incrementStatistic(OBJECT_PUT_BYTES, bytes);
+      decrementGauge(OBJECT_PUT_BYTES_PENDING, bytes);
+    }
+    incrementStatistic(OBJECT_PUT_REQUESTS_COMPLETED);
+    decrementGauge(OBJECT_PUT_REQUESTS_ACTIVE, 1);
+  }
+
+  
+  public void incrementPutProgressStatistics(String key, long bytes) {
+    PROGRESS.debug("PUT {}: {} bytes", key, bytes);
+    incrementWriteOperations();
+    if (bytes > 0) {
+      statistics.incrementBytesWritten(bytes);
+    }
+  }
+
+  
+  @Retries.RetryRaw
+  private DeleteObjectsResult removeKeysS3(
+      List<DeleteObjectsRequest.KeyVersion> keysToDelete,
+      boolean deleteFakeDir,
+      boolean quiet)
+      throws MultiObjectDeleteException, AmazonClientException,
+      IOException {
+    if (LOG.isDebugEnabled()) {
+      LOG.debug("Initiating delete operation for {} objects",
+          keysToDelete.size());
+      for (DeleteObjectsRequest.KeyVersion key : keysToDelete) {
+        LOG.debug(" {} {}", key.getKey(),
+            key.getVersion() != null ? key.getVersion() : "");
+      }
+    }
+    DeleteObjectsResult result = null;
+    if (keysToDelete.isEmpty()) {
+      
+      return result;
+    }
+    for (DeleteObjectsRequest.KeyVersion keyVersion : keysToDelete) {
+      blockRootDelete(keyVersion.getKey());
+    }
+    try {
+      if (enableMultiObjectsDelete) {
+        result = deleteObjects(
+            getRequestFactory().newBulkDeleteRequest(keysToDelete, quiet));
+      } else {
+        for (DeleteObjectsRequest.KeyVersion keyVersion : keysToDelete) {
+          deleteObject(keyVersion.getKey());
+        }
+      }
+    } catch (MultiObjectDeleteException ex) {
+      
+      
+      
+      int rejected = ex.getErrors().size();
+      noteDeleted(keysToDelete.size() - rejected, deleteFakeDir);
+      incrementStatistic(FILES_DELETE_REJECTED, rejected);
+      throw ex;
+    }
+    noteDeleted(keysToDelete.size(), deleteFakeDir);
+    return result;
+  }
+
+  
+  private void noteDeleted(final int count, final boolean deleteFakeDir) {
+    if (!deleteFakeDir) {
+      instrumentation.fileDeleted(count);
+    } else {
+      instrumentation.fakeDirsDeleted(count);
+    }
+  }
+
+  
+  @VisibleForTesting
+  @Retries.RetryMixed
+  public void removeKeys(
+      final List<DeleteObjectsRequest.KeyVersion> keysToDelete,
+      final boolean deleteFakeDir,
+      final BulkOperationState operationState)
+      throws MultiObjectDeleteException, AmazonClientException,
+      IOException {
+    removeKeys(keysToDelete, deleteFakeDir, new ArrayList<>(), operationState,
+        true);
+  }
+
+  
+  @Retries.RetryMixed
+  private DeleteObjectsResult removeKeys(
+      final List<DeleteObjectsRequest.KeyVersion> keysToDelete,
+      final boolean deleteFakeDir,
+      final List<Path> undeletedObjectsOnFailure,
+      final BulkOperationState operationState,
+      final boolean quiet)
+      throws MultiObjectDeleteException, AmazonClientException, IOException {
+    undeletedObjectsOnFailure.clear();
+    try (DurationInfo ignored = new DurationInfo(LOG, false,
+        "Deleting %d keys", keysToDelete.size())) {
+      return removeKeysS3(keysToDelete, deleteFakeDir, quiet);
+    } catch (MultiObjectDeleteException ex) {
+      LOG.debug("Partial delete failure");
+      
+      
+      if (!deleteFakeDir) {
+        
+        
+        Triple<List<Path>, List<Path>, List<Pair<Path, IOException>>> results =
+            new MultiObjectDeleteSupport(createStoreContext(), operationState)
+                .processDeleteFailure(ex, keysToDelete, new ArrayList<Path>());
+        undeletedObjectsOnFailure.addAll(results.getLeft());
+      }
+      throw ex;
+    } catch (AmazonClientException | IOException ex) {
+      List<Path> paths = new MultiObjectDeleteSupport(
+          createStoreContext(),
+          operationState)
+          .processDeleteFailureGenericException(ex, keysToDelete);
+      
+      undeletedObjectsOnFailure.addAll(paths);
+      throw ex;
+    }
+  }
+
+  
+  @Override
+  @Retries.RetryTranslated
+  @AuditEntryPoint
+  public boolean delete(Path f, boolean recursive) throws IOException {
+    checkNotClosed();
+    final Path path = qualify(f);
+    
+    try (AuditSpan span = createSpan(INVOCATION_DELETE.getSymbol(),
+        path.toString(), null)) {
+      boolean outcome = trackDuration(getDurationTrackerFactory(),
+          INVOCATION_DELETE.getSymbol(),
+          new DeleteOperation(
+              createStoreContext(),
+              innerGetFileStatus(path, true, StatusProbeEnum.ALL),
+              recursive,
+              new OperationCallbacksImpl(),
+              pageSize));
+      if (outcome) {
+        try {
+          maybeCreateFakeParentDirectory(path);
+        } catch (AccessDeniedException e) {
+          LOG.warn("Cannot create directory marker at {}: {}",
+              f.getParent(), e.toString());
+          LOG.debug("Failed to create fake dir above {}", path, e);
+        }
+      }
+      return outcome;
+    } catch (FileNotFoundException e) {
+      LOG.debug("Couldn't delete {} - does not exist: {}", path, e.toString());
+      instrumentation.errorIgnored();
+      return false;
+    } catch (AmazonClientException e) {
+      throw translateException("delete", path, e);
+    }
+  }
+
+  
+  @Retries.RetryTranslated
+  private void createFakeDirectoryIfNecessary(Path f)
+      throws IOException, AmazonClientException {
+    String key = pathToKey(f);
+    
+    
+    
+    if (!key.isEmpty() && !s3Exists(f, StatusProbeEnum.DIRECTORIES)) {
+      LOG.debug("Creating new fake directory at {}", f);
+      createFakeDirectory(key);
+    }
+  }
+
+  
+  @Retries.RetryTranslated
+  @VisibleForTesting
+  protected void maybeCreateFakeParentDirectory(Path path)
+      throws IOException, AmazonClientException {
+    Path parent = path.getParent();
+    if (parent != null && !parent.isRoot()) {
+      createFakeDirectoryIfNecessary(parent);
+    }
+  }
+
+  
+  @Override
+  @AuditEntryPoint
+  public RemoteIterator<FileStatus> listStatusIterator(Path p)
+          throws FileNotFoundException, IOException {
+    Path path = qualify(p);
+    return typeCastingRemoteIterator(trackDurationAndSpan(
+        INVOCATION_LIST_STATUS, path, () ->
+            once("listStatus", path.toString(), () ->
+                innerListStatus(p))));
+  }
+
+  
+  @Override
+  @AuditEntryPoint
+  public FileStatus[] listStatus(Path f) throws FileNotFoundException,
+      IOException {
+    Path path = qualify(f);
+    return trackDurationAndSpan(INVOCATION_LIST_STATUS, path, () ->
+        once("listStatus", path.toString(),
+            () -> iteratorToStatuses(innerListStatus(path),
+                new HashSet<>())));
+  }
+
+  
+  private RemoteIterator<S3AFileStatus> innerListStatus(Path f)
+          throws FileNotFoundException,
+          IOException, AmazonClientException {
+    Path path = qualify(f);
+    LOG.debug("List status for path: {}", path);
+
+    Triple<RemoteIterator<S3AFileStatus>, DirListingMetadata, Boolean>
+            statusesAssumingNonEmptyDir = listing
+            .getFileStatusesAssumingNonEmptyDir(path, getActiveAuditSpan());
+
+    if (!statusesAssumingNonEmptyDir.getLeft().hasNext() &&
+            statusesAssumingNonEmptyDir.getRight()) {
+      
+      return statusesAssumingNonEmptyDir.getLeft();
+    } else if (!statusesAssumingNonEmptyDir.getLeft().hasNext()) {
+      
+      
+      
+      
+      final S3AFileStatus fileStatus = innerGetFileStatus(path, false,
+              StatusProbeEnum.ALL);
+      
+      if (fileStatus.isFile()) {
+        LOG.debug("Adding: rd (not a dir): {}", path);
+        S3AFileStatus[] stats = new S3AFileStatus[1];
+        stats[0] = fileStatus;
+        return listing.createProvidedFileStatusIterator(
+                stats,
+                ACCEPT_ALL,
+                Listing.ACCEPT_ALL_BUT_S3N);
+      }
+    }
+    
+    
+    return S3Guard.dirListingUnion(
+            metadataStore,
+            path,
+            statusesAssumingNonEmptyDir.getLeft(),
+            statusesAssumingNonEmptyDir.getMiddle(),
+            allowAuthoritative(path),
+            ttlTimeProvider, p ->
+                    listing.createProvidedFileStatusIterator(
+                    dirMetaToStatuses(statusesAssumingNonEmptyDir.getMiddle()),
+                    ACCEPT_ALL,
+                    Listing.ACCEPT_ALL_BUT_S3N));
+  }
+
+  
+  public boolean allowAuthoritative(final Path path) {
+    return S3Guard.allowAuthoritative(path, this,
+        allowAuthoritativeMetadataStore, allowAuthoritativePaths);
+  }
+
+  
+  @VisibleForTesting
+  public S3ListRequest createListObjectsRequest(String key,
+      String delimiter) {
+    return createListObjectsRequest(key, delimiter, maxKeys);
+  }
+
+  
+  private S3ListRequest createListObjectsRequest(String key,
+      String delimiter, int limit) {
+    if (!useListV1) {
+      ListObjectsV2Request request =
+          getRequestFactory().newListObjectsV2Request(
+              key, delimiter, limit);
+      return S3ListRequest.v2(request);
+    } else {
+      ListObjectsRequest request =
+          getRequestFactory().newListObjectsV1Request(
+              key, delimiter, limit);
+      return S3ListRequest.v1(request);
+    }
+  }
+
+  
+  public void setWorkingDirectory(Path newDir) {
+    workingDir = makeQualified(newDir);
+  }
+
+  
+  public Path getWorkingDirectory() {
+    return workingDir;
+  }
+
+  
+  public String getUsername() {
+    return username;
+  }
+
+  
+  public UserGroupInformation getOwner() {
+    return owner;
+  }
+
+  
+  @Override
+  @AuditEntryPoint
+  public boolean mkdirs(Path p, FsPermission permission) throws IOException,
+      FileAlreadyExistsException {
+    Path path = qualify(p);
+    return trackDurationAndSpan(
+        INVOCATION_MKDIRS, path,
+        new MkdirOperation(
+            createStoreContext(),
+            path,
+            createMkdirOperationCallbacks()));
+  }
+
+  
+  @VisibleForTesting
+  public MkdirOperation.MkdirCallbacks createMkdirOperationCallbacks() {
+    return new MkdirOperationCallbacksImpl();
+  }
+
+  
+  protected class MkdirOperationCallbacksImpl implements
+      MkdirOperation.MkdirCallbacks {
+
+    @Override
+    public S3AFileStatus probePathStatus(final Path path,
+        final Set<StatusProbeEnum> probes) throws IOException {
+      return S3AFileSystem.this.innerGetFileStatus(path, false, probes);
+    }
+
+    @Override
+    public void createFakeDirectory(final String key)
+        throws IOException {
+      S3AFileSystem.this.createEmptyObject(key);
+    }
+  }
+
+  
+  @Override
+  @Retries.RetryTranslated
+  @AuditEntryPoint
+  public ContentSummary getContentSummary(final Path f) throws IOException {
+    final Path path = qualify(f);
+    return trackDurationAndSpan(
+        INVOCATION_GET_CONTENT_SUMMARY, path,
+        new GetContentSummaryOperation(
+            createStoreContext(),
+            path,
+            createGetContentSummaryCallbacks()));
+  }
+
+  
+  protected GetContentSummaryOperation.GetContentSummaryCallbacks
+      createGetContentSummaryCallbacks() {
+    return new GetContentSummaryCallbacksImpl();
+  }
+
+  
+  protected class GetContentSummaryCallbacksImpl implements
+      GetContentSummaryOperation.GetContentSummaryCallbacks {
+
+    @Override
+    public S3AFileStatus probePathStatus(final Path path,
+        final Set<StatusProbeEnum> probes) throws IOException {
+      return S3AFileSystem.this.innerGetFileStatus(path, false, probes);
+    }
+
+    @Override
+    public RemoteIterator<S3AFileStatus> listStatusIterator(final Path path)
+        throws IOException {
+      return S3AFileSystem.this.innerListStatus(path);
+    }
+  }
+
+  
+  @Override
+  @AuditEntryPoint
+  public void access(final Path f, final FsAction mode)
+      throws AccessControlException, FileNotFoundException, IOException {
+    Path path = qualify(f);
+    LOG.debug("check access mode {} for {}", path, mode);
+    trackDurationAndSpan(
+        INVOCATION_ACCESS, path, () -> {
+          final S3AFileStatus stat = innerGetFileStatus(path, false,
+              StatusProbeEnum.ALL);
+          if (!getAuditManager().checkAccess(path, stat, mode)) {
+            incrementStatistic(AUDIT_ACCESS_CHECK_FAILURE);
+            throw new AccessControlException(String.format(
+                "Permission denied: user=%s, path=\"%s\":%s:%s:%s%s",
+                getOwner().getUserName(),
+                stat.getPath(),
+                stat.getOwner(), stat.getGroup(),
+                stat.isDirectory() ? "d" : "-", mode));
+          }
+          
+          return true;
+        });
+  }
+
+  
+  @Override
+  @AuditEntryPoint
+  @Retries.RetryTranslated
+  public FileStatus getFileStatus(final Path f) throws IOException {
+    Path path = qualify(f);
+    return trackDurationAndSpan(
+        INVOCATION_GET_FILE_STATUS, path, () ->
+            innerGetFileStatus(path, false, StatusProbeEnum.ALL));
+  }
+
+  
+  @VisibleForTesting
+  @Retries.RetryTranslated
+  S3AFileStatus innerGetFileStatus(final Path f,
+      final boolean needEmptyDirectoryFlag,
+      final Set<StatusProbeEnum> probes) throws IOException {
+    final Path path = qualify(f);
+    String key = pathToKey(path);
+    LOG.debug("Getting path status for {}  ({}); needEmptyDirectory={}",
+        path, key, needEmptyDirectoryFlag);
+
+    boolean allowAuthoritative = allowAuthoritative(path);
+    
+    PathMetadata pm = null;
+    if (hasMetadataStore()) {
+      pm = S3Guard.getWithTtl(metadataStore, path, ttlTimeProvider,
+          needEmptyDirectoryFlag, allowAuthoritative);
+    }
+    Set<Path> tombstones = Collections.emptySet();
+    if (pm != null) {
+      S3AFileStatus msStatus = pm.getFileStatus();
+      if (pm.isDeleted()) {
+        OffsetDateTime deletedAt = OffsetDateTime.ofInstant(
+            Instant.ofEpochMilli(msStatus.getModificationTime()),
+            ZoneOffset.UTC);
+        throw new FileNotFoundException("Path " + path + " is recorded as " +
+            "deleted by S3Guard at " + deletedAt);
+      }
+
+      
+      
+      
+      
+
+      if (!msStatus.isDirectory() &&
+          !allowAuthoritative &&
+          probes.contains(StatusProbeEnum.Head)) {
+        
+        
+        LOG.debug("Metadata for {} found in the non-auth metastore.", path);
+        final long msModTime = pm.getFileStatus().getModificationTime();
+
+        S3AFileStatus s3AFileStatus;
+        try {
+          s3AFileStatus = s3GetFileStatus(path,
+              key,
+              probes,
+              tombstones,
+              needEmptyDirectoryFlag);
+        } catch (FileNotFoundException fne) {
+          LOG.trace("File Not Found from probes for {}", key, fne);
+          s3AFileStatus = null;
+        }
+        if (s3AFileStatus == null) {
+          LOG.warn("Failed to find file {}. Either it is not yet visible, or "
+              + "it has been deleted.", path);
+        } else {
+          final long s3ModTime = s3AFileStatus.getModificationTime();
+
+          if(s3ModTime > msModTime) {
+            LOG.debug("S3Guard metadata for {} is outdated;"
+                + " s3modtime={}; msModTime={} updating metastore",
+                path, s3ModTime, msModTime);
+            return S3Guard.putAndReturn(metadataStore, s3AFileStatus,
+                ttlTimeProvider);
+          }
+        }
+      }
+
+      if (needEmptyDirectoryFlag && msStatus.isDirectory()) {
+        
+        
+        if (pm.isEmptyDirectory() != Tristate.UNKNOWN) {
+          
+          return msStatus;
+        } else {
+          
+          
+          
+          DirListingMetadata children =
+              S3Guard.listChildrenWithTtl(metadataStore, path, ttlTimeProvider,
+                  allowAuthoritative);
+          if (children != null) {
+            tombstones = children.listTombstones();
+          }
+          LOG.debug("MetadataStore doesn't know if {} is empty, using S3.",
+              path);
+        }
+      } else {
+        
+        return msStatus;
+      }
+
+      
+      try {
+        S3AFileStatus s3FileStatus = s3GetFileStatus(path,
+            key,
+            probes,
+            tombstones,
+            true);
+        
+        return S3Guard.putAndReturn(metadataStore, s3FileStatus,
+            ttlTimeProvider);
+      } catch (FileNotFoundException e) {
+        
+        
+        return S3AFileStatus.fromFileStatus(msStatus, Tristate.TRUE,
+            null, null);
+      }
+    } else {
+      
+      
+      return S3Guard.putAndReturn(metadataStore,
+          s3GetFileStatus(path,
+              key,
+              probes,
+              tombstones,
+              needEmptyDirectoryFlag),
+          ttlTimeProvider);
+    }
+  }
+
+  
+  @VisibleForTesting
+  @Retries.RetryTranslated
+  S3AFileStatus s3GetFileStatus(final Path path,
+      final String key,
+      final Set<StatusProbeEnum> probes,
+      @Nullable final Set<Path> tombstones,
+      final boolean needEmptyDirectoryFlag) throws IOException {
+    LOG.debug("S3GetFileStatus {}", path);
+    
+    
+    Preconditions.checkArgument(!needEmptyDirectoryFlag
+        || probes.contains(StatusProbeEnum.List),
+        "s3GetFileStatus(%s) wants to know if a directory is empty but"
+            + " does not request a list probe", path);
+
+    if (key.isEmpty() && !needEmptyDirectoryFlag) {
+      return new S3AFileStatus(Tristate.UNKNOWN, path, username);
+    }
+
+    if (!key.isEmpty() && !key.endsWith("/")
+        && probes.contains(StatusProbeEnum.Head)) {
+      try {
+        
+        ObjectMetadata meta = getObjectMetadata(key);
+        LOG.debug("Found exact file: normal file {}", key);
+        return new S3AFileStatus(meta.getContentLength(),
+            dateToLong(meta.getLastModified()),
+            path,
+            getDefaultBlockSize(path),
+            username,
+            meta.getETag(),
+            meta.getVersionId());
+      } catch (AmazonServiceException e) {
+        
+        
+        if (e.getStatusCode() != SC_404 || isUnknownBucket(e)) {
+          throw translateException("getFileStatus", path, e);
+        }
+      } catch (AmazonClientException e) {
+        throw translateException("getFileStatus", path, e);
+      }
+    }
+
+    
+    if (probes.contains(StatusProbeEnum.List)) {
+      try {
+        
+        
+        
+        
+        
+        String dirKey = maybeAddTrailingSlash(key);
+        
+        
+        
+        
+        
+        
+
+        int listSize;
+        if (tombstones == null) {
+          
+          listSize = 2;
+        } else {
+          
+          
+          
+          listSize = Math.min(2 + tombstones.size(), Math.max(2, maxKeys));
+        }
+        S3ListRequest request = createListObjectsRequest(dirKey, "/",
+            listSize);
+        
+        S3ListResult listResult = listObjects(request,
+            getDurationTrackerFactory());
+
+        if (listResult.hasPrefixesOrObjects(contextAccessors, tombstones)) {
+          if (LOG.isDebugEnabled()) {
+            LOG.debug("Found path as directory (with /)");
+            listResult.logAtDebug(LOG);
+          }
+          
+          
+          
+          
+          if (needEmptyDirectoryFlag
+              && listResult.representsEmptyDirectory(
+                  contextAccessors, dirKey, tombstones)) {
+            return new S3AFileStatus(Tristate.TRUE, path, username);
+          }
+          
+          
+          return new S3AFileStatus(Tristate.FALSE, path, username);
+        } else if (key.isEmpty()) {
+          LOG.debug("Found root directory");
+          return new S3AFileStatus(Tristate.TRUE, path, username);
+        }
+      } catch (AmazonServiceException e) {
+        if (e.getStatusCode() != SC_404 || isUnknownBucket(e)) {
+          throw translateException("getFileStatus", path, e);
+        }
+      } catch (AmazonClientException e) {
+        throw translateException("getFileStatus", path, e);
+      }
+    }
+
+    LOG.debug("Not Found: {}", path);
+    throw new FileNotFoundException("No such file or directory: " + path);
+  }
+
+  
+  @Retries.RetryTranslated
+  private boolean s3Exists(final Path path, final Set<StatusProbeEnum> probes)
+      throws IOException {
+    String key = pathToKey(path);
+    try {
+      s3GetFileStatus(path, key, probes, null, false);
+      return true;
+    } catch (FileNotFoundException e) {
+      return false;
+    }
+  }
+
+  
+  @Override
+  @AuditEntryPoint
+  public void copyFromLocalFile(boolean delSrc, boolean overwrite, Path src,
+      Path dst) throws IOException {
+    checkNotClosed();
+    LOG.debug("Copying local file from {} to {}", src, dst);
+    trackDurationAndSpan(INVOCATION_COPY_FROM_LOCAL_FILE, dst, () -> {
+      
+      super.copyFromLocalFile(delSrc, overwrite, src, dst);
+      return null;
+    });
+  }
+
+  
+  @Retries.RetryTranslated
+  private void innerCopyFromLocalFile(boolean delSrc, boolean overwrite,
+      Path src, Path dst)
+      throws IOException, FileAlreadyExistsException, AmazonClientException {
+    LOG.debug("Copying local file from {} to {}", src, dst);
+
+    
+    LocalFileSystem local = getLocal(getConf());
+    File srcfile = local.pathToFile(src);
+    if (!srcfile.exists()) {
+      throw new FileNotFoundException("No file: " + src);
+    }
+    if (!srcfile.isFile()) {
+      throw new FileNotFoundException("Not a file: " + src);
+    }
+
+    try {
+      FileStatus status = innerGetFileStatus(dst, false, StatusProbeEnum.ALL);
+      if (!status.isFile()) {
+        throw new FileAlreadyExistsException(dst + " exists and is not a file");
+      }
+      if (!overwrite) {
+        throw new FileAlreadyExistsException(dst + " already exists");
+      }
+    } catch (FileNotFoundException e) {
+      
+    }
+    final String key = pathToKey(dst);
+    final ObjectMetadata om = newObjectMetadata(srcfile.length());
+    Progressable progress = null;
+    PutObjectRequest putObjectRequest = newPutObjectRequest(key, om, srcfile);
+    invoker.retry("copyFromLocalFile(" + src + ")", dst.toString(), true,
+        () -> executePut(putObjectRequest, progress));
+    if (delSrc) {
+      local.delete(src, false);
+    }
+  }
+
+  
+  @Retries.OnceRaw("For PUT; post-PUT actions are RetryTranslated")
+  UploadResult executePut(PutObjectRequest putObjectRequest,
+      Progressable progress)
+      throws InterruptedIOException, MetadataPersistenceException {
+    String key = putObjectRequest.getKey();
+    UploadInfo info = putObject(putObjectRequest);
+    Upload upload = info.getUpload();
+    ProgressableProgressListener listener = new ProgressableProgressListener(
+        this, key, upload, progress);
+    upload.addProgressListener(listener);
+    UploadResult result = waitForUploadCompletion(key, info);
+    listener.uploadCompleted();
+    
+    finishedWrite(key, info.getLength(),
+        result.getETag(), result.getVersionId(), null);
+    return result;
+  }
+
+  
+  @Retries.OnceRaw
+  UploadResult waitForUploadCompletion(String key, UploadInfo uploadInfo)
+      throws InterruptedIOException {
+    Upload upload = uploadInfo.getUpload();
+    try {
+      UploadResult result = upload.waitForUploadResult();
+      incrementPutCompletedStatistics(true, uploadInfo.getLength());
+      return result;
+    } catch (InterruptedException e) {
+      LOG.info("Interrupted: aborting upload");
+      incrementPutCompletedStatistics(false, uploadInfo.getLength());
+      upload.abort();
+      throw (InterruptedIOException)
+          new InterruptedIOException("Interrupted in PUT to "
+              + keyToQualifiedPath(key))
+          .initCause(e);
+    }
+  }
+
+  
+  @Override
+  public void close() throws IOException {
+    if (closed.getAndSet(true)) {
+      
+      return;
+    }
+    isClosed = true;
+    LOG.debug("Filesystem {} is closed", uri);
+    if (getConf() != null) {
+      String iostatisticsLoggingLevel =
+          getConf().getTrimmed(IOSTATISTICS_LOGGING_LEVEL,
+              IOSTATISTICS_LOGGING_LEVEL_DEFAULT);
+      logIOStatisticsAtLevel(LOG, iostatisticsLoggingLevel, getIOStatistics());
+    }
+    try {
+      super.close();
+    } finally {
+      stopAllServices();
+    }
+    
+    if (LOG.isDebugEnabled()) {
+      
+      LOG.debug("Statistics for {}: {}", uri,
+          IOStatisticsLogging.ioStatisticsToPrettyString(getIOStatistics()));
+    }
+  }
+
+  
+  protected synchronized void stopAllServices() {
+    
+    
+    if (transfers != null) {
+      try {
+        transfers.shutdownNow(true);
+      } catch (RuntimeException e) {
+        
+        LOG.debug("When shutting down", e);
+      }
+      transfers = null;
+    }
+    
+    
+    HadoopExecutors.shutdown(boundedThreadPool, LOG,
+        THREAD_POOL_SHUTDOWN_DELAY_SECONDS, TimeUnit.SECONDS);
+    boundedThreadPool = null;
+    HadoopExecutors.shutdown(unboundedThreadPool, LOG,
+        THREAD_POOL_SHUTDOWN_DELAY_SECONDS, TimeUnit.SECONDS);
+    unboundedThreadPool = null;
+    
+    cleanupWithLogger(LOG,
+        metadataStore,
+        instrumentation,
+        delegationTokens.orElse(null),
+        signerManager,
+        auditManager);
+    closeAutocloseables(LOG, credentials);
+    delegationTokens = Optional.empty();
+    signerManager = null;
+    credentials = null;
+  }
+
+  
+  private void checkNotClosed() throws IOException {
+    if (isClosed) {
+      throw new IOException(uri + ": " + E_FS_CLOSED);
+    }
+  }
+
+  
+  @VisibleForTesting
+  public Optional<S3ADelegationTokens> getDelegationTokens() {
+    return delegationTokens;
+  }
+
+  
+  @Override
+  public String getCanonicalServiceName() {
+    
+    
+    
+    if (!delegationTokens.isPresent()) {
+      return null;
+    }
+    
+    
+    S3ADelegationTokens dt = delegationTokens.get();
+    return dt.getTokenIssuingPolicy() != NoTokensAvailable
+        ? dt.getCanonicalServiceName()
+        : null;
+  }
+
+  
+  @Override
+  @AuditEntryPoint
+  public Token<AbstractS3ATokenIdentifier> getDelegationToken(String renewer)
+      throws IOException {
+    checkNotClosed();
+    LOG.debug("Delegation token requested");
+    if (delegationTokens.isPresent()) {
+      return trackDurationAndSpan(
+          INVOCATION_GET_DELEGATION_TOKEN, null, () ->
+              delegationTokens.get().getBoundOrNewDT(
+                  encryptionSecrets,
+                  (renewer != null ? new Text(renewer) : new Text())));
+    } else {
+      
+      LOG.debug("Token support is not enabled");
+      return null;
+    }
+  }
+
+  
+  @Override
+  public DelegationTokenIssuer[] getAdditionalTokenIssuers()
+      throws IOException {
+    checkNotClosed();
+    if (delegationTokens.isPresent()) {
+      return delegationTokens.get().getAdditionalTokenIssuers();
+    } else {
+      
+      LOG.debug("Token support is not enabled");
+      return null;
+    }
+  }
+
+  
+  @Override
+  @InterfaceAudience.Private
+  public List<RoleModel.Statement> listAWSPolicyRules(
+      final Set<AccessLevel> access) {
+    if (access.isEmpty()) {
+      return Collections.emptyList();
+    }
+    List<RoleModel.Statement> statements = new ArrayList<>(
+        allowS3Operations(bucket,
+            access.contains(AccessLevel.WRITE)
+                || access.contains(AccessLevel.ADMIN)));
+
+    
+    
+    
+    statements.add(STATEMENT_ALLOW_SSE_KMS_RW);
+
+    
+    if (metadataStore instanceof AWSPolicyProvider) {
+      statements.addAll(
+          ((AWSPolicyProvider) metadataStore).listAWSPolicyRules(access));
+    }
+    return statements;
+  }
+
+  
+  @Retries.RetryTranslated
+  private CopyResult copyFile(String srcKey, String dstKey, long size,
+      S3ObjectAttributes srcAttributes, S3AReadOpContext readContext)
+      throws IOException, InterruptedIOException  {
+    LOG.debug("copyFile {} -> {} ", srcKey, dstKey);
+
+    ProgressListener progressListener = progressEvent -> {
+      switch (progressEvent.getEventType()) {
+      case TRANSFER_PART_COMPLETED_EVENT:
+        incrementWriteOperations();
+        break;
+      default:
+        break;
+      }
+    };
+
+    ChangeTracker changeTracker = new ChangeTracker(
+        keyToQualifiedPath(srcKey).toString(),
+        changeDetectionPolicy,
+        readContext.getS3AStatisticsContext()
+            .newInputStreamStatistics()
+            .getChangeTrackerStatistics(),
+        srcAttributes);
+
+    String action = "copyFile(" + srcKey + ", " + dstKey + ")";
+    Invoker readInvoker = readContext.getReadInvoker();
+
+    ObjectMetadata srcom;
+    try {
+      srcom = once(action, srcKey,
+          () ->
+              getObjectMetadata(srcKey, changeTracker, readInvoker, "copy"));
+    } catch (FileNotFoundException e) {
+      
+      
+      
+      
+      
+      
+      
+      LOG.debug("getObjectMetadata({}) failed to find an expected file",
+          srcKey, e);
+      
+      String message = hasMetadataStore()
+          ? RemoteFileChangedException.FILE_NEVER_FOUND
+          : RemoteFileChangedException.FILE_NOT_FOUND_SINGLE_ATTEMPT;
+      throw new RemoteFileChangedException(
+          keyToQualifiedPath(srcKey).toString(),
+          action,
+          message,
+          e);
+    }
+
+    return readInvoker.retry(
+        action, srcKey,
+        true,
+        () -> {
+          CopyObjectRequest copyObjectRequest =
+              getRequestFactory().newCopyObjectRequest(srcKey, dstKey, srcom);
+          changeTracker.maybeApplyConstraint(copyObjectRequest);
+          incrementStatistic(OBJECT_COPY_REQUESTS);
+          Copy copy = transfers.copy(copyObjectRequest,
+              getAuditManager().createStateChangeListener());
+          copy.addProgressListener(progressListener);
+          CopyOutcome copyOutcome = CopyOutcome.waitForCopy(copy);
+          InterruptedException interruptedException =
+              copyOutcome.getInterruptedException();
+          if (interruptedException != null) {
+            
+            throw (IOException)new InterruptedIOException(
+                "Interrupted copying " + srcKey
+                    + " to " + dstKey + ", cancelling")
+                .initCause(interruptedException);
+          }
+          SdkBaseException awsException = copyOutcome.getAwsException();
+          if (awsException != null) {
+            changeTracker.processException(awsException, "copy");
+            throw awsException;
+          }
+          CopyResult result = copyOutcome.getCopyResult();
+          changeTracker.processResponse(result);
+          incrementWriteOperations();
+          instrumentation.filesCopied(1, size);
+          return result;
+        });
+  }
+
+  
+  @Retries.OnceRaw
+  InitiateMultipartUploadResult initiateMultipartUpload(
+      InitiateMultipartUploadRequest request) throws IOException {
+    LOG.debug("Initiate multipart upload to {}", request.getKey());
+    return trackDurationOfSupplier(getDurationTrackerFactory(),
+        OBJECT_MULTIPART_UPLOAD_INITIATED.getSymbol(),
+        () -> getAmazonS3Client().initiateMultipartUpload(request));
+  }
+
+  
+  @InterfaceAudience.Private
+  @Retries.RetryTranslated("Except if failOnMetadataWriteError=false, in which"
+      + " case RetryExceptionsSwallowed")
+  void finishedWrite(String key, long length, String eTag, String versionId,
+      @Nullable final BulkOperationState operationState)
+      throws MetadataPersistenceException {
+    LOG.debug("Finished write to {}, len {}. etag {}, version {}",
+        key, length, eTag, versionId);
+    Path p = keyToQualifiedPath(key);
+    Preconditions.checkArgument(length >= 0, "content length is negative");
+    final boolean isDir = objectRepresentsDirectory(key, length);
+    
+    CompletableFuture<?> deletion;
+    if (!keepDirectoryMarkers(p)) {
+      deletion = submit(
+          unboundedThreadPool, getActiveAuditSpan(),
+          () -> {
+            deleteUnnecessaryFakeDirectories(
+                p.getParent(),
+                operationState);
+            return null;
+          });
+    } else {
+      deletion = null;
+    }
+    
+    
+    BulkOperationState stateToClose = null;
+
+    
+    try {
+      if (hasMetadataStore()) {
+        BulkOperationState activeState = operationState;
+        if (activeState == null) {
+          
+          
+          
+          stateToClose = S3Guard.initiateBulkWrite(metadataStore,
+              isDir
+                  ? BulkOperationState.OperationType.Mkdir
+                  : BulkOperationState.OperationType.Put,
+              keyToPath(key));
+          activeState = stateToClose;
+        }
+        S3Guard.addAncestors(metadataStore, p, ttlTimeProvider, activeState);
+        S3AFileStatus status = createUploadFileStatus(p,
+            isDir, length,
+            getDefaultBlockSize(p), username, eTag, versionId);
+        boolean authoritative = false;
+        if (isDir) {
+          
+          status.setIsEmptyDirectory(Tristate.TRUE);
+          
+          authoritative = allowAuthoritative(p);
+        }
+        if (!authoritative) {
+          
+          S3Guard.putAndReturn(metadataStore, status,
+              ttlTimeProvider,
+              activeState);
+        } else {
+          
+          S3Guard.putAuthDirectoryMarker(metadataStore, status,
+              ttlTimeProvider,
+              activeState);
+        }
+      }
+      
+      waitForCompletionIgnoringExceptions(deletion);
+    } catch (IOException e) {
+      if (failOnMetadataWriteError) {
+        throw new MetadataPersistenceException(p.toString(), e);
+      } else {
+        LOG.error("S3Guard: Error updating MetadataStore for write to {}",
+            p, e);
+      }
+      instrumentation.errorIgnored();
+    } finally {
+      
+      IOUtils.cleanupWithLogger(LOG, stateToClose);
+    }
+  }
+
+  
+  private boolean keepDirectoryMarkers(Path path) {
+    return directoryPolicy.keepDirectoryMarkers(path);
+  }
+
+  
+  @Retries.RetryExceptionsSwallowed
+  private void deleteUnnecessaryFakeDirectories(Path path,
+      final BulkOperationState operationState) {
+    List<DeleteObjectsRequest.KeyVersion> keysToRemove = new ArrayList<>();
+    while (!path.isRoot()) {
+      String key = pathToKey(path);
+      key = (key.endsWith("/")) ? key : (key + "/");
+      LOG.trace("To delete unnecessary fake directory {} for {}", key, path);
+      keysToRemove.add(new DeleteObjectsRequest.KeyVersion(key));
+      path = path.getParent();
+    }
+    try {
+      removeKeys(keysToRemove, true, operationState);
+    } catch(AmazonClientException | IOException e) {
+      instrumentation.errorIgnored();
+      if (LOG.isDebugEnabled()) {
+        StringBuilder sb = new StringBuilder();
+        for(DeleteObjectsRequest.KeyVersion kv : keysToRemove) {
+          sb.append(kv.getKey()).append(",");
+        }
+        LOG.debug("While deleting keys {} ", sb.toString(), e);
+      }
+    }
+  }
+
+  
+  @Retries.RetryTranslated
+  private void createFakeDirectory(final String objectName)
+      throws IOException {
+    createEmptyObject(objectName);
+  }
+
+  
+  @Retries.RetryTranslated
+  private void createEmptyObject(final String objectName)
+      throws IOException {
+    invoker.retry("PUT 0-byte object ", objectName,
+         true, () ->
+            putObjectDirect(getRequestFactory()
+                .newDirectoryMarkerRequest(objectName)));
+    incrementPutProgressStatistics(objectName, 0);
+    instrumentation.directoryCreated();
+  }
+
+  
+  @Deprecated
+  public long getDefaultBlockSize() {
+    return getConf().getLongBytes(FS_S3A_BLOCK_SIZE, DEFAULT_BLOCKSIZE);
+  }
+
+  
+  public DirectoryPolicy getDirectoryMarkerPolicy() {
+    return directoryPolicy;
+  }
+
+  @Override
+  public String toString() {
+    final StringBuilder sb = new StringBuilder(
+        "S3AFileSystem{");
+    sb.append("uri=").append(uri);
+    sb.append(", workingDir=").append(workingDir);
+    sb.append(", inputPolicy=").append(inputPolicy);
+    sb.append(", partSize=").append(partSize);
+    sb.append(", enableMultiObjectsDelete=").append(enableMultiObjectsDelete);
+    sb.append(", maxKeys=").append(maxKeys);
+    if (cannedACL != null) {
+      sb.append(", cannedACL=").append(cannedACL.toString());
+    }
+    sb.append(", readAhead=").append(readAhead);
+    if (getConf() != null) {
+      sb.append(", blockSize=").append(getDefaultBlockSize());
+    }
+    sb.append(", multiPartThreshold=").append(multiPartThreshold);
+    if (getServerSideEncryptionAlgorithm() != null) {
+      sb.append(", serverSideEncryptionAlgorithm='")
+          .append(getServerSideEncryptionAlgorithm())
+          .append('\'');
+    }
+    if (blockFactory != null) {
+      sb.append(", blockFactory=").append(blockFactory);
+    }
+    sb.append(", auditManager=").append(auditManager);
+    sb.append(", metastore=").append(metadataStore);
+    sb.append(", authoritativeStore=").append(allowAuthoritativeMetadataStore);
+    sb.append(", authoritativePath=").append(allowAuthoritativePaths);
+    sb.append(", useListV1=").append(useListV1);
+    if (committerIntegration != null) {
+      sb.append(", magicCommitter=").append(isMagicCommitEnabled());
+    }
+    sb.append(", boundedExecutor=").append(boundedThreadPool);
+    sb.append(", unboundedExecutor=").append(unboundedThreadPool);
+    sb.append(", credentials=").append(credentials);
+    sb.append(", delegation tokens=")
+        .append(delegationTokens.map(Objects::toString).orElse("disabled"));
+    sb.append(", ").append(directoryPolicy);
+    
+    if (getInstrumentation() != null) {
+      sb.append(", instrumentation {")
+          .append(getInstrumentation().toString())
+          .append("}");
+    }
+    sb.append('}');
+    return sb.toString();
+  }
+
+  
+  public long getPartitionSize() {
+    return partSize;
+  }
+
+  
+  public long getMultiPartThreshold() {
+    return multiPartThreshold;
+  }
+
+  
+  int getMaxKeys() {
+    return maxKeys;
+  }
+
+  
+  public boolean isMagicCommitEnabled() {
+    return committerIntegration.isMagicCommitEnabled();
+  }
+
+  
+  public boolean isMagicCommitPath(Path path) {
+    return committerIntegration.isMagicCommitPath(path);
+  }
+
+  
+  @Override
+  public FileStatus[] globStatus(Path pathPattern) throws IOException {
+    return globStatus(pathPattern, ACCEPT_ALL);
+  }
+
+  
+  @Override
+  @AuditEntryPoint
+  public FileStatus[] globStatus(
+      final Path pathPattern,
+      final PathFilter filter)
+      throws IOException {
+    return trackDurationAndSpan(
+        INVOCATION_GLOB_STATUS, pathPattern, () ->
+            Globber.createGlobber(this)
+                .withPathPattern(pathPattern)
+                .withPathFiltern(filter)
+                .withResolveSymlinks(false)
+                .build()
+                .glob());
+  }
+
+  
+  @Override
+  @AuditEntryPoint
+  public boolean exists(Path f) throws IOException {
+    final Path path = qualify(f);
+    try {
+      trackDurationAndSpan(
+          INVOCATION_EXISTS, path, () ->
+              innerGetFileStatus(path, false, StatusProbeEnum.ALL));
+      return true;
+    } catch (FileNotFoundException e) {
+      return false;
+    }
+  }
+
+  
+  @Override
+  @AuditEntryPoint
+  @SuppressWarnings("deprecation")
+  public boolean isDirectory(Path f) throws IOException {
+    final Path path = qualify(f);
+    try {
+      return trackDurationAndSpan(
+          INVOCATION_IS_DIRECTORY, path, () ->
+              innerGetFileStatus(path, false, StatusProbeEnum.DIRECTORIES)
+                  .isDirectory());
+    } catch (FileNotFoundException e) {
+      
+      return false;
+    }
+  }
+
+  
+  @Override
+  @AuditEntryPoint
+  @SuppressWarnings("deprecation")
+  public boolean isFile(Path f) throws IOException {
+    final Path path = qualify(f);
+    try {
+      return trackDurationAndSpan(INVOCATION_IS_FILE, path, () ->
+          innerGetFileStatus(path, false, StatusProbeEnum.HEAD_ONLY)
+              .isFile());
+    } catch (FileNotFoundException e) {
+      
+      return false;
+    }
+  }
+
+  
+  @Override
+  @Retries.RetryTranslated
+  @AuditEntryPoint
+  public EtagChecksum getFileChecksum(Path f, final long length)
+      throws IOException {
+    Preconditions.checkArgument(length >= 0);
+    final Path path = qualify(f);
+    if (getConf().getBoolean(ETAG_CHECKSUM_ENABLED,
+        ETAG_CHECKSUM_ENABLED_DEFAULT)) {
+      return trackDurationAndSpan(INVOCATION_GET_FILE_CHECKSUM, path, () -> {
+        LOG.debug("getFileChecksum({})", path);
+        ObjectMetadata headers = getObjectMetadata(path, null,
+            invoker,
+            "getFileChecksum are");
+        String eTag = headers.getETag();
+        return eTag != null ? new EtagChecksum(eTag) : null;
+      });
+    } else {
+      
+      return null;
+    }
+  }
+
+  
+  private HeaderProcessing getHeaderProcessing() {
+    return new HeaderProcessing(createStoreContext(),
+        createHeaderProcessingCallbacks());
+  }
+
+  @Override
+  @AuditEntryPoint
+  public byte[] getXAttr(final Path path, final String name)
+      throws IOException {
+    checkNotClosed();
+    try (AuditSpan span = createSpan(
+        INVOCATION_XATTR_GET_NAMED.getSymbol(),
+        path.toString(), null)) {
+      return getHeaderProcessing().getXAttr(path, name);
+    }
+  }
+
+  @Override
+  @AuditEntryPoint
+  public Map<String, byte[]> getXAttrs(final Path path) throws IOException {
+    checkNotClosed();
+    try (AuditSpan span = createSpan(
+        INVOCATION_XATTR_GET_MAP.getSymbol(),
+        path.toString(), null)) {
+      return getHeaderProcessing().getXAttrs(path);
+    }
+  }
+
+  @Override
+  @AuditEntryPoint
+  public Map<String, byte[]> getXAttrs(final Path path,
+      final List<String> names)
+      throws IOException {
+    checkNotClosed();
+    try (AuditSpan span = createSpan(
+        INVOCATION_XATTR_GET_NAMED_MAP.getSymbol(),
+        path.toString(), null)) {
+      return getHeaderProcessing().getXAttrs(path, names);
+    }
+  }
+
+  @Override
+  @AuditEntryPoint
+  public List<String> listXAttrs(final Path path) throws IOException {
+    checkNotClosed();
+    try (AuditSpan span = createSpan(
+        INVOCATION_OP_XATTR_LIST.getSymbol(),
+        path.toString(), null)) {
+      return getHeaderProcessing().listXAttrs(path);
+    }
+  }
+
+  
+  protected HeaderProcessing.HeaderProcessingCallbacks
+      createHeaderProcessingCallbacks() {
+    return new HeaderProcessingCallbacksImpl();
+  }
+
+  
+  protected final class HeaderProcessingCallbacksImpl implements
+      HeaderProcessing.HeaderProcessingCallbacks {
+
+    @Override
+    public ObjectMetadata getObjectMetadata(final String key)
+        throws IOException {
+      return once("getObjectMetadata", key, () ->
+          S3AFileSystem.this.getObjectMetadata(key));
+    }
+  }
+  
+  @Override
+  @Retries.RetryTranslated
+  @AuditEntryPoint
+  public RemoteIterator<LocatedFileStatus> listFiles(Path f,
+      boolean recursive) throws FileNotFoundException, IOException {
+    final Path path = qualify(f);
+    return toLocatedFileStatusIterator(
+        trackDurationAndSpan(INVOCATION_LIST_FILES, path, () ->
+            innerListFiles(path, recursive,
+                new Listing.AcceptFilesOnly(path), null, true, false)));
+  }
+
+  
+  @InterfaceAudience.Private
+  @Retries.RetryTranslated
+  @AuditEntryPoint
+  public RemoteIterator<S3ALocatedFileStatus> listFilesAndEmptyDirectories(
+      Path f, boolean recursive) throws IOException {
+    final Path path = qualify(f);
+    return trackDurationAndSpan(INVOCATION_LIST_FILES, path, () ->
+        innerListFiles(path, recursive,
+            Listing.ACCEPT_ALL_BUT_S3N,
+            null, true, false));
+  }
+
+  
+  @InterfaceAudience.Private
+  @Retries.RetryTranslated
+  @AuditEntryPoint
+  public RemoteIterator<S3ALocatedFileStatus> listFilesAndEmptyDirectoriesForceNonAuth(
+      Path f, boolean recursive) throws IOException {
+    final Path path = qualify(f);
+    return trackDurationAndSpan(INVOCATION_LIST_FILES, path, () ->
+        innerListFiles(path, recursive,
+            Listing.ACCEPT_ALL_BUT_S3N,
+            null, true, true));
+  }
+
+  
+  @Retries.RetryTranslated
+  private RemoteIterator<S3ALocatedFileStatus> innerListFiles(
+      final Path f,
+      final boolean recursive,
+      final Listing.FileStatusAcceptor acceptor,
+      final S3AFileStatus status,
+      final boolean collectTombstones,
+      final boolean forceNonAuthoritativeMS) throws IOException {
+    Path path = qualify(f);
+    LOG.debug("listFiles({}, {})", path, recursive);
+    try {
+      
+      if (status != null && status.isFile()) {
+        
+        LOG.debug("Path is a file: {}", path);
+        return listing.createSingleStatusIterator(
+            toLocatedFileStatus(status));
+      }
+      
+      
+      RemoteIterator<S3ALocatedFileStatus> listFilesAssumingDir =
+              listing.getListFilesAssumingDir(path,
+                      recursive,
+                      acceptor,
+                      collectTombstones,
+                      forceNonAuthoritativeMS,
+                      getActiveAuditSpan());
+      
+      
+      
+      if (!listFilesAssumingDir.hasNext()) {
+        
+        final S3AFileStatus fileStatus = status != null
+                ? status
+                : innerGetFileStatus(path, false, StatusProbeEnum.ALL);
+        if (fileStatus.isFile()) {
+          return listing.createSingleStatusIterator(
+                  toLocatedFileStatus(fileStatus));
+        }
+      }
+      
+      
+      return listFilesAssumingDir;
+    } catch (AmazonClientException e) {
+      throw translateException("listFiles", path, e);
+    }
+  }
+
+  
+  @Override
+  public RemoteIterator<LocatedFileStatus> listLocatedStatus(Path f)
+      throws FileNotFoundException, IOException {
+    return listLocatedStatus(f, ACCEPT_ALL);
+  }
+
+  
+  @Override
+  @Retries.OnceTranslated("s3guard not retrying")
+  @AuditEntryPoint
+  public RemoteIterator<LocatedFileStatus> listLocatedStatus(final Path f,
+      final PathFilter filter)
+      throws FileNotFoundException, IOException {
+    Path path = qualify(f);
+    AuditSpan span = entryPoint(INVOCATION_LIST_LOCATED_STATUS, path);
+    LOG.debug("listLocatedStatus({}, {}", path, filter);
+    RemoteIterator<? extends LocatedFileStatus> iterator =
+        once("listLocatedStatus", path.toString(),
+          () -> {
+            
+            
+            final RemoteIterator<S3ALocatedFileStatus>
+                    locatedFileStatusIteratorForDir =
+                    listing.getLocatedFileStatusIteratorForDir(path, filter,
+                        span);
+
+            
+            if (!locatedFileStatusIteratorForDir.hasNext()) {
+              final S3AFileStatus fileStatus =
+                  innerGetFileStatus(path, false, StatusProbeEnum.ALL);
+              if (fileStatus.isFile()) {
+                
+                LOG.debug("Path is a file");
+                return listing.createSingleStatusIterator(
+                        filter.accept(path)
+                                ? toLocatedFileStatus(fileStatus)
+                                : null);
+              }
+            }
+            
+            return locatedFileStatusIteratorForDir;
+          });
+    return toLocatedFileStatusIterator(iterator);
+  }
+
+  
+  S3ALocatedFileStatus toLocatedFileStatus(S3AFileStatus status)
+      throws IOException {
+    return new S3ALocatedFileStatus(status,
+        status.isFile() ?
+          getFileBlockLocations(status, 0, status.getLen())
+          : null);
+  }
+
+  
+  @InterfaceAudience.Private
+  @Retries.RetryTranslated
+  @AuditEntryPoint
+  public MultipartUtils.UploadIterator listUploads(@Nullable String prefix)
+      throws IOException {
+    
+    return trackDurationAndSpan(MULTIPART_UPLOAD_LIST, prefix, null, () ->
+        MultipartUtils.listMultipartUploads(
+            createStoreContext(),
+            s3, prefix, maxKeys
+        ));
+  }
+
+  
+  @InterfaceAudience.Private
+  @Retries.RetryTranslated
+  public List<MultipartUpload> listMultipartUploads(String prefix)
+      throws IOException {
+    
+    if (prefix != null && !prefix.isEmpty() && !prefix.endsWith("/")) {
+      prefix = prefix + "/";
+    }
+    String p = prefix;
+    return invoker.retry("listMultipartUploads", p, true, () -> {
+      ListMultipartUploadsRequest request = getRequestFactory()
+          .newListMultipartUploadsRequest(p);
+      return s3.listMultipartUploads(request).getMultipartUploads();
+    });
+  }
+
+  
+  @Retries.OnceRaw
+  void abortMultipartUpload(String destKey, String uploadId) {
+    LOG.info("Aborting multipart upload {} to {}", uploadId, destKey);
+    getAmazonS3Client().abortMultipartUpload(
+        getRequestFactory().newAbortMultipartUploadRequest(
+            destKey,
+            uploadId));
+  }
+
+  
+  @Retries.OnceRaw
+  void abortMultipartUpload(MultipartUpload upload) {
+    String destKey;
+    String uploadId;
+    destKey = upload.getKey();
+    uploadId = upload.getUploadId();
+    if (LOG.isInfoEnabled()) {
+      DateFormat df = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+      LOG.debug("Aborting multipart upload {} to {} initiated by {} on {}",
+          uploadId, destKey, upload.getInitiator(),
+          df.format(upload.getInitiated()));
+    }
+    getAmazonS3Client().abortMultipartUpload(
+        getRequestFactory().newAbortMultipartUploadRequest(
+            destKey,
+            uploadId));
+  }
+
+  
+  public CommitterStatistics newCommitterStatistics() {
+    return statisticsContext.newCommitterStatistics();
+  }
+
+  @SuppressWarnings("deprecation")
+  @Override
+  public boolean hasPathCapability(final Path path, final String capability)
+      throws IOException {
+    final Path p = makeQualified(path);
+    String cap = validatePathCapabilityArgs(p, capability);
+    switch (cap) {
+
+    case CommitConstants.STORE_CAPABILITY_MAGIC_COMMITTER:
+    case CommitConstants.STORE_CAPABILITY_MAGIC_COMMITTER_OLD:
+      
+      return isMagicCommitEnabled();
+
+    case SelectConstants.S3_SELECT_CAPABILITY:
+      
+      return SelectBinding.isSelectEnabled(getConf());
+
+    case CommonPathCapabilities.FS_CHECKSUMS:
+      
+      return getConf().getBoolean(ETAG_CHECKSUM_ENABLED,
+          ETAG_CHECKSUM_ENABLED_DEFAULT);
+
+    case CommonPathCapabilities.ABORTABLE_STREAM:
+    case CommonPathCapabilities.FS_MULTIPART_UPLOADER:
+      return true;
+
+    
+    
+    
+    case STORE_CAPABILITY_DIRECTORY_MARKER_AWARE:
+      return true;
+
+    
+    case STORE_CAPABILITY_DIRECTORY_MARKER_POLICY_KEEP:
+    case STORE_CAPABILITY_DIRECTORY_MARKER_POLICY_DELETE:
+    case STORE_CAPABILITY_DIRECTORY_MARKER_POLICY_AUTHORITATIVE:
+    case STORE_CAPABILITY_DIRECTORY_MARKER_ACTION_KEEP:
+    case STORE_CAPABILITY_DIRECTORY_MARKER_ACTION_DELETE:
+      return getDirectoryMarkerPolicy().hasPathCapability(path, cap);
+
+    default:
+      return super.hasPathCapability(p, cap);
+    }
+  }
+
+  
+  @Deprecated
+  @Override
+  public boolean hasCapability(String capability) {
+    try {
+      return hasPathCapability(new Path("/"), capability);
+    } catch (IOException ex) {
+      
+      LOG.debug("Ignoring exception on hasCapability({}})", capability, ex);
+      return false;
+    }
+  }
+
+  
+  public AWSCredentialProviderList shareCredentials(final String purpose) {
+    LOG.debug("Sharing credentials for: {}", purpose);
+    return credentials.share();
+  }
+
+  @VisibleForTesting
+  public ITtlTimeProvider getTtlTimeProvider() {
+    return ttlTimeProvider;
+  }
+
+  @VisibleForTesting
+  protected void setTtlTimeProvider(ITtlTimeProvider ttlTimeProvider) {
+    this.ttlTimeProvider = ttlTimeProvider;
+    metadataStore.setTtlTimeProvider(ttlTimeProvider);
+  }
+
+  
+  @Retries.RetryTranslated
+  @AuditEntryPoint
+  private FSDataInputStream select(final Path source,
+      final String expression,
+      final Configuration options,
+      final Optional<S3AFileStatus> providedStatus)
+      throws IOException {
+    final AuditSpan auditSpan = entryPoint(OBJECT_SELECT_REQUESTS, source);
+    requireSelectSupport(source);
+    final Path path = makeQualified(source);
+    final S3AFileStatus fileStatus = extractOrFetchSimpleFileStatus(path,
+        providedStatus);
+
+    
+    long ra = options.getLong(READAHEAD_RANGE, readAhead);
+    S3ObjectAttributes objectAttributes = createObjectAttributes(fileStatus);
+    S3AReadOpContext readContext = createReadContext(fileStatus, inputPolicy,
+        changeDetectionPolicy, ra, auditSpan);
+
+    if (changeDetectionPolicy.getSource() != ChangeDetectionPolicy.Source.None
+        && fileStatus.getETag() != null) {
+      
+      
+      
+      
+      
+      
+      
+      
+      ChangeTracker changeTracker =
+          new ChangeTracker(uri.toString(),
+              changeDetectionPolicy,
+              readContext.getS3AStatisticsContext()
+                  .newInputStreamStatistics()
+                  .getChangeTrackerStatistics(),
+              objectAttributes);
+
+      
+      Invoker readInvoker = readContext.getReadInvoker();
+      getObjectMetadata(path, changeTracker, readInvoker, "select");
+    }
+    
+    
+    SelectBinding selectBinding = new SelectBinding(
+        createWriteOperationHelper(auditSpan));
+
+    
+    return selectBinding.select(
+        readContext,
+        expression,
+        options,
+        objectAttributes);
+  }
+
+  
+  private void requireSelectSupport(final Path source) throws
+      UnsupportedOperationException {
+    if (!SelectBinding.isSelectEnabled(getConf())) {
+
+      throw new UnsupportedOperationException(
+          SelectConstants.SELECT_UNSUPPORTED);
+    }
+  }
+
+  
+  private S3AFileStatus extractOrFetchSimpleFileStatus(
+      final Path path, final Optional<S3AFileStatus> optStatus)
+      throws IOException {
+    S3AFileStatus fileStatus;
+    if (optStatus.isPresent()) {
+      fileStatus = optStatus.get();
+    } else {
+      
+      
+      
+      
+      fileStatus = innerGetFileStatus(path, false,
+          StatusProbeEnum.HEAD_ONLY);
+    }
+    
+    
+    if (fileStatus.isDirectory()) {
+      throw new FileNotFoundException(path.toString() + " is a directory");
+    }
+    return fileStatus;
+  }
+
+  
+  @Override
+  @Retries.RetryTranslated
+  @AuditEntryPoint
+  public CompletableFuture<FSDataInputStream> openFileWithOptions(
+      final Path rawPath,
+      final OpenFileParameters parameters) throws IOException {
+    final Path path = qualify(rawPath);
+    Configuration options = parameters.getOptions();
+    Set<String> mandatoryKeys = parameters.getMandatoryKeys();
+    String sql = options.get(SelectConstants.SELECT_SQL, null);
+    boolean isSelect = sql != null;
+    
+    if (isSelect) {
+      rejectUnknownMandatoryKeys(
+          mandatoryKeys,
+          InternalSelectConstants.SELECT_OPTIONS,
+          "for " + path + " in S3 Select operation");
+    } else {
+      rejectUnknownMandatoryKeys(
+          mandatoryKeys,
+          InternalConstants.STANDARD_OPENFILE_KEYS,
+          "for " + path + " in non-select file I/O");
+    }
+    FileStatus providedStatus = parameters.getStatus();
+    S3AFileStatus fileStatus;
+    if (providedStatus != null) {
+      Preconditions.checkArgument(path.equals(providedStatus.getPath()),
+          "FileStatus parameter is not for the path %s: %s",
+          path, providedStatus);
+      if (providedStatus instanceof S3AFileStatus) {
+        
+        
+        LOG.debug("File was opened with a supplied S3AFileStatus;"
+            + " skipping getFileStatus call in open() operation: {}",
+            providedStatus);
+        fileStatus = (S3AFileStatus) providedStatus;
+      } else if (providedStatus instanceof S3ALocatedFileStatus) {
+        LOG.debug("File was opened with a supplied S3ALocatedFileStatus;"
+            + " skipping getFileStatus call in open() operation: {}",
+            providedStatus);
+        fileStatus = ((S3ALocatedFileStatus) providedStatus).toS3AFileStatus();
+      } else {
+        LOG.debug("Ignoring file status {}", providedStatus);
+        fileStatus = null;
+      }
+    } else {
+      fileStatus = null;
+    }
+    Optional<S3AFileStatus> ost = Optional.ofNullable(fileStatus);
+    CompletableFuture<FSDataInputStream> result = new CompletableFuture<>();
+    if (!isSelect) {
+      
+      unboundedThreadPool.submit(() ->
+          LambdaUtils.eval(result,
+              () -> open(path, Optional.of(options), ost)));
+    } else {
+      
+      
+      requireSelectSupport(path);
+      
+      unboundedThreadPool.submit(() ->
+          LambdaUtils.eval(result,
+              () -> select(path, sql, options, ost)));
+    }
+    return result;
+  }
+
+  @Override
+  @AuditEntryPoint
+  public S3AMultipartUploaderBuilder createMultipartUploader(
+      final Path basePath)
+      throws IOException {
+    final Path path = makeQualified(basePath);
+    try (AuditSpan span = entryPoint(MULTIPART_UPLOAD_INSTANTIATED, path)) {
+      StoreContext ctx = createStoreContext();
+      return new S3AMultipartUploaderBuilder(this,
+          createWriteOperationHelper(span),
+          ctx,
+          path,
+          statisticsContext.createMultipartUploaderStatistics());
+    }
+  }
+
+  
+  @InterfaceAudience.Private
+  public StoreContext createStoreContext() {
+    return new StoreContextBuilder().setFsURI(getUri())
+        .setBucket(getBucket())
+        .setConfiguration(getConf())
+        .setUsername(getUsername())
+        .setOwner(owner)
+        .setExecutor(boundedThreadPool)
+        .setExecutorCapacity(executorCapacity)
+        .setInvoker(invoker)
+        .setInstrumentation(statisticsContext)
+        .setStorageStatistics(getStorageStatistics())
+        .setInputPolicy(getInputPolicy())
+        .setChangeDetectionPolicy(changeDetectionPolicy)
+        .setMultiObjectDeleteEnabled(enableMultiObjectsDelete)
+        .setMetadataStore(metadataStore)
+        .setUseListV1(useListV1)
+        .setContextAccessors(new ContextAccessorsImpl())
+        .setTimeProvider(getTtlTimeProvider())
+        .setAuditor(getAuditor())
+        .build();
+  }
+
+  
+  @AuditEntryPoint
+  @InterfaceAudience.Private
+  public MarkerToolOperations createMarkerToolOperations(final String target)
+      throws IOException {
+    createSpan("marker-tool-scan", target,
+        null);
+    return new MarkerToolOperationsImpl(new OperationCallbacksImpl());
+  }
+
+  
+  @InterfaceAudience.Private
+  public static void initializeClass() {
+    LOG.debug("Initialize S3A class");
+  }
+
+  
+  private class ContextAccessorsImpl implements ContextAccessors {
+
+    @Override
+    public Path keyToPath(final String key) {
+      return keyToQualifiedPath(key);
+    }
+
+    @Override
+    public String pathToKey(final Path path) {
+      return S3AFileSystem.this.pathToKey(path);
+    }
+
+    @Override
+    public File createTempFile(final String prefix, final long size)
+        throws IOException {
+      return createTmpFileForWrite(prefix, size, getConf());
+    }
+
+    @Override
+    public String getBucketLocation() throws IOException {
+      return S3AFileSystem.this.getBucketLocation();
+    }
+
+    @Override
+    public Path makeQualified(final Path path) {
+      return S3AFileSystem.this.makeQualified(path);
+    }
+
+    @Override
+    public AuditSpan getActiveAuditSpan() {
+      return S3AFileSystem.this.getActiveAuditSpan();
+    }
+
+    @Override
+    public RequestFactory getRequestFactory() {
+      return S3AFileSystem.this.getRequestFactory();
+    }
+  }
+}

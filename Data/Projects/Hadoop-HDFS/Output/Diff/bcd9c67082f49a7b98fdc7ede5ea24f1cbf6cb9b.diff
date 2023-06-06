@@ -1,0 +1,630 @@
+diff --git a/hadoop-common-project/hadoop-common/src/site/markdown/filesystem/filesystem.md b/hadoop-common-project/hadoop-common/src/site/markdown/filesystem/filesystem.md
+index 433212491b52..a5a35df30c0b 100644
+--- a/hadoop-common-project/hadoop-common/src/site/markdown/filesystem/filesystem.md
++++ b/hadoop-common-project/hadoop-common/src/site/markdown/filesystem/filesystem.md
+@@ -1164,7 +1164,7 @@ deletion, preventing the stores' use as drop-in replacements for HDFS.
+ 
+ ### `boolean rename(Path src, Path d)`
+ 
+-In terms of its specification, `rename()` is one of the most complex operations within a filesystem .
++In terms of its specification, `rename()` is one of the most complex operations within a filesystem.
+ 
+ In terms of its implementation, it is the one with the most ambiguity regarding when to return false
+ versus raising an exception.
+@@ -1187,7 +1187,6 @@ Source `src` must exist:
+ 
+     exists(FS, src) else raise FileNotFoundException
+ 
+-
+ `dest` cannot be a descendant of `src`:
+ 
+     if isDescendant(FS, src, dest) : raise IOException
+@@ -1283,6 +1282,15 @@ that the parent directories of the destination also exist.
+ 
+     exists(FS', parent(dest))
+ 
++*S3A FileSystem*
++
++The outcome is as a normal rename, with the additional (implicit) feature that
++the parent directories of the destination then exist:
++`exists(FS', parent(dest))`
++
++There is a check for and rejection if the `parent(dest)` is a file, but
++no checks for any other ancestors.
++
+ *Other Filesystems (including Swift) *
+ 
+ Other filesystems strictly reject the operation, raising a `FileNotFoundException`
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
+index 4243a4f1a5d3..f625346957f4 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
+@@ -1463,9 +1463,6 @@ public boolean rename(Path src, Path dst) throws IOException {
+       LOG.info("{}", e.getMessage());
+       LOG.debug("rename failure", e);
+       return e.getExitCode();
+-    } catch (FileNotFoundException e) {
+-      LOG.debug(e.toString());
+-      return false;
+     }
+   }
+ 
+@@ -1518,9 +1515,9 @@ private Pair<S3AFileStatus, S3AFileStatus> initiateRename(
+       // whether or not it can be the destination of the rename.
+       if (srcStatus.isDirectory()) {
+         if (dstStatus.isFile()) {
+-          throw new RenameFailedException(src, dst,
+-              "source is a directory and dest is a file")
+-              .withExitCode(srcStatus.isFile());
++          throw new FileAlreadyExistsException(
++              "Failed to rename " + src + " to " + dst
++               +"; source is a directory and dest is a file");
+         } else if (dstStatus.isEmptyDirectory() != Tristate.TRUE) {
+           throw new RenameFailedException(src, dst,
+               "Destination is a non-empty directory")
+@@ -1531,9 +1528,9 @@ private Pair<S3AFileStatus, S3AFileStatus> initiateRename(
+         // source is a file. The destination must be a directory,
+         // empty or not
+         if (dstStatus.isFile()) {
+-          throw new RenameFailedException(src, dst,
+-              "Cannot rename onto an existing file")
+-              .withExitCode(false);
++          throw new FileAlreadyExistsException(
++              "Failed to rename " + src + " to " + dst
++                  + "; destination file exists");
+         }
+       }
+ 
+@@ -1544,17 +1541,24 @@ private Pair<S3AFileStatus, S3AFileStatus> initiateRename(
+       if (!pathToKey(parent).isEmpty()
+           && !parent.equals(src.getParent())) {
+         try {
+-          // only look against S3 for directories; saves
+-          // a HEAD request on all normal operations.
++          // make sure parent isn't a file.
++          // don't look for parent being a dir as there is a risk
++          // of a race between dest dir cleanup and rename in different
++          // threads.
+           S3AFileStatus dstParentStatus = innerGetFileStatus(parent,
+-              false, StatusProbeEnum.DIRECTORIES);
++              false, StatusProbeEnum.FILE);
++          // if this doesn't raise an exception then it's one of
++          // raw S3: parent is a file: error
++          // guarded S3: parent is a file or a dir.
+           if (!dstParentStatus.isDirectory()) {
+             throw new RenameFailedException(src, dst,
+                 "destination parent is not a directory");
+           }
+-        } catch (FileNotFoundException e2) {
+-          throw new RenameFailedException(src, dst,
+-              "destination has no parent ");
++        } catch (FileNotFoundException expected) {
++          // nothing was found. Don't worry about it;
++          // expect rename to implicitly create the parent dir (raw S3)
++          // or the s3guard parents (guarded)
++
+         }
+       }
+     }
+@@ -2761,7 +2765,8 @@ private void createFakeDirectoryIfNecessary(Path f)
+    * @throws IOException IO problem
+    */
+   @Retries.RetryTranslated
+-  void maybeCreateFakeParentDirectory(Path path)
++  @VisibleForTesting
++  protected void maybeCreateFakeParentDirectory(Path path)
+       throws IOException, AmazonClientException {
+     Path parent = path.getParent();
+     if (parent != null && !parent.isRoot()) {
+diff --git a/hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/troubleshooting_s3a.md b/hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/troubleshooting_s3a.md
+index 6cdbe3e19876..416793b8ed95 100644
+--- a/hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/troubleshooting_s3a.md
++++ b/hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/troubleshooting_s3a.md
+@@ -1126,6 +1126,40 @@ We also recommend using applications/application
+ options which do  not rename files when committing work or when copying data
+ to S3, but instead write directly to the final destination.
+ 
++## Rename not behaving as "expected"
++
++S3 is not a filesystem. The S3A connector mimics file and directory rename by
++
++* HEAD then LIST of source path. The source MUST exist, else a `FileNotFoundException`
++  is raised.
++* HEAD then LIST of the destination path.
++  This SHOULD NOT exist.
++  If it does and if the source is a directory, the destination MUST be an empty directory.
++  If the source is a file, the destination MAY be a directory, empty or not.
++  If the destination exists and relevant conditions are not met, a `FileAlreadyExistsException`
++  is raised.
++* If the destination path does not exist, a HEAD request of the parent path
++  to verify that there is no object there.
++  Directory markers are not checked for, nor that the path has any children,
++* File-by-file copy of source objects to destination.
++  Parallelized, with page listings of directory objects and issuing of DELETE requests.
++* Post-delete recreation of source parent directory marker, if needed.
++
++This is slow (`O(data)`) and can cause timeouts on code which is required
++to send regular progress reports/heartbeats -for example, distCp.
++It is _very unsafe_ if the calling code expects atomic renaming as part
++of any commit algorithm.
++This is why the [S3A Committers](committers.md) or similar are needed to safely
++commit output.
++
++There is also the risk of race conditions arising if many processes/threads
++are working with the same directory tree
++[HADOOP-16721](https://issues.apache.org/jira/browse/HADOOP-16721).
++
++To reduce this risk, since Hadoop 3.3.1, the S3A connector no longer verifies the parent directory
++of the destination of a rename is a directory -only that it is _not_ a file.
++You can rename a directory or file deep under a file if you try -after which
++there is no guarantee of the files being found in listings. Try not to do that.
+ 
+ ## <a name="encryption"></a> S3 Server Side Encryption
+ 
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/contract/s3a/ITestS3AContractRename.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/contract/s3a/ITestS3AContractRename.java
+index e623d5d27941..e44df5facd2c 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/contract/s3a/ITestS3AContractRename.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/contract/s3a/ITestS3AContractRename.java
+@@ -38,6 +38,7 @@
+ import org.apache.hadoop.fs.s3a.Statistic;
+ 
+ import static org.apache.hadoop.fs.contract.ContractTestUtils.dataset;
++import static org.apache.hadoop.fs.contract.ContractTestUtils.skip;
+ import static org.apache.hadoop.fs.contract.ContractTestUtils.verifyFileContents;
+ import static org.apache.hadoop.fs.contract.ContractTestUtils.writeDataset;
+ import static org.apache.hadoop.fs.s3a.Constants.METADATASTORE_AUTHORITATIVE;
+@@ -106,9 +107,7 @@ public void setup() throws Exception {
+ 
+   @Override
+   public void testRenameDirIntoExistingDir() throws Throwable {
+-    describe("Verify renaming a dir into an existing dir puts the files"
+-             +" from the source dir into the existing dir"
+-             +" and leaves existing files alone");
++    describe("S3A rename into an existing directory returns false");
+     FileSystem fs = getFileSystem();
+     String sourceSubdir = "source";
+     Path srcDir = path(sourceSubdir);
+@@ -169,4 +168,9 @@ public void testRenamePopulatesFileAncestors2() throws Exception {
+     validateAncestorsMoved(src, dest, nestedFile);
+ 
+   }
++
++  @Override
++  public void testRenameFileUnderFileSubdir() throws Exception {
++    skip("Rename deep paths under files is allowed");
++  }
+ }
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3AFileSystemContract.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3AFileSystemContract.java
+index 46d6ffc85e03..7ce7b8385cec 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3AFileSystemContract.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3AFileSystemContract.java
+@@ -18,6 +18,8 @@
+ 
+ package org.apache.hadoop.fs.s3a;
+ 
++import java.io.FileNotFoundException;
++
+ import org.junit.Before;
+ import org.junit.Rule;
+ import org.junit.Test;
+@@ -25,21 +27,19 @@
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileAlreadyExistsException;
+ import org.apache.hadoop.fs.FileSystemContractBaseTest;
+ import org.apache.hadoop.fs.Path;
+ 
++import static org.apache.hadoop.fs.contract.ContractTestUtils.skip;
++import static org.apache.hadoop.test.LambdaTestUtils.intercept;
+ import static org.junit.Assume.*;
+ import static org.junit.Assert.*;
+ 
+ /**
+  *  Tests a live S3 system. If your keys and bucket aren't specified, all tests
+  *  are marked as passed.
+- *
+- *  This uses BlockJUnit4ClassRunner because FileSystemContractBaseTest from
+- *  TestCase which uses the old Junit3 runner that doesn't ignore assumptions
+- *  properly making it impossible to skip the tests if we don't have a valid
+- *  bucket.
+- **/
++ */
+ public class ITestS3AFileSystemContract extends FileSystemContractBaseTest {
+ 
+   protected static final Logger LOG =
+@@ -77,7 +77,7 @@ public Path getTestBaseDir() {
+ 
+   @Test
+   public void testMkdirsWithUmask() throws Exception {
+-    // not supported
++    skip("Not supported");
+   }
+ 
+   @Test
+@@ -103,8 +103,38 @@ public void testRenameDirectoryAsExistingDirectory() throws Exception {
+   }
+ 
+   @Test
+-  public void testMoveDirUnderParent() throws Throwable {
+-    // not support because
+-    // Fails if dst is a directory that is not empty.
++  public void testRenameDirectoryAsExistingFile() throws Exception {
++    assumeTrue(renameSupported());
++
++    Path src = path("testRenameDirectoryAsExistingFile/dir");
++    fs.mkdirs(src);
++    Path dst = path("testRenameDirectoryAsExistingFileNew/newfile");
++    createFile(dst);
++    intercept(FileAlreadyExistsException.class,
++        () -> rename(src, dst, false, true, true));
++  }
++
++  @Test
++  public void testRenameDirectoryMoveToNonExistentDirectory()
++      throws Exception {
++    skip("does not fail");
++  }
++
++  @Test
++  public void testRenameFileMoveToNonExistentDirectory() throws Exception {
++    skip("does not fail");
++  }
++
++  @Test
++  public void testRenameFileAsExistingFile() throws Exception {
++    intercept(FileAlreadyExistsException.class,
++        () -> super.testRenameFileAsExistingFile());
++  }
++
++  @Test
++  public void testRenameNonExistentPath() throws Exception {
++    intercept(FileNotFoundException.class,
++        () -> super.testRenameNonExistentPath());
++
+   }
+ }
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3GuardListConsistency.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3GuardListConsistency.java
+index 75653b1f6aff..09f66df4c2ec 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3GuardListConsistency.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3GuardListConsistency.java
+@@ -196,7 +196,7 @@ public void testRollingRenames() throws Exception {
+       }
+ 
+       S3AFileSystem fs = getFileSystem();
+-      assertFalse("Renaming deleted file should have failed",
++      intercept(FileNotFoundException.class, () ->
+           fs.rename(dir2[0], dir1[0]));
+       assertTrue("Renaming over existing file should have succeeded",
+           fs.rename(dir1[0], dir0[0]));
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/MockS3AFileSystem.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/MockS3AFileSystem.java
+index 1570e10dd05c..e2915884cefa 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/MockS3AFileSystem.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/MockS3AFileSystem.java
+@@ -332,7 +332,7 @@ void deleteObjectAtPath(Path f,
+   }
+ 
+   @Override
+-  void maybeCreateFakeParentDirectory(Path path)
++  protected void maybeCreateFakeParentDirectory(Path path)
+       throws IOException, AmazonClientException {
+     // no-op
+   }
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/S3ATestUtils.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/S3ATestUtils.java
+index bba5041e4a61..599f18cd9ad6 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/S3ATestUtils.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/S3ATestUtils.java
+@@ -827,6 +827,16 @@ public static void removeBaseAndBucketOverrides(
+     removeBaseAndBucketOverrides(getTestBucketName(conf), conf, options);
+   }
+ 
++  /**
++   * Disable S3Guard from the test bucket in a configuration.
++   * @param conf configuration.
++   */
++  public static void disableS3GuardInTestBucket(Configuration conf) {
++    removeBaseAndBucketOverrides(getTestBucketName(conf), conf,
++        S3_METADATA_STORE_IMPL,
++        DIRECTORY_MARKER_POLICY);
++    conf.set(S3_METADATA_STORE_IMPL, S3GUARD_METASTORE_NULL);
++  }
+   /**
+    * Call a function; any exception raised is logged at info.
+    * This is for test teardowns.
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/impl/ITestRenameDeleteRace.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/impl/ITestRenameDeleteRace.java
+new file mode 100644
+index 000000000000..9885eb569847
+--- /dev/null
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/impl/ITestRenameDeleteRace.java
+@@ -0,0 +1,248 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements. See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership. The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License. You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.fs.s3a.impl;
++
++import java.io.IOException;
++import java.util.concurrent.CompletableFuture;
++import java.util.concurrent.Semaphore;
++import java.util.concurrent.TimeUnit;
++
++import com.amazonaws.AmazonClientException;
++
++import org.assertj.core.api.Assertions;
++import org.junit.Test;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.fs.contract.ContractTestUtils;
++import org.apache.hadoop.fs.s3a.AbstractS3ATestBase;
++import org.apache.hadoop.fs.s3a.S3AFileSystem;
++import org.apache.hadoop.util.BlockingThreadPoolExecutorService;
++
++import static org.apache.hadoop.fs.s3a.Constants.DIRECTORY_MARKER_POLICY;
++import static org.apache.hadoop.fs.s3a.Constants.DIRECTORY_MARKER_POLICY_DELETE;
++import static org.apache.hadoop.fs.s3a.S3ATestUtils.disableS3GuardInTestBucket;
++import static org.apache.hadoop.fs.s3a.S3ATestUtils.getTestBucketName;
++import static org.apache.hadoop.fs.s3a.S3ATestUtils.removeBaseAndBucketOverrides;
++import static org.apache.hadoop.fs.s3a.impl.CallableSupplier.submit;
++import static org.apache.hadoop.fs.s3a.impl.CallableSupplier.waitForCompletion;
++import static org.apache.hadoop.io.IOUtils.cleanupWithLogger;
++
++/**
++ * HADOOP-16721: race condition with delete and rename underneath the
++ * same destination directory.
++ * This test suite recreates the failure using semaphores to
++ * guarantee the failure condition is encountered
++ * -then verifies that the rename operation is successful.
++ */
++public class ITestRenameDeleteRace extends AbstractS3ATestBase {
++
++  private static final Logger LOG =
++      LoggerFactory.getLogger(ITestRenameDeleteRace.class);
++
++
++  /** Many threads for scale performance: {@value}. */
++  public static final int EXECUTOR_THREAD_COUNT = 2;
++
++  /**
++   * For submitting work.
++   */
++  private static final BlockingThreadPoolExecutorService EXECUTOR =
++      BlockingThreadPoolExecutorService.newInstance(
++          EXECUTOR_THREAD_COUNT,
++          EXECUTOR_THREAD_COUNT * 2,
++          30, TimeUnit.SECONDS,
++          "test-operations");
++
++  @Override
++  protected Configuration createConfiguration() {
++    Configuration conf = super.createConfiguration();
++
++    // use the keep policy to ensure that surplus markers exist
++    // to complicate failures
++    conf.set(DIRECTORY_MARKER_POLICY, DIRECTORY_MARKER_POLICY_DELETE);
++    removeBaseAndBucketOverrides(getTestBucketName(conf),
++        conf,
++        DIRECTORY_MARKER_POLICY);
++    disableS3GuardInTestBucket(conf);
++    return conf;
++  }
++
++  /**
++   * This test uses a subclass of S3AFileSystem to recreate the race between
++   * subdirectory delete and rename.
++   * The JUnit thread performs the rename, while an executor-submitted
++   * thread performs the delete.
++   * Semaphores are used to
++   * -block the JUnit thread from initiating the rename until the delete
++   * has finished the delete phase, and has reached the
++   * {@code maybeCreateFakeParentDirectory()} call.
++   * A second semaphore is used to block the delete thread from
++   * listing and recreating the deleted directory until after
++   * the JUnit thread has completed.
++   * Together, the two semaphores guarantee that the rename()
++   * call will be made at exactly the moment when the destination
++   * directory no longer exists.
++   */
++  @Test
++  public void testDeleteRenameRaceCondition() throws Throwable {
++    describe("verify no race between delete and rename");
++
++    // the normal FS is used for path setup, verification
++    // and the rename call.
++    final S3AFileSystem fs = getFileSystem();
++    final Path path = path(getMethodName());
++    Path srcDir = new Path(path, "src");
++
++    // this dir must exist throughout the rename
++    Path destDir = new Path(path, "dest");
++    // this dir tree will be deleted in a thread which does not
++    // complete before the rename exists
++    Path destSubdir1 = new Path(destDir, "subdir1");
++    Path subfile1 = new Path(destSubdir1, "subfile1");
++
++    // this is the directory we want to copy over under the dest dir
++    Path srcSubdir2 = new Path(srcDir, "subdir2");
++    Path srcSubfile = new Path(srcSubdir2, "subfile2");
++    Path destSubdir2 = new Path(destDir, "subdir2");
++
++    // creates subfile1 and all parents, so that
++    // dest/subdir1/subfile1 exists as a file;
++    // dest/subdir1 and dest are directories without markers
++    ContractTestUtils.touch(fs, subfile1);
++    assertIsDirectory(destDir);
++
++    // source subfile
++    ContractTestUtils.touch(fs, srcSubfile);
++
++    // this is the FS used for delete()
++    final BlockingFakeDirMarkerFS blockingFS
++        = new BlockingFakeDirMarkerFS();
++    blockingFS.initialize(fs.getUri(), fs.getConf());
++    // get the semaphore; this ensures that the next attempt to create
++    // a fake marker blocks
++    blockingFS.blockFakeDirCreation();
++    try {
++      final CompletableFuture<Path> future = submit(EXECUTOR, () -> {
++        LOG.info("deleting {}", destSubdir1);
++        blockingFS.delete(destSubdir1, true);
++        return destSubdir1;
++      });
++
++      // wait for the blocking FS to return from the DELETE call.
++      blockingFS.awaitFakeDirCreation();
++
++      try {
++        // there is now no destination directory
++        assertPathDoesNotExist("should have been implicitly deleted",
++            destDir);
++
++        // attempt the rename in the normal FS.
++        LOG.info("renaming {} to {}", srcSubdir2, destSubdir2);
++        Assertions.assertThat(fs.rename(srcSubdir2, destSubdir2))
++            .describedAs("rename(%s, %s)", srcSubdir2, destSubdir2)
++            .isTrue();
++        // dest dir implicitly exists.
++        assertPathExists("must now exist", destDir);
++      } finally {
++        // release the remaining semaphore so that the deletion thread exits.
++        blockingFS.allowFakeDirCreationToProceed();
++      }
++
++      // now let the delete complete
++      LOG.info("Waiting for delete {} to finish", destSubdir1);
++      waitForCompletion(future);
++
++      // everything still exists
++      assertPathExists("must now exist", destDir);
++      assertPathExists("must now exist", new Path(destSubdir2, "subfile2"));
++      assertPathDoesNotExist("Src dir deleted", srcSubdir2);
++
++    } finally {
++      cleanupWithLogger(LOG, blockingFS);
++    }
++
++  }
++
++  /**
++   * Subclass of S3A FS whose execution of maybeCreateFakeParentDirectory
++   * can be choreographed with another thread so as to reliably
++   * create the delete/rename race condition.
++   * This class is only intended for "single shot" API calls.
++   */
++  private final class BlockingFakeDirMarkerFS extends S3AFileSystem {
++
++    /**
++     * Block for entry into maybeCreateFakeParentDirectory(); will be released
++     * then.
++     */
++    private final Semaphore signalCreatingFakeParentDirectory =
++        new Semaphore(1);
++
++    /**
++     * Semaphore to acquire before the marker can be listed/created.
++     */
++    private final Semaphore blockBeforeCreatingMarker = new Semaphore(1);
++
++    private BlockingFakeDirMarkerFS() {
++      signalCreatingFakeParentDirectory.acquireUninterruptibly();
++    }
++
++    @Override
++    protected void maybeCreateFakeParentDirectory(final Path path)
++        throws IOException, AmazonClientException {
++      LOG.info("waking anything blocked on the signal semaphore");
++      // notify anything waiting
++      signalCreatingFakeParentDirectory.release();
++      // acquire the semaphore and then create any fake directory
++      LOG.info("blocking for creation");
++      blockBeforeCreatingMarker.acquireUninterruptibly();
++      try {
++        LOG.info("probing for/creating markers");
++        super.maybeCreateFakeParentDirectory(path);
++      } finally {
++        // and release the marker for completeness.
++        blockBeforeCreatingMarker.release();
++      }
++    }
++
++    /**
++     * Block until fake dir creation is invoked.
++     */
++    public void blockFakeDirCreation() throws InterruptedException {
++      blockBeforeCreatingMarker.acquire();
++    }
++
++    /**
++     * wait for the blocking FS to return from the DELETE call.
++     */
++    public void awaitFakeDirCreation() throws InterruptedException {
++      LOG.info("Blocking until maybeCreateFakeParentDirectory() is reached");
++      signalCreatingFakeParentDirectory.acquire();
++    }
++
++    public void allowFakeDirCreationToProceed() {
++      LOG.info("Allowing the fake directory LIST/PUT to proceed.");
++      blockBeforeCreatingMarker.release();
++    }
++  }
++
++}
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/performance/OperationCost.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/performance/OperationCost.java
+index c2e0c04fbe63..af4cfba0aa07 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/performance/OperationCost.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/performance/OperationCost.java
+@@ -134,7 +134,7 @@ public final class OperationCost {
+   public static final OperationCost RENAME_SINGLE_FILE_DIFFERENT_DIR =
+       FILE_STATUS_FILE_PROBE              // source file probe
+           .plus(GET_FILE_STATUS_FNFE)     // dest does not exist
+-          .plus(FILE_STATUS_DIR_PROBE)    // parent dir of dest
++          .plus(FILE_STATUS_FILE_PROBE)   // parent dir of dest is not file
+           .plus(FILE_STATUS_DIR_PROBE)    // recreate source parent dir?
+           .plus(COPY_OP);                 // metadata read on copy
+ 
+diff --git a/hadoop-tools/hadoop-aws/src/test/resources/contract/s3a.xml b/hadoop-tools/hadoop-aws/src/test/resources/contract/s3a.xml
+index 6251aab7859c..a5d98a32e6fc 100644
+--- a/hadoop-tools/hadoop-aws/src/test/resources/contract/s3a.xml
++++ b/hadoop-tools/hadoop-aws/src/test/resources/contract/s3a.xml
+@@ -48,13 +48,23 @@
+   </property>
+ 
+   <property>
+-    <name>fs.contract.rename-returns-false-if-source-missing</name>
++    <name>fs.contract.rename-creates-dest-dirs</name>
+     <value>true</value>
+   </property>
+ 
++  <property>
++    <name>fs.contract.rename-returns-false-if-source-missing</name>
++    <value>false</value>
++  </property>
++
++  <property>
++    <name>fs.contract.rename-overwrites-dest</name>
++    <value>false</value>
++  </property>
++
+   <property>
+     <name>fs.contract.rename-returns-false-if-dest-exists</name>
+-    <value>true</value>
++    <value>false</value>
+   </property>
+ 
+   <property>

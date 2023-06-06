@@ -1,0 +1,171 @@
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/http/HttpServer2.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/http/HttpServer2.java
+index dde27dbec497..9f7562d35aa2 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/http/HttpServer2.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/http/HttpServer2.java
+@@ -27,6 +27,7 @@
+ import java.net.MalformedURLException;
+ import java.net.URI;
+ import java.net.URL;
++import java.nio.file.Path;
+ import java.nio.file.Paths;
+ import java.util.List;
+ import java.util.ArrayList;
+@@ -587,7 +588,8 @@ private ServerConnector createHttpsChannelConnector(
+           conf.getLong(FileBasedKeyStoresFactory.SSL_STORES_RELOAD_INTERVAL_TPL_KEY,
+               FileBasedKeyStoresFactory.DEFAULT_SSL_STORES_RELOAD_INTERVAL);
+ 
+-      if (storesReloadInterval > 0) {
++      if (storesReloadInterval > 0 &&
++          (keyStore != null || trustStore != null)) {
+         this.configurationChangeMonitor = Optional.of(
+             this.makeConfigurationChangeMonitor(storesReloadInterval, sslContextFactory));
+       }
+@@ -601,22 +603,30 @@ private ServerConnector createHttpsChannelConnector(
+     private Timer makeConfigurationChangeMonitor(long reloadInterval,
+         SslContextFactory.Server sslContextFactory) {
+       java.util.Timer timer = new java.util.Timer(FileBasedKeyStoresFactory.SSL_MONITORING_THREAD_NAME, true);
++      ArrayList<Path> locations = new ArrayList<Path>();
++      if (keyStore != null) {
++        locations.add(Paths.get(keyStore));
++      }
++      if (trustStore != null) {
++        locations.add(Paths.get(trustStore));
++      }
+       //
+       // The Jetty SSLContextFactory provides a 'reload' method which will reload both
+       // truststore and keystore certificates.
+       //
+       timer.schedule(new FileMonitoringTimerTask(
+-              Paths.get(keyStore),
+-              path -> {
+-                LOG.info("Reloading certificates from store keystore " + keyStore);
+-                try {
+-                  sslContextFactory.reload(factory -> { });
+-                } catch (Exception ex) {
+-                  LOG.error("Failed to reload SSL keystore certificates", ex);
+-                }
+-              },null),
+-          reloadInterval,
+-          reloadInterval
++            locations,
++            path -> {
++              LOG.info("Reloading keystore and truststore certificates.");
++              try {
++                sslContextFactory.reload(factory -> { });
++              } catch (Exception ex) {
++                LOG.error("Failed to reload SSL keystore " +
++                    "and truststore certificates", ex);
++              }
++            },null),
++        reloadInterval,
++        reloadInterval
+       );
+       return timer;
+     }
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/ssl/FileMonitoringTimerTask.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/ssl/FileMonitoringTimerTask.java
+index 40b61978ef1f..d42d3173cb2b 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/ssl/FileMonitoringTimerTask.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/ssl/FileMonitoringTimerTask.java
+@@ -24,6 +24,9 @@
+ import org.slf4j.LoggerFactory;
+ 
+ import java.nio.file.Path;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.List;
+ import java.util.TimerTask;
+ import java.util.function.Consumer;
+ 
+@@ -42,34 +45,59 @@ public class FileMonitoringTimerTask extends TimerTask {
+   static final String PROCESS_ERROR_MESSAGE =
+       "Could not process file change : ";
+ 
+-  final private Path filePath;
++  final private List<Path> filePaths;
+   final private Consumer<Path> onFileChange;
+   final Consumer<Throwable> onChangeFailure;
+-  private long lastProcessed;
++  private List<Long> lastProcessed;
+ 
+   /**
+-   * Create file monitoring task to be scheduled using a standard Java {@link java.util.Timer}
+-   * instance.
++   * See {@link #FileMonitoringTimerTask(List, Consumer, Consumer)}.
+    *
+-   * @param filePath The path to the file to monitor.
+-   * @param onFileChange The function to call when the file has changed.
+-   * @param onChangeFailure The function to call when an exception is thrown during the
+-   *                       file change processing.
++   * @param filePath The file to monitor.
++   * @param onFileChange What to do when the file changes.
++   * @param onChangeFailure What to do when <code>onFileChange</code>
++   *                        throws an exception.
+    */
+   public FileMonitoringTimerTask(Path filePath, Consumer<Path> onFileChange,
+-      Consumer<Throwable> onChangeFailure) {
+-    Preconditions.checkNotNull(filePath, "path to monitor disk file is not set");
+-    Preconditions.checkNotNull(onFileChange, "action to monitor disk file is not set");
++                                 Consumer<Throwable> onChangeFailure) {
++    this(Collections.singletonList(filePath), onFileChange, onChangeFailure);
++  }
+ 
+-    this.filePath = filePath;
+-    this.lastProcessed = filePath.toFile().lastModified();
++  /**
++   * Create file monitoring task to be scheduled using a standard
++   * Java {@link java.util.Timer} instance.
++   *
++   * @param filePaths The path to the file to monitor.
++   * @param onFileChange The function to call when the file has changed.
++   * @param onChangeFailure The function to call when an exception is
++   *                       thrown during the file change processing.
++   */
++  public FileMonitoringTimerTask(List<Path> filePaths,
++                                 Consumer<Path> onFileChange,
++                                 Consumer<Throwable> onChangeFailure) {
++    Preconditions.checkNotNull(filePaths,
++        "path to monitor disk file is not set");
++    Preconditions.checkNotNull(onFileChange,
++        "action to monitor disk file is not set");
++
++    this.filePaths = new ArrayList<Path>(filePaths);
++    this.lastProcessed = new ArrayList<Long>();
++    this.filePaths.forEach(path ->
++        this.lastProcessed.add(path.toFile().lastModified()));
+     this.onFileChange = onFileChange;
+     this.onChangeFailure = onChangeFailure;
+   }
+ 
+   @Override
+   public void run() {
+-    if (lastProcessed != filePath.toFile().lastModified()) {
++    int modified = -1;
++    for (int i = 0; i < filePaths.size() && modified < 0; i++) {
++      if (lastProcessed.get(i) != filePaths.get(i).toFile().lastModified()) {
++        modified = i;
++      }
++    }
++    if (modified > -1) {
++      Path filePath = filePaths.get(modified);
+       try {
+         onFileChange.accept(filePath);
+       } catch (Throwable t) {
+@@ -79,7 +107,7 @@ public void run() {
+           LOG.error(PROCESS_ERROR_MESSAGE + filePath.toString(), t);
+         }
+       }
+-      lastProcessed = filePath.toFile().lastModified();
++      lastProcessed.set(modified, filePath.toFile().lastModified());
+     }
+   }
+ }
+diff --git a/hadoop-yarn-project/hadoop-yarn/pom.xml b/hadoop-yarn-project/hadoop-yarn/pom.xml
+index caa9a1b6c0bc..e97e35608553 100644
+--- a/hadoop-yarn-project/hadoop-yarn/pom.xml
++++ b/hadoop-yarn-project/hadoop-yarn/pom.xml
+@@ -246,4 +246,5 @@
+     <module>hadoop-yarn-ui</module>
+     <module>hadoop-yarn-csi</module>
+   </modules>
++  <!--  -->
+ </project>

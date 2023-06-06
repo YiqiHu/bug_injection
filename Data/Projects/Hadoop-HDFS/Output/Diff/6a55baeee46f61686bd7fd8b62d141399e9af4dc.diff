@@ -1,0 +1,156 @@
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockRecoveryWorker.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockRecoveryWorker.java
+index dfc6f7f13364..d4687e8331ad 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockRecoveryWorker.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockRecoveryWorker.java
+@@ -119,6 +119,7 @@ protected void recover() throws IOException {
+       List<BlockRecord> syncList = new ArrayList<>(locs.length);
+       int errorCount = 0;
+       int candidateReplicaCnt = 0;
++      DataNodeFaultInjector.get().delay();
+ 
+       // Check generation stamps, replica size and state. Replica must satisfy
+       // the following criteria to be included in syncList for recovery:
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNodeFaultInjector.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNodeFaultInjector.java
+index 949c2dd67668..58c589e4d255 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNodeFaultInjector.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNodeFaultInjector.java
+@@ -137,4 +137,9 @@ public void delayWhenOfferServiceHoldLock() {}
+    * Used as a hook to inject intercept when re-register.
+    */
+   public void blockUtilSendFullBlockReport() {}
++
++  /**
++   * Just delay a while.
++   */
++  public void delay() {}
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirTruncateOp.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirTruncateOp.java
+index 4104930ca365..22b0e175018d 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirTruncateOp.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirTruncateOp.java
+@@ -24,6 +24,7 @@
+ import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.fs.UnresolvedLinkException;
+ import org.apache.hadoop.fs.permission.FsAction;
++import org.apache.hadoop.hdfs.protocol.AlreadyBeingCreatedException;
+ import org.apache.hadoop.hdfs.protocol.Block;
+ import org.apache.hadoop.hdfs.protocol.BlockStoragePolicy;
+ import org.apache.hadoop.hdfs.protocol.QuotaExceededException;
+@@ -111,6 +112,10 @@ static TruncateResult truncate(final FSNamesystem fsn, final String srcArg,
+               + truncatedBlock.getNumBytes();
+           if (newLength == truncateLength) {
+             return new TruncateResult(false, fsd.getAuditFileInfo(iip));
++          } else {
++            throw new AlreadyBeingCreatedException(
++                RecoverLeaseOp.TRUNCATE_FILE.getExceptionMessage(src,
++                    clientName, clientMachine, src + " is being truncated."));
+           }
+         }
+       }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+index ff03d7b0522f..c6902b8ea213 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+@@ -2823,7 +2823,7 @@ enum RecoverLeaseOp {
+     TRUNCATE_FILE,
+     RECOVER_LEASE;
+     
+-    private String getExceptionMessage(String src, String holder,
++    public String getExceptionMessage(String src, String holder,
+         String clientMachine, String reason) {
+       return "Failed to " + this + " " + src + " for " + holder +
+           " on " + clientMachine + " because " + reason;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFileTruncate.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFileTruncate.java
+index 60f49c442c4e..57f5ea33eb0e 100755
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFileTruncate.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFileTruncate.java
+@@ -33,6 +33,9 @@
+ import java.io.IOException;
+ import java.util.concurrent.ThreadLocalRandom;
+ 
++import org.apache.hadoop.hdfs.server.datanode.DataNodeFaultInjector;
++import org.apache.hadoop.ipc.RemoteException;
++import org.apache.hadoop.test.LambdaTestUtils;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ import org.apache.hadoop.HadoopIllegalArgumentException;
+@@ -218,6 +221,70 @@ public void testSnapshotTruncateThenDeleteSnapshot() throws IOException {
+     fs.delete(dir, true);
+   }
+ 
++  /**
++   * Test truncate twice together on a file.
++   */
++  @Test(timeout=90000)
++  public void testTruncateTwiceTogether() throws Exception {
++
++    Path dir = new Path("/testTruncateTwiceTogether");
++    fs.mkdirs(dir);
++    final Path p = new Path(dir, "file");
++    final byte[] data = new byte[100 * BLOCK_SIZE];
++    ThreadLocalRandom.current().nextBytes(data);
++    writeContents(data, data.length, p);
++
++    DataNodeFaultInjector originInjector = DataNodeFaultInjector.get();
++    DataNodeFaultInjector injector = new DataNodeFaultInjector() {
++      @Override
++      public void delay() {
++        try {
++          // Bigger than soft lease period.
++          Thread.sleep(5000);
++        } catch (InterruptedException e) {
++          // Ignore
++        }
++      }
++    };
++    // Delay to recovery.
++    DataNodeFaultInjector.set(injector);
++
++    // Truncate by using different client name.
++    Thread t = new Thread(() -> {
++      String hdfsCacheDisableKey = "fs.hdfs.impl.disable.cache";
++      boolean originCacheDisable =
++          conf.getBoolean(hdfsCacheDisableKey, false);
++      try {
++        conf.setBoolean(hdfsCacheDisableKey, true);
++        FileSystem fs1 = FileSystem.get(conf);
++        fs1.truncate(p, data.length-1);
++        } catch (IOException e) {
++          // ignore
++        } finally{
++          conf.setBoolean(hdfsCacheDisableKey, originCacheDisable);
++        }
++      });
++    t.start();
++    t.join();
++    NameNodeAdapter.getLeaseManager(cluster.getNamesystem())
++        .setLeasePeriod(LOW_SOFTLIMIT, LOW_HARDLIMIT);
++
++    LambdaTestUtils.intercept(RemoteException.class,
++        "/testTruncateTwiceTogether/file is being truncated",
++        () -> fs.truncate(p, data.length - 2));
++
++    // wait for block recovery
++    checkBlockRecovery(p);
++    assertFileLength(p, data.length - 1);
++
++    DataNodeFaultInjector.set(originInjector);
++    NameNodeAdapter.getLeaseManager(cluster.getNamesystem())
++        .setLeasePeriod(HdfsConstants.LEASE_SOFTLIMIT_PERIOD,
++            conf.getLong(DFSConfigKeys.DFS_LEASE_HARDLIMIT_KEY,
++                DFSConfigKeys.DFS_LEASE_HARDLIMIT_DEFAULT) * 1000);
++    fs.delete(dir, true);
++  }
++
+   /**
+    * Truncate files and then run other operations such as
+    * rename, set replication, set permission, etc.
+@@ -631,7 +698,7 @@ public void testTruncateFailure() throws IOException {
+     {
+       try {
+         fs.truncate(p, 0);
+-        fail("Truncate must fail since a trancate is already in pregress.");
++        fail("Truncate must fail since a truncate is already in progress.");
+       } catch (IOException expected) {
+         GenericTestUtils.assertExceptionContains(
+             "Failed to TRUNCATE_FILE", expected);

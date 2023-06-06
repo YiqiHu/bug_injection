@@ -1,0 +1,665 @@
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/DFSClient.java b/hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
+index 2682549cba12..f314ac9c6e35 100755
+--- a/hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
++++ b/hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
+@@ -41,6 +41,7 @@
+ import java.util.ArrayList;
+ import java.util.EnumSet;
+ import java.util.HashMap;
++import java.util.HashSet;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Random;
+@@ -579,6 +580,27 @@ void updateLastLeaseRenewal() {
+     }
+   }
+ 
++  /**
++   * Get all namespaces of DFSOutputStreams.
++   */
++  private List<String> getNamespaces() {
++    HashSet<String> namespaces = new HashSet<>();
++    synchronized (filesBeingWritten) {
++      for (DFSOutputStream outputStream : filesBeingWritten.values()) {
++        String namespace = outputStream.getNamespace();
++        if (namespace == null || namespace.isEmpty()) {
++          return null;
++        } else {
++          namespaces.add(namespace);
++        }
++      }
++      if (namespaces.isEmpty()) {
++        return null;
++      }
++    }
++    return new ArrayList<>(namespaces);
++  }
++
+   /**
+    * Renew leases.
+    * @return true if lease was renewed. May return false if this
+@@ -587,7 +609,7 @@ void updateLastLeaseRenewal() {
+   public boolean renewLease() throws IOException {
+     if (clientRunning && !isFilesBeingWrittenEmpty()) {
+       try {
+-        namenode.renewLease(clientName);
++        namenode.renewLease(clientName, getNamespaces());
+         updateLastLeaseRenewal();
+         return true;
+       } catch (IOException e) {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/DFSOutputStream.java b/hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/DFSOutputStream.java
+index 0deaa41cf417..92df7c51b23e 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/DFSOutputStream.java
++++ b/hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/DFSOutputStream.java
+@@ -113,6 +113,7 @@ public class DFSOutputStream extends FSOutputSummer
+ 
+   protected final String src;
+   protected final long fileId;
++  private final String namespace;
+   protected final long blockSize;
+   protected final int bytesPerChecksum;
+ 
+@@ -195,6 +196,7 @@ private DFSOutputStream(DFSClient dfsClient, String src,
+     this.dfsClient = dfsClient;
+     this.src = src;
+     this.fileId = stat.getFileId();
++    this.namespace = stat.getNamespace();
+     this.blockSize = stat.getBlockSize();
+     this.blockReplication = stat.getReplication();
+     this.fileEncryptionInfo = stat.getFileEncryptionInfo();
+@@ -1084,6 +1086,11 @@ public long getFileId() {
+     return fileId;
+   }
+ 
++  @VisibleForTesting
++  public String getNamespace() {
++    return namespace;
++  }
++
+   /**
+    * Return the source of stream.
+    */
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/protocol/ClientProtocol.java b/hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/protocol/ClientProtocol.java
+index e9ae803a541b..4f2da496a1a3 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/protocol/ClientProtocol.java
++++ b/hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/protocol/ClientProtocol.java
+@@ -759,11 +759,19 @@ SnapshotStatus[] getSnapshotListing(String snapshotRoot)
+    * the last call to renewLease(), the NameNode assumes the
+    * client has died.
+    *
++   * @param namespaces The full Namespace list that the renewLease rpc
++   *                   should be forwarded by RBF.
++   *                   Tips: NN side, this value should be null.
++   *                         RBF side, if this value is null, this rpc will
++   *                         be forwarded to all available namespaces,
++   *                         else this rpc will be forwarded to
++   *                         the special namespaces.
++   *
+    * @throws org.apache.hadoop.security.AccessControlException permission denied
+    * @throws IOException If an I/O error occurred
+    */
+   @Idempotent
+-  void renewLease(String clientName) throws IOException;
++  void renewLease(String clientName, List<String> namespaces) throws IOException;
+ 
+   /**
+    * Start lease recovery.
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/protocol/HdfsFileStatus.java b/hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/protocol/HdfsFileStatus.java
+index 264e3f4050fd..efc3b90b5a97 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/protocol/HdfsFileStatus.java
++++ b/hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/protocol/HdfsFileStatus.java
+@@ -490,6 +490,10 @@ default FileStatus makeQualified(URI defaultUri, Path parent) {
+    */
+   int compareTo(FileStatus stat);
+ 
++  void setNamespace(String namespace);
++
++  String getNamespace();
++
+   /**
+    * Set redundant flags for compatibility with existing applications.
+    */
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/protocol/HdfsLocatedFileStatus.java b/hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/protocol/HdfsLocatedFileStatus.java
+index bf4e0d2f9f16..a3d4867cff45 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/protocol/HdfsLocatedFileStatus.java
++++ b/hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/protocol/HdfsLocatedFileStatus.java
+@@ -54,6 +54,8 @@
+   // BlockLocations[] is the user-facing type
+   private transient LocatedBlocks hdfsloc;
+ 
++  private String namespace = null;
++
+   /**
+    * Constructor.
+    * @param length the number of bytes the file has
+@@ -217,4 +219,14 @@ public LocatedFileStatus makeQualifiedLocated(URI defaultUri, Path path) {
+     return this;
+   }
+ 
++  @Override
++  public String getNamespace() {
++    return namespace;
++  }
++
++  @Override
++  public void setNamespace(String namespace) {
++    this.namespace = namespace;
++  }
++
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/protocol/HdfsNamedFileStatus.java b/hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/protocol/HdfsNamedFileStatus.java
+index 9434423d721b..4c90e17e4a5d 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/protocol/HdfsNamedFileStatus.java
++++ b/hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/protocol/HdfsNamedFileStatus.java
+@@ -44,6 +44,8 @@ public class HdfsNamedFileStatus extends FileStatus implements HdfsFileStatus {
+   private final int childrenNum;
+   private final byte storagePolicy;
+ 
++  private String namespace = null;
++
+   /**
+    * Constructor.
+    * @param length the number of bytes the file has
+@@ -177,4 +179,13 @@ public int hashCode() {
+     return super.hashCode();
+   }
+ 
++  @Override
++  public String getNamespace() {
++    return namespace;
++  }
++
++  @Override
++  public void setNamespace(String namespace) {
++    this.namespace = namespace;
++  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/protocolPB/ClientNamenodeProtocolTranslatorPB.java b/hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/protocolPB/ClientNamenodeProtocolTranslatorPB.java
+index 7b8ca42c50f7..541a4361896d 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/protocolPB/ClientNamenodeProtocolTranslatorPB.java
++++ b/hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/protocolPB/ClientNamenodeProtocolTranslatorPB.java
+@@ -744,11 +744,15 @@ public BatchedDirectoryListing getBatchedListing(
+ 
+ 
+   @Override
+-  public void renewLease(String clientName) throws IOException {
+-    RenewLeaseRequestProto req = RenewLeaseRequestProto.newBuilder()
+-        .setClientName(clientName).build();
++  public void renewLease(String clientName, List<String> namespaces)
++      throws IOException {
++    RenewLeaseRequestProto.Builder builder = RenewLeaseRequestProto
++        .newBuilder().setClientName(clientName);
++    if (namespaces != null && !namespaces.isEmpty()) {
++      builder.addAllNamespaces(namespaces);
++    }
+     try {
+-      rpcProxy.renewLease(null, req);
++      rpcProxy.renewLease(null, builder.build());
+     } catch (ServiceException e) {
+       throw ProtobufHelper.getRemoteException(e);
+     }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/protocolPB/PBHelperClient.java b/hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/protocolPB/PBHelperClient.java
+index 6097d2f495da..496a5cf46146 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/protocolPB/PBHelperClient.java
++++ b/hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/protocolPB/PBHelperClient.java
+@@ -1764,7 +1764,7 @@ public static HdfsFileStatus convert(HdfsFileStatusProto fs) {
+     EnumSet<HdfsFileStatus.Flags> flags = fs.hasFlags()
+         ? convertFlags(fs.getFlags())
+         : convertFlags(fs.getPermission());
+-    return new HdfsFileStatus.Builder()
++    HdfsFileStatus hdfsFileStatus = new HdfsFileStatus.Builder()
+         .length(fs.getLength())
+         .isdir(fs.getFileType().equals(FileType.IS_DIR))
+         .replication(fs.getBlockReplication())
+@@ -1794,6 +1794,10 @@ public static HdfsFileStatus convert(HdfsFileStatusProto fs) {
+             ? convertErasureCodingPolicy(fs.getEcPolicy())
+             : null)
+         .build();
++    if (fs.hasNamespace()) {
++      hdfsFileStatus.setNamespace(fs.getNamespace());
++    }
++    return hdfsFileStatus;
+   }
+ 
+   private static EnumSet<HdfsFileStatus.Flags> convertFlags(int flags) {
+@@ -2399,6 +2403,9 @@ public static HdfsFileStatusProto convert(HdfsFileStatus fs) {
+     flags |= fs.isSnapshotEnabled() ? HdfsFileStatusProto.Flags
+         .SNAPSHOT_ENABLED_VALUE : 0;
+     builder.setFlags(flags);
++    if (fs.getNamespace() != null && !fs.getNamespace().isEmpty()) {
++      builder.setNamespace(fs.getNamespace());
++    }
+     return builder.build();
+   }
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-client/src/main/proto/ClientNamenodeProtocol.proto b/hadoop-hdfs-project/hadoop-hdfs-client/src/main/proto/ClientNamenodeProtocol.proto
+index 1e8d0b0a2667..60792b5b6c94 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-client/src/main/proto/ClientNamenodeProtocol.proto
++++ b/hadoop-hdfs-project/hadoop-hdfs-client/src/main/proto/ClientNamenodeProtocol.proto
+@@ -332,6 +332,7 @@ message GetSnapshotDiffReportListingResponseProto {
+ }
+ message RenewLeaseRequestProto {
+   required string clientName = 1;
++  repeated string namespaces = 2;
+ }
+ 
+ message RenewLeaseResponseProto { //void response
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-client/src/main/proto/hdfs.proto b/hadoop-hdfs-project/hadoop-hdfs-client/src/main/proto/hdfs.proto
+index 163d3a49d301..a4d36180c2c7 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-client/src/main/proto/hdfs.proto
++++ b/hadoop-hdfs-project/hadoop-hdfs-client/src/main/proto/hdfs.proto
+@@ -481,6 +481,7 @@ message HdfsFileStatusProto {
+ 
+   // Set of flags
+   optional uint32 flags = 18 [default = 0];
++  optional string namespace = 19;
+ }
+ 
+ /**
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-rbf/src/main/java/org/apache/hadoop/hdfs/server/federation/router/RouterClientProtocol.java b/hadoop-hdfs-project/hadoop-hdfs-rbf/src/main/java/org/apache/hadoop/hdfs/server/federation/router/RouterClientProtocol.java
+index c1dafec92203..73445595de7a 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-rbf/src/main/java/org/apache/hadoop/hdfs/server/federation/router/RouterClientProtocol.java
++++ b/hadoop-hdfs-project/hadoop-hdfs-rbf/src/main/java/org/apache/hadoop/hdfs/server/federation/router/RouterClientProtocol.java
+@@ -291,8 +291,10 @@ public HdfsFileStatus create(String src, FsPermission masked,
+     RemoteLocation createLocation = null;
+     try {
+       createLocation = rpcServer.getCreateLocation(src, locations);
+-      return rpcClient.invokeSingle(createLocation, method,
++      HdfsFileStatus status = rpcClient.invokeSingle(createLocation, method,
+           HdfsFileStatus.class);
++      status.setNamespace(createLocation.getNameserviceId());
++      return status;
+     } catch (IOException ioe) {
+       final List<RemoteLocation> newLocations = checkFaultTolerantRetry(
+           method, src, ioe, createLocation, locations);
+@@ -377,8 +379,11 @@ public LastBlockWithStatus append(String src, final String clientName,
+     RemoteMethod method = new RemoteMethod("append",
+         new Class<?>[] {String.class, String.class, EnumSetWritable.class},
+         new RemoteParam(), clientName, flag);
+-    return rpcClient.invokeSequential(
+-        locations, method, LastBlockWithStatus.class, null);
++    RemoteResult result = rpcClient.invokeSequential(
++        method, locations, LastBlockWithStatus.class, null);
++    LastBlockWithStatus lbws = (LastBlockWithStatus) result.getResult();
++    lbws.getFileStatus().setNamespace(result.getLocation().getNameserviceId());
++    return lbws;
+   }
+ 
+   @Override
+@@ -759,14 +764,49 @@ public boolean mkdirs(String src, FsPermission masked, boolean createParent)
+     }
+   }
+ 
++  private Map<String, FederationNamespaceInfo> getAvailableNamespaces()
++      throws IOException {
++    Map<String, FederationNamespaceInfo> allAvailableNamespaces =
++        new HashMap<>();
++    namenodeResolver.getNamespaces().forEach(
++        k -> allAvailableNamespaces.put(k.getNameserviceId(), k));
++    return allAvailableNamespaces;
++  }
++
++  /**
++   * Try to get a list of FederationNamespaceInfo for renewLease RPC.
++   */
++  private List<FederationNamespaceInfo> getRenewLeaseNSs(List<String> namespaces)
++      throws IOException {
++    if (namespaces == null || namespaces.isEmpty()) {
++      return new ArrayList<>(namenodeResolver.getNamespaces());
++    }
++    List<FederationNamespaceInfo> result = new ArrayList<>();
++    Map<String, FederationNamespaceInfo> allAvailableNamespaces =
++        getAvailableNamespaces();
++    for (String namespace : namespaces) {
++      if (!allAvailableNamespaces.containsKey(namespace)) {
++        return new ArrayList<>(namenodeResolver.getNamespaces());
++      } else {
++        result.add(allAvailableNamespaces.get(namespace));
++      }
++    }
++    return result;
++  }
++
+   @Override
+-  public void renewLease(String clientName) throws IOException {
++  public void renewLease(String clientName, List<String> namespaces)
++      throws IOException {
+     rpcServer.checkOperation(NameNode.OperationCategory.WRITE);
+ 
+     RemoteMethod method = new RemoteMethod("renewLease",
+-        new Class<?>[] {String.class}, clientName);
+-    Set<FederationNamespaceInfo> nss = namenodeResolver.getNamespaces();
+-    rpcClient.invokeConcurrent(nss, method, false, false);
++        new Class<?>[] {String.class, List.class}, clientName, null);
++    List<FederationNamespaceInfo> nss = getRenewLeaseNSs(namespaces);
++    if (nss.size() == 1) {
++      rpcClient.invokeSingle(nss.get(0).getNameserviceId(), method);
++    } else {
++      rpcClient.invokeConcurrent(nss, method, false, false);
++    }
+   }
+ 
+   @Override
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-rbf/src/main/java/org/apache/hadoop/hdfs/server/federation/router/RouterRpcServer.java b/hadoop-hdfs-project/hadoop-hdfs-rbf/src/main/java/org/apache/hadoop/hdfs/server/federation/router/RouterRpcServer.java
+index 58181dcc346c..980d64a45d13 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-rbf/src/main/java/org/apache/hadoop/hdfs/server/federation/router/RouterRpcServer.java
++++ b/hadoop-hdfs-project/hadoop-hdfs-rbf/src/main/java/org/apache/hadoop/hdfs/server/federation/router/RouterRpcServer.java
+@@ -980,8 +980,9 @@ public boolean mkdirs(String src, FsPermission masked, boolean createParent)
+   }
+ 
+   @Override // ClientProtocol
+-  public void renewLease(String clientName) throws IOException {
+-    clientProto.renewLease(clientName);
++  public void renewLease(String clientName, List<String> namespaces)
++      throws IOException {
++    clientProto.renewLease(clientName, namespaces);
+   }
+ 
+   @Override // ClientProtocol
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-rbf/src/test/java/org/apache/hadoop/hdfs/server/federation/fairness/TestRouterHandlersFairness.java b/hadoop-hdfs-project/hadoop-hdfs-rbf/src/test/java/org/apache/hadoop/hdfs/server/federation/fairness/TestRouterHandlersFairness.java
+index 2d27c66e37ee..8fc9de0cb261 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-rbf/src/test/java/org/apache/hadoop/hdfs/server/federation/fairness/TestRouterHandlersFairness.java
++++ b/hadoop-hdfs-project/hadoop-hdfs-rbf/src/test/java/org/apache/hadoop/hdfs/server/federation/fairness/TestRouterHandlersFairness.java
+@@ -194,7 +194,7 @@ private void invokeSequential(ClientProtocol routerProto) throws IOException {
+ 
+   private void invokeConcurrent(ClientProtocol routerProto, String clientName)
+       throws IOException {
+-    routerProto.renewLease(clientName);
++    routerProto.renewLease(clientName, null);
+   }
+ 
+   private int getTotalRejectedPermits(RouterContext routerContext) {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-rbf/src/test/java/org/apache/hadoop/hdfs/server/federation/metrics/TestRouterClientMetrics.java b/hadoop-hdfs-project/hadoop-hdfs-rbf/src/test/java/org/apache/hadoop/hdfs/server/federation/metrics/TestRouterClientMetrics.java
+index da16c0591078..3397718745ff 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-rbf/src/test/java/org/apache/hadoop/hdfs/server/federation/metrics/TestRouterClientMetrics.java
++++ b/hadoop-hdfs-project/hadoop-hdfs-rbf/src/test/java/org/apache/hadoop/hdfs/server/federation/metrics/TestRouterClientMetrics.java
+@@ -156,7 +156,7 @@ public void testGetQuota() throws Exception {
+ 
+   @Test
+   public void testRenewLease() throws Exception {
+-    router.getRpcServer().renewLease("test");
++    router.getRpcServer().renewLease("test", null);
+     assertCounter("RenewLeaseOps", 2L, getMetrics(ROUTER_METRICS));
+     assertCounter("ConcurrentRenewLeaseOps", 1L, getMetrics(ROUTER_METRICS));
+   }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-rbf/src/test/java/org/apache/hadoop/hdfs/server/federation/router/TestDisableNameservices.java b/hadoop-hdfs-project/hadoop-hdfs-rbf/src/test/java/org/apache/hadoop/hdfs/server/federation/router/TestDisableNameservices.java
+index ae04150d70fa..78f41c5d92a2 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-rbf/src/test/java/org/apache/hadoop/hdfs/server/federation/router/TestDisableNameservices.java
++++ b/hadoop-hdfs-project/hadoop-hdfs-rbf/src/test/java/org/apache/hadoop/hdfs/server/federation/router/TestDisableNameservices.java
+@@ -159,7 +159,7 @@ public void cleanup() throws IOException {
+   public void testWithoutDisabling() throws IOException {
+     // ns0 is slow and renewLease should take a long time
+     long t0 = monotonicNow();
+-    routerProtocol.renewLease("client0");
++    routerProtocol.renewLease("client0", null);
+     long t = monotonicNow() - t0;
+     assertTrue("It took too little: " + t + "ms",
+         t > TimeUnit.SECONDS.toMillis(1));
+@@ -178,7 +178,7 @@ public void testDisabling() throws Exception {
+ 
+     // renewLease should be fast as we are skipping ns0
+     long t0 = monotonicNow();
+-    routerProtocol.renewLease("client0");
++    routerProtocol.renewLease("client0", null);
+     long t = monotonicNow() - t0;
+     assertTrue("It took too long: " + t + "ms",
+         t < TimeUnit.SECONDS.toMillis(1));
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-rbf/src/test/java/org/apache/hadoop/hdfs/server/federation/router/TestRouterClientRejectOverload.java b/hadoop-hdfs-project/hadoop-hdfs-rbf/src/test/java/org/apache/hadoop/hdfs/server/federation/router/TestRouterClientRejectOverload.java
+index 71ec747af4c3..04cfb5c9d903 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-rbf/src/test/java/org/apache/hadoop/hdfs/server/federation/router/TestRouterClientRejectOverload.java
++++ b/hadoop-hdfs-project/hadoop-hdfs-rbf/src/test/java/org/apache/hadoop/hdfs/server/federation/router/TestRouterClientRejectOverload.java
+@@ -215,7 +215,7 @@ public void run() {
+             routerClient = new DFSClient(address, conf);
+             String clientName = routerClient.getClientName();
+             ClientProtocol routerProto = routerClient.getNamenode();
+-            routerProto.renewLease(clientName);
++            routerProto.renewLease(clientName, null);
+           } catch (RemoteException re) {
+             IOException ioe = re.unwrapRemoteException();
+             assertTrue("Wrong exception: " + ioe,
+@@ -390,7 +390,7 @@ public void testAsyncCallerPoolMetrics() throws Exception {
+               cluster.getRouterClientConf());
+           String clientName = routerClient.getClientName();
+           ClientProtocol routerProto = routerClient.getNamenode();
+-          routerProto.renewLease(clientName);
++          routerProto.renewLease(clientName, null);
+         } catch (Exception e) {
+           fail("Client request failed: " + e);
+         } finally {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-rbf/src/test/java/org/apache/hadoop/hdfs/server/federation/router/TestRouterRPCClientRetries.java b/hadoop-hdfs-project/hadoop-hdfs-rbf/src/test/java/org/apache/hadoop/hdfs/server/federation/router/TestRouterRPCClientRetries.java
+index 73803d980520..039acbb5988d 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-rbf/src/test/java/org/apache/hadoop/hdfs/server/federation/router/TestRouterRPCClientRetries.java
++++ b/hadoop-hdfs-project/hadoop-hdfs-rbf/src/test/java/org/apache/hadoop/hdfs/server/federation/router/TestRouterRPCClientRetries.java
+@@ -153,7 +153,7 @@ public void testRetryWhenOneNameServiceDown() throws Exception {
+ 
+     DFSClient client = nnContext1.getClient();
+     // Renew lease for the DFS client, it will succeed.
+-    routerProtocol.renewLease(client.getClientName());
++    routerProtocol.renewLease(client.getClientName(), null);
+ 
+     // Verify the retry times, it will retry one time for ns0.
+     FederationRPCMetrics rpcMetrics = routerContext.getRouter()
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-rbf/src/test/java/org/apache/hadoop/hdfs/server/federation/router/TestRouterRpc.java b/hadoop-hdfs-project/hadoop-hdfs-rbf/src/test/java/org/apache/hadoop/hdfs/server/federation/router/TestRouterRpc.java
+index 4aeb2ec9b8f3..f71145a45229 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-rbf/src/test/java/org/apache/hadoop/hdfs/server/federation/router/TestRouterRpc.java
++++ b/hadoop-hdfs-project/hadoop-hdfs-rbf/src/test/java/org/apache/hadoop/hdfs/server/federation/router/TestRouterRpc.java
+@@ -58,6 +58,7 @@
+ import org.apache.hadoop.crypto.CryptoProtocolVersion;
+ import org.apache.hadoop.fs.ContentSummary;
+ import org.apache.hadoop.fs.CreateFlag;
++import org.apache.hadoop.fs.FSDataOutputStream;
+ import org.apache.hadoop.fs.FileContext;
+ import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.fs.FileSystem;
+@@ -107,6 +108,7 @@
+ import org.apache.hadoop.hdfs.server.federation.MiniRouterDFSCluster.RouterContext;
+ import org.apache.hadoop.hdfs.server.federation.MockResolver;
+ import org.apache.hadoop.hdfs.server.federation.RouterConfigBuilder;
++import org.apache.hadoop.hdfs.server.federation.metrics.FederationRPCMetrics;
+ import org.apache.hadoop.hdfs.server.federation.metrics.NamenodeBeanMetrics;
+ import org.apache.hadoop.hdfs.server.federation.metrics.RBFMetrics;
+ import org.apache.hadoop.hdfs.server.federation.resolver.FileSubclusterResolver;
+@@ -1450,6 +1452,101 @@ public void testProxyRestoreFailedStorage() throws Exception {
+     assertEquals(nnSuccess, routerSuccess);
+   }
+ 
++  private void testRenewLeaseInternal(DistributedFileSystem dfs,
++      FederationRPCMetrics rpcMetrics, Path testPath, boolean createFlag)
++      throws Exception {
++    FSDataOutputStream outputStream = null;
++    try {
++      if (createFlag) {
++        outputStream = dfs.create(testPath);
++      } else {
++        outputStream = dfs.append(testPath);
++      }
++      outputStream.write("hello world. \n".getBytes());
++      long proxyOpBeforeRenewLease = rpcMetrics.getProxyOps();
++      assertTrue(dfs.getClient().renewLease());
++      long proxyOpAfterRenewLease = rpcMetrics.getProxyOps();
++      assertEquals((proxyOpBeforeRenewLease + 1), proxyOpAfterRenewLease);
++    } finally {
++      if (outputStream != null) {
++        outputStream.close();
++      }
++    }
++  }
++
++  @Test
++  public void testRenewLeaseForECFile() throws Exception {
++    String ecName = "RS-6-3-1024k";
++    FederationRPCMetrics metrics = router.getRouterRpcServer().getRPCMetrics();
++    // Install a mount point to a different path to check
++    MockResolver resolver =
++        (MockResolver)router.getRouter().getSubclusterResolver();
++    String ns0 = cluster.getNameservices().get(0);
++    resolver.addLocation("/testRenewLease0", ns0, "/testRenewLease0");
++
++    // Stop LeaseRenewer
++    DistributedFileSystem routerDFS = (DistributedFileSystem) routerFS;
++    routerDFS.getClient().getLeaseRenewer().interruptAndJoin();
++
++    Path testECPath = new Path("/testRenewLease0/ecDirectory/test_ec.txt");
++    routerDFS.mkdirs(testECPath.getParent());
++    routerDFS.setErasureCodingPolicy(
++        testECPath.getParent(), ecName);
++    testRenewLeaseInternal(routerDFS, metrics, testECPath, true);
++
++    ErasureCodingPolicy ecPolicy = routerDFS.getErasureCodingPolicy(testECPath);
++    assertNotNull(ecPolicy);
++    assertEquals(ecName, ecPolicy.getName());
++  }
++
++
++  @Test
++  public void testRenewLeaseForReplicaFile() throws Exception {
++    FederationRPCMetrics metrics = router.getRouterRpcServer().getRPCMetrics();
++    // Install a mount point to a different path to check
++    MockResolver resolver =
++        (MockResolver)router.getRouter().getSubclusterResolver();
++    String ns0 = cluster.getNameservices().get(0);
++    resolver.addLocation("/testRenewLease0", ns0, "/testRenewLease0");
++
++    // Stop LeaseRenewer
++    DistributedFileSystem routerDFS = (DistributedFileSystem) routerFS;
++    routerDFS.getClient().getLeaseRenewer().interruptAndJoin();
++
++    // Test Replica File
++    Path testPath = new Path("/testRenewLease0/test_replica.txt");
++    testRenewLeaseInternal(routerDFS, metrics, testPath, true);
++    testRenewLeaseInternal(routerDFS, metrics, testPath, false);
++  }
++
++  @Test
++  public void testRenewLeaseWithMultiStream() throws Exception {
++    FederationRPCMetrics metrics = router.getRouterRpcServer().getRPCMetrics();
++    // Install a mount point to a different path to check
++    MockResolver resolver =
++        (MockResolver)router.getRouter().getSubclusterResolver();
++    String ns0 = cluster.getNameservices().get(0);
++    String ns1 = cluster.getNameservices().get(1);
++    resolver.addLocation("/testRenewLease0", ns0, "/testRenewLease0");
++    resolver.addLocation("/testRenewLease1", ns1, "/testRenewLease1");
++
++    // Stop LeaseRenewer
++    DistributedFileSystem routerDFS = (DistributedFileSystem) routerFS;
++    routerDFS.getClient().getLeaseRenewer().interruptAndJoin();
++
++    Path newTestPath0 = new Path("/testRenewLease0/test1.txt");
++    Path newTestPath1 = new Path("/testRenewLease1/test1.txt");
++    try (FSDataOutputStream outStream1 = routerDFS.create(newTestPath0);
++         FSDataOutputStream outStream2 = routerDFS.create(newTestPath1)) {
++      outStream1.write("hello world \n".getBytes());
++      outStream2.write("hello world \n".getBytes());
++      long proxyOpBeforeRenewLease2 = metrics.getProxyOps();
++      assertTrue(routerDFS.getClient().renewLease());
++      long proxyOpAfterRenewLease2 = metrics.getProxyOps();
++      assertEquals((proxyOpBeforeRenewLease2 + 2), proxyOpAfterRenewLease2);
++    }
++  }
++
+   @Test
+   public void testProxyExceptionMessages() throws IOException {
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/ClientNamenodeProtocolServerSideTranslatorPB.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/ClientNamenodeProtocolServerSideTranslatorPB.java
+index 0164f25460dc..79c122cf5bae 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/ClientNamenodeProtocolServerSideTranslatorPB.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/ClientNamenodeProtocolServerSideTranslatorPB.java
+@@ -818,7 +818,7 @@ public GetBatchedListingResponseProto getBatchedListing(
+   public RenewLeaseResponseProto renewLease(RpcController controller,
+       RenewLeaseRequestProto req) throws ServiceException {
+     try {
+-      server.renewLease(req.getClientName());
++      server.renewLease(req.getClientName(), req.getNamespacesList());
+       return VOID_RENEWLEASE_RESPONSE;
+     } catch (IOException e) {
+       throw new ServiceException(e);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java
+index c86211b058bd..1d50bc5cb533 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java
+@@ -1174,7 +1174,14 @@ public boolean mkdirs(String src, FsPermission masked, boolean createParent)
+   }
+ 
+   @Override // ClientProtocol
+-  public void renewLease(String clientName) throws IOException {
++  public void renewLease(String clientName, List<String> namespaces)
++      throws IOException {
++    if (namespaces != null && namespaces.size() > 0) {
++      LOG.warn("namespaces({}) should be null or empty "
++          + "on NameNode side, please check it.", namespaces);
++      throw new IOException("namespaces(" + namespaces
++          + ") should be null or empty");
++    }
+     checkNNStartup();
+     namesystem.renewLease(clientName);        
+   }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSClientRetries.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSClientRetries.java
+index 970003b0e58c..c335d38f7331 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSClientRetries.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSClientRetries.java
+@@ -384,7 +384,7 @@ public void testLeaseRenewSocketTimeout() throws Exception
+       cluster.waitActive();
+       NamenodeProtocols spyNN = spy(cluster.getNameNodeRpc());
+       Mockito.doThrow(new SocketTimeoutException()).when(spyNN).renewLease(
+-          Mockito.anyString());
++          Mockito.anyString(), any());
+       DFSClient client = new DFSClient(null, spyNN, conf, null);
+       // Get hold of the lease renewer instance used by the client
+       final LeaseRenewer leaseRenewer1 = client.getLeaseRenewer();
+@@ -392,7 +392,7 @@ public void testLeaseRenewSocketTimeout() throws Exception
+       OutputStream out1 = client.create(file1, false);
+ 
+       Mockito.verify(spyNN, timeout(10000).times(1)).renewLease(
+-          Mockito.anyString());
++          Mockito.anyString(), any());
+       verifyEmptyLease(leaseRenewer1);
+       GenericTestUtils.waitFor(() -> !(leaseRenewer1.isRunning()), 100, 10000);
+       try {
+@@ -406,12 +406,12 @@ public void testLeaseRenewSocketTimeout() throws Exception
+       // Verify DFSClient can do write operation after renewLease no longer
+       // throws SocketTimeoutException.
+       Mockito.doNothing().when(spyNN).renewLease(
+-          Mockito.anyString());
++          Mockito.anyString(), any());
+       final LeaseRenewer leaseRenewer2 = client.getLeaseRenewer();
+       leaseRenewer2.setRenewalTime(100);
+       OutputStream out2 = client.create(file2, false);
+       Mockito.verify(spyNN, timeout(10000).times(2)).renewLease(
+-          Mockito.anyString());
++          Mockito.anyString(), any());
+       out2.write(new byte[256]);
+       out2.close();
+       verifyEmptyLease(leaseRenewer2);
+@@ -1309,7 +1309,7 @@ public void delayWhenRenewLeaseTimeout() {
+           try {
+             //1. trigger get LeaseRenewer lock
+             Mockito.doThrow(new SocketTimeoutException()).when(spyNN)
+-                .renewLease(Mockito.anyString());
++                .renewLease(Mockito.anyString(), any());
+           } catch (IOException e) {
+             e.printStackTrace();
+           }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestLease.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestLease.java
+index 5d7b62a42846..8b527d07a29b 100755
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestLease.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestLease.java
+@@ -90,7 +90,8 @@ public void testLeaseAbort() throws Exception {
+ 
+       // stub the renew method.
+       doThrow(new RemoteException(InvalidToken.class.getName(),
+-          "Your token is worthless")).when(spyNN).renewLease(anyString());
++          "Your token is worthless")).when(spyNN).renewLease(
++              anyString(), any());
+ 
+       // We don't need to wait the lease renewer thread to act.
+       // call renewLease() manually.
+@@ -131,7 +132,7 @@ public void testLeaseAbort() throws Exception {
+       Assert.assertTrue(originalRenewer.isEmpty());
+ 
+       // unstub
+-      doNothing().when(spyNN).renewLease(anyString());
++      doNothing().when(spyNN).renewLease(anyString(), any());
+ 
+       // existing input streams should work
+       try {

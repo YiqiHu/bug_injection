@@ -1,0 +1,154 @@
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/CommonConfigurationKeysPublic.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/CommonConfigurationKeysPublic.java
+index 20bb0350d191..968de7994587 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/CommonConfigurationKeysPublic.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/CommonConfigurationKeysPublic.java
+@@ -494,6 +494,10 @@ public class CommonConfigurationKeysPublic {
+                                                 "ipc.server.log.slow.rpc";
+   public static final boolean IPC_SERVER_LOG_SLOW_RPC_DEFAULT = false;
+ 
++  public static final String IPC_SERVER_PURGE_INTERVAL_MINUTES_KEY =
++    "ipc.server.purge.interval";
++  public static final int IPC_SERVER_PURGE_INTERVAL_MINUTES_DEFAULT = 15;
++
+   /**
+    * @see
+    * <a href="{@docRoot}/../hadoop-project-dist/hadoop-common/core-default.xml">
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/Server.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/Server.java
+index 1e67203f795c..bc51a700e43c 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/Server.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/Server.java
+@@ -488,6 +488,8 @@ protected ResponseBuffer initialValue() {
+   volatile private boolean running = true;         // true while server runs
+   private CallQueueManager<Call> callQueue;
+ 
++  private long purgeIntervalNanos;
++
+   // maintains the set of client connections and handles idle timeouts
+   private ConnectionManager connectionManager;
+   private Listener listener = null;
+@@ -517,6 +519,20 @@ protected void setLogSlowRPC(boolean logSlowRPCFlag) {
+     this.logSlowRPC = logSlowRPCFlag;
+   }
+ 
++  private void setPurgeIntervalNanos(int purgeInterval) {
++    int tmpPurgeInterval = CommonConfigurationKeysPublic.
++        IPC_SERVER_PURGE_INTERVAL_MINUTES_DEFAULT;
++    if (purgeInterval > 0) {
++      tmpPurgeInterval = purgeInterval;
++    }
++    this.purgeIntervalNanos = TimeUnit.NANOSECONDS.convert(
++            tmpPurgeInterval, TimeUnit.MINUTES);
++  }
++
++  @VisibleForTesting
++  public long getPurgeIntervalNanos() {
++    return this.purgeIntervalNanos;
++  }
+ 
+   /**
+    * Logs a Slow RPC Request.
+@@ -1591,9 +1607,6 @@ Reader getReader() {
+     }
+   }
+ 
+-  private final static long PURGE_INTERVAL_NANOS = TimeUnit.NANOSECONDS.convert(
+-      15, TimeUnit.MINUTES);
+-
+   // Sends responses of RPC back to clients.
+   private class Responder extends Thread {
+     private final Selector writeSelector;
+@@ -1629,7 +1642,7 @@ private void doRunLoop() {
+         try {
+           waitPending();     // If a channel is being registered, wait.
+           writeSelector.select(
+-              TimeUnit.NANOSECONDS.toMillis(PURGE_INTERVAL_NANOS));
++              TimeUnit.NANOSECONDS.toMillis(purgeIntervalNanos));
+           Iterator<SelectionKey> iter = writeSelector.selectedKeys().iterator();
+           while (iter.hasNext()) {
+             SelectionKey key = iter.next();
+@@ -1652,7 +1665,7 @@ private void doRunLoop() {
+             }
+           }
+           long nowNanos = Time.monotonicNowNanos();
+-          if (nowNanos < lastPurgeTimeNanos + PURGE_INTERVAL_NANOS) {
++          if (nowNanos < lastPurgeTimeNanos + purgeIntervalNanos) {
+             continue;
+           }
+           lastPurgeTimeNanos = nowNanos;
+@@ -1730,7 +1743,7 @@ private void doPurge(RpcCall call, long now) {
+         Iterator<RpcCall> iter = responseQueue.listIterator(0);
+         while (iter.hasNext()) {
+           call = iter.next();
+-          if (now > call.responseTimestampNanos + PURGE_INTERVAL_NANOS) {
++          if (now > call.responseTimestampNanos + purgeIntervalNanos) {
+             closeConnection(call.connection);
+             break;
+           }
+@@ -3239,6 +3252,10 @@ protected Server(String bindAddress, int port,
+         CommonConfigurationKeysPublic.IPC_SERVER_LOG_SLOW_RPC,
+         CommonConfigurationKeysPublic.IPC_SERVER_LOG_SLOW_RPC_DEFAULT));
+ 
++    this.setPurgeIntervalNanos(conf.getInt(
++        CommonConfigurationKeysPublic.IPC_SERVER_PURGE_INTERVAL_MINUTES_KEY,
++        CommonConfigurationKeysPublic.IPC_SERVER_PURGE_INTERVAL_MINUTES_DEFAULT));
++
+     // Create the responder here
+     responder = new Responder();
+     
+diff --git a/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml b/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml
+index 1a4a6bf269a5..15075a4fce87 100644
+--- a/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml
++++ b/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml
+@@ -2460,6 +2460,14 @@
+     </description>
+ </property>
+ 
++<property>
++  <name>ipc.server.purge.interval</name>
++  <value>15</value>
++  <description>Define how often calls are cleaned up in the server.
++    The default is 15 minutes. The unit is minutes.
++  </description>
++</property>
++
+ <property>
+   <name>ipc.maximum.data.length</name>
+   <value>134217728</value>
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestServer.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestServer.java
+index fbaa75bd43ef..748d99e2a0d3 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestServer.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestServer.java
+@@ -25,8 +25,10 @@
+ import java.net.BindException;
+ import java.net.InetSocketAddress;
+ import java.net.ServerSocket;
++import java.util.concurrent.TimeUnit;
+ 
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.CommonConfigurationKeysPublic;
+ import org.apache.hadoop.io.LongWritable;
+ import org.apache.hadoop.io.Writable;
+ import org.apache.hadoop.ipc.Server.Call;
+@@ -184,4 +186,22 @@ public void testExceptionsHandlerSuppressed() {
+     assertTrue(handler.isSuppressedLog(IpcException.class));
+     assertFalse(handler.isSuppressedLog(RpcClientException.class));
+   }
++
++  @Test (timeout=300000)
++  public void testPurgeIntervalNanosConf() throws Exception {
++    Configuration conf = new Configuration();
++    conf.setInt(CommonConfigurationKeysPublic.
++        IPC_SERVER_PURGE_INTERVAL_MINUTES_KEY, 3);
++    Server server = new Server("0.0.0.0", 0, LongWritable.class,
++            1, conf) {
++      @Override
++      public Writable call(
++              RPC.RpcKind rpcKind, String protocol, Writable param,
++              long receiveTime) throws Exception {
++        return null;
++      }
++    };
++    long purgeInterval = TimeUnit.NANOSECONDS.convert(3, TimeUnit.MINUTES);
++    assertEquals(server.getPurgeIntervalNanos(), purgeInterval);
++  }
+ }

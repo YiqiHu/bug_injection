@@ -1,0 +1,1 @@
+    validateEncryptionSecrets(secrets);

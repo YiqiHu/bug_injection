@@ -1,0 +1,658 @@
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/InodeTree.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/InodeTree.java
+index 50c839b52b65..d1e5d3a4e5fb 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/InodeTree.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/InodeTree.java
+@@ -374,7 +374,7 @@ protected abstract T getTargetFileSystem(URI uri)
+       throws UnsupportedFileSystemException, URISyntaxException, IOException;
+ 
+   protected abstract T getTargetFileSystem(INodeDir<T> dir)
+-      throws URISyntaxException;
++      throws URISyntaxException, IOException;
+ 
+   protected abstract T getTargetFileSystem(String settings, URI[] mergeFsURIs)
+       throws UnsupportedFileSystemException, URISyntaxException, IOException;
+@@ -393,7 +393,7 @@ private boolean hasFallbackLink() {
+     return rootFallbackLink != null;
+   }
+ 
+-  private INodeLink<T> getRootFallbackLink() {
++  protected INodeLink<T> getRootFallbackLink() {
+     Preconditions.checkState(root.isInternalDir());
+     return rootFallbackLink;
+   }
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFileSystem.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFileSystem.java
+index 1ee06e02aab1..06052b80d921 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFileSystem.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFileSystem.java
+@@ -290,8 +290,9 @@ protected FileSystem getTargetFileSystem(final URI uri)
+ 
+         @Override
+         protected FileSystem getTargetFileSystem(final INodeDir<FileSystem> dir)
+-          throws URISyntaxException {
+-          return new InternalDirOfViewFs(dir, creationTime, ugi, myUri, config);
++            throws URISyntaxException {
++          return new InternalDirOfViewFs(dir, creationTime, ugi, myUri, config,
++              this);
+         }
+ 
+         @Override
+@@ -518,10 +519,10 @@ public void access(Path path, FsAction mode) throws AccessControlException,
+   /**
+    * {@inheritDoc}
+    *
+-   * Note: listStatus on root("/") considers listing from fallbackLink if
+-   * available. If the same directory name is present in configured mount path
+-   * as well as in fallback link, then only the configured mount path will be
+-   * listed in the returned result.
++   * Note: listStatus considers listing from fallbackLink if available. If the
++   * same directory path is present in configured mount path as well as in
++   * fallback fs, then only the fallback path will be listed in the returned
++   * result except for link.
+    *
+    * If any of the the immediate children of the given path f is a symlink(mount
+    * link), the returned FileStatus object of that children would be represented
+@@ -1125,11 +1126,13 @@ static class InternalDirOfViewFs extends FileSystem {
+     final UserGroupInformation ugi; // the user/group of user who created mtable
+     final URI myUri;
+     private final boolean showMountLinksAsSymlinks;
++    private InodeTree<FileSystem> fsState;
+     
+     public InternalDirOfViewFs(final InodeTree.INodeDir<FileSystem> dir,
+         final long cTime, final UserGroupInformation ugi, URI uri,
+-        Configuration config) throws URISyntaxException {
++        Configuration config, InodeTree fsState) throws URISyntaxException {
+       myUri = uri;
++      this.fsState = fsState;
+       try {
+         initialize(myUri, config);
+       } catch (IOException e) {
+@@ -1225,7 +1228,8 @@ public FileStatus[] listStatus(Path f) throws AccessControlException,
+         FileNotFoundException, IOException {
+       checkPathIsSlash(f);
+       FileStatus[] fallbackStatuses = listStatusForFallbackLink();
+-      FileStatus[] result = new FileStatus[theInternalDir.getChildren().size()];
++      Set<FileStatus> linkStatuses = new HashSet<>();
++      Set<FileStatus> internalDirStatuses = new HashSet<>();
+       int i = 0;
+       for (Entry<String, INode<FileSystem>> iEntry :
+           theInternalDir.getChildren().entrySet()) {
+@@ -1238,11 +1242,10 @@ public FileStatus[] listStatus(Path f) throws AccessControlException,
+             // To maintain backward compatibility, with default option(showing
+             // mount links as symlinks), we will represent target link as
+             // symlink and rest other properties are belongs to mount link only.
+-            result[i++] =
++            linkStatuses.add(
+                 new FileStatus(0, false, 0, 0, creationTime, creationTime,
+                     PERMISSION_555, ugi.getShortUserName(),
+-                    ugi.getPrimaryGroupName(), link.getTargetLink(),
+-                    path);
++                    ugi.getPrimaryGroupName(), link.getTargetLink(), path));
+             continue;
+           }
+ 
+@@ -1258,11 +1261,12 @@ public FileStatus[] listStatus(Path f) throws AccessControlException,
+             FileStatus status =
+                 ((ChRootedFileSystem)link.getTargetFileSystem())
+                 .getMyFs().getFileStatus(new Path(linkedPath));
+-            result[i++] = new FileStatus(status.getLen(), status.isDirectory(),
+-                status.getReplication(), status.getBlockSize(),
+-                status.getModificationTime(), status.getAccessTime(),
+-                status.getPermission(), status.getOwner(), status.getGroup(),
+-                null, path);
++            linkStatuses.add(
++                new FileStatus(status.getLen(), status.isDirectory(),
++                    status.getReplication(), status.getBlockSize(),
++                    status.getModificationTime(), status.getAccessTime(),
++                    status.getPermission(), status.getOwner(),
++                    status.getGroup(), null, path));
+           } catch (FileNotFoundException ex) {
+             LOG.warn("Cannot get one of the children's(" + path
+                 + ")  target path(" + link.getTargetFileSystem().getUri()
+@@ -1270,51 +1274,58 @@ public FileStatus[] listStatus(Path f) throws AccessControlException,
+             throw ex;
+           }
+         } else {
+-          result[i++] =
++          internalDirStatuses.add(
+               new FileStatus(0, true, 0, 0, creationTime, creationTime,
+                   PERMISSION_555, ugi.getShortUserName(),
+-                  ugi.getPrimaryGroupName(), path);
++                  ugi.getPrimaryGroupName(), path));
+         }
+       }
++      FileStatus[] internalDirStatusesMergedWithFallBack = internalDirStatuses
++          .toArray(new FileStatus[internalDirStatuses.size()]);
+       if (fallbackStatuses.length > 0) {
+-        return consolidateFileStatuses(fallbackStatuses, result);
+-      } else {
+-        return result;
++        internalDirStatusesMergedWithFallBack =
++            merge(fallbackStatuses, internalDirStatusesMergedWithFallBack);
+       }
++      // Links will always have precedence than internalDir or fallback paths.
++      return merge(linkStatuses.toArray(new FileStatus[linkStatuses.size()]),
++          internalDirStatusesMergedWithFallBack);
+     }
+ 
+-    private FileStatus[] consolidateFileStatuses(FileStatus[] fallbackStatuses,
+-        FileStatus[] mountPointStatuses) {
++    private FileStatus[] merge(FileStatus[] toStatuses,
++        FileStatus[] fromStatuses) {
+       ArrayList<FileStatus> result = new ArrayList<>();
+       Set<String> pathSet = new HashSet<>();
+-      for (FileStatus status : mountPointStatuses) {
++      for (FileStatus status : toStatuses) {
+         result.add(status);
+         pathSet.add(status.getPath().getName());
+       }
+-      for (FileStatus status : fallbackStatuses) {
++      for (FileStatus status : fromStatuses) {
+         if (!pathSet.contains(status.getPath().getName())) {
+           result.add(status);
+         }
+       }
+-      return result.toArray(new FileStatus[0]);
++      return result.toArray(new FileStatus[result.size()]);
+     }
+ 
+     private FileStatus[] listStatusForFallbackLink() throws IOException {
+-      if (theInternalDir.isRoot() &&
+-          theInternalDir.getFallbackLink() != null) {
+-        FileSystem linkedFs =
+-            theInternalDir.getFallbackLink().getTargetFileSystem();
+-        // Fallback link is only applicable for root
+-        FileStatus[] statuses = linkedFs.listStatus(new Path("/"));
+-        for (FileStatus status : statuses) {
+-          // Fix the path back to viewfs scheme
+-          status.setPath(
+-              new Path(myUri.toString(), status.getPath().getName()));
++      if (this.fsState.getRootFallbackLink() != null) {
++        FileSystem linkedFallbackFs =
++            this.fsState.getRootFallbackLink().getTargetFileSystem();
++        Path p = Path.getPathWithoutSchemeAndAuthority(
++            new Path(theInternalDir.fullPath));
++        if (theInternalDir.isRoot() || linkedFallbackFs.exists(p)) {
++          FileStatus[] statuses = linkedFallbackFs.listStatus(p);
++          for (FileStatus status : statuses) {
++            // Fix the path back to viewfs scheme
++            Path pathFromConfiguredFallbackRoot =
++                new Path(p, status.getPath().getName());
++            status.setPath(
++                new Path(myUri.toString(), pathFromConfiguredFallbackRoot));
++          }
++          return statuses;
+         }
+-        return statuses;
+-      } else {
+-        return new FileStatus[0];
+       }
++      return new FileStatus[0];
+     }
+ 
+     @Override
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFs.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFs.java
+index fae5d1b5f62a..d18233a8e974 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFs.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFs.java
+@@ -44,6 +44,7 @@
+ import org.apache.hadoop.fs.FSDataOutputStream;
+ import org.apache.hadoop.fs.FileAlreadyExistsException;
+ import org.apache.hadoop.fs.FileChecksum;
++import org.apache.hadoop.fs.FileContext;
+ import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.fs.FsConstants;
+ import org.apache.hadoop.fs.FsServerDefaults;
+@@ -236,7 +237,8 @@ protected AbstractFileSystem getTargetFileSystem(final URI uri)
+       @Override
+       protected AbstractFileSystem getTargetFileSystem(
+           final INodeDir<AbstractFileSystem> dir) throws URISyntaxException {
+-        return new InternalDirOfViewFs(dir, creationTime, ugi, getUri());
++        return new InternalDirOfViewFs(dir, creationTime, ugi, getUri(), this,
++            config);
+       }
+ 
+       @Override
+@@ -455,6 +457,11 @@ public LocatedFileStatus getViewFsFileStatus(LocatedFileStatus stat,
+   /**
+    * {@inheritDoc}
+    *
++   * Note: listStatus considers listing from fallbackLink if available. If the
++   * same directory path is present in configured mount path as well as in
++   * fallback fs, then only the fallback path will be listed in the returned
++   * result except for link.
++   *
+    * If any of the the immediate children of the given path f is a symlink(mount
+    * link), the returned FileStatus object of that children would be represented
+    * as a symlink. It will not be resolved to the target path and will not get
+@@ -880,15 +887,20 @@ static class InternalDirOfViewFs extends AbstractFileSystem {
+     final long creationTime; // of the the mount table
+     final UserGroupInformation ugi; // the user/group of user who created mtable
+     final URI myUri; // the URI of the outer ViewFs
+-    
++    private InodeTree<AbstractFileSystem> fsState;
++    private Configuration conf;
++
+     public InternalDirOfViewFs(final InodeTree.INodeDir<AbstractFileSystem> dir,
+-        final long cTime, final UserGroupInformation ugi, final URI uri)
++        final long cTime, final UserGroupInformation ugi, final URI uri,
++        InodeTree fsState, Configuration conf)
+       throws URISyntaxException {
+       super(FsConstants.VIEWFS_URI, FsConstants.VIEWFS_SCHEME, false, -1);
+       theInternalDir = dir;
+       creationTime = cTime;
+       this.ugi = ugi;
+       myUri = uri;
++      this.fsState = fsState;
++      this.conf = conf;
+     }
+ 
+     static private void checkPathIsSlash(final Path f) throws IOException {
+@@ -1015,7 +1027,8 @@ public int getUriDefaultPort() {
+     public FileStatus[] listStatus(final Path f) throws IOException {
+       checkPathIsSlash(f);
+       FileStatus[] fallbackStatuses = listStatusForFallbackLink();
+-      FileStatus[] result = new FileStatus[theInternalDir.getChildren().size()];
++      Set<FileStatus> linkStatuses = new HashSet<>();
++      Set<FileStatus> internalDirStatuses = new HashSet<>();
+       int i = 0;
+       for (Entry<String, INode<AbstractFileSystem>> iEntry :
+           theInternalDir.getChildren().entrySet()) {
+@@ -1029,11 +1042,10 @@ public FileStatus[] listStatus(final Path f) throws IOException {
+             // To maintain backward compatibility, with default option(showing
+             // mount links as symlinks), we will represent target link as
+             // symlink and rest other properties are belongs to mount link only.
+-            result[i++] =
++            linkStatuses.add(
+                 new FileStatus(0, false, 0, 0, creationTime, creationTime,
+                     PERMISSION_555, ugi.getShortUserName(),
+-                    ugi.getPrimaryGroupName(), link.getTargetLink(),
+-                    path);
++                    ugi.getPrimaryGroupName(), link.getTargetLink(), path));
+             continue;
+           }
+ 
+@@ -1049,11 +1061,12 @@ public FileStatus[] listStatus(final Path f) throws IOException {
+             FileStatus status =
+                 ((ChRootedFs) link.getTargetFileSystem()).getMyFs()
+                     .getFileStatus(new Path(linkedPath));
+-            result[i++] = new FileStatus(status.getLen(), status.isDirectory(),
+-                status.getReplication(), status.getBlockSize(),
+-                status.getModificationTime(), status.getAccessTime(),
+-                status.getPermission(), status.getOwner(), status.getGroup(),
+-                null, path);
++            linkStatuses.add(
++                new FileStatus(status.getLen(), status.isDirectory(),
++                    status.getReplication(), status.getBlockSize(),
++                    status.getModificationTime(), status.getAccessTime(),
++                    status.getPermission(), status.getOwner(),
++                    status.getGroup(), null, path));
+           } catch (FileNotFoundException ex) {
+             LOG.warn("Cannot get one of the children's(" + path
+                 + ")  target path(" + link.getTargetFileSystem().getUri()
+@@ -1061,51 +1074,62 @@ public FileStatus[] listStatus(final Path f) throws IOException {
+             throw ex;
+           }
+         } else {
+-          result[i++] =
++          internalDirStatuses.add(
+               new FileStatus(0, true, 0, 0, creationTime, creationTime,
+                   PERMISSION_555, ugi.getShortUserName(),
+-                  ugi.getGroupNames()[0], path);
++                  ugi.getPrimaryGroupName(), path));
+         }
+       }
++
++      FileStatus[] internalDirStatusesMergedWithFallBack = internalDirStatuses
++          .toArray(new FileStatus[internalDirStatuses.size()]);
+       if (fallbackStatuses.length > 0) {
+-        return consolidateFileStatuses(fallbackStatuses, result);
+-      } else {
+-        return result;
++        internalDirStatusesMergedWithFallBack =
++            merge(fallbackStatuses, internalDirStatusesMergedWithFallBack);
+       }
++
++      // Links will always have precedence than internalDir or fallback paths.
++      return merge(linkStatuses.toArray(new FileStatus[linkStatuses.size()]),
++          internalDirStatusesMergedWithFallBack);
+     }
+ 
+-    private FileStatus[] consolidateFileStatuses(FileStatus[] fallbackStatuses,
+-        FileStatus[] mountPointStatuses) {
++    private FileStatus[] merge(FileStatus[] toStatuses,
++        FileStatus[] fromStatuses) {
+       ArrayList<FileStatus> result = new ArrayList<>();
+       Set<String> pathSet = new HashSet<>();
+-      for (FileStatus status : mountPointStatuses) {
++      for (FileStatus status : toStatuses) {
+         result.add(status);
+         pathSet.add(status.getPath().getName());
+       }
+-      for (FileStatus status : fallbackStatuses) {
++      for (FileStatus status : fromStatuses) {
+         if (!pathSet.contains(status.getPath().getName())) {
+           result.add(status);
+         }
+       }
+-      return result.toArray(new FileStatus[0]);
++      return result.toArray(new FileStatus[result.size()]);
+     }
+ 
+     private FileStatus[] listStatusForFallbackLink() throws IOException {
+-      if (theInternalDir.isRoot() &&
+-          theInternalDir.getFallbackLink() != null) {
+-        AbstractFileSystem linkedFs =
+-            theInternalDir.getFallbackLink().getTargetFileSystem();
+-        // Fallback link is only applicable for root
+-        FileStatus[] statuses = linkedFs.listStatus(new Path("/"));
+-        for (FileStatus status : statuses) {
+-          // Fix the path back to viewfs scheme
+-          status.setPath(
+-              new Path(myUri.toString(), status.getPath().getName()));
++      if (fsState.getRootFallbackLink() != null) {
++        AbstractFileSystem linkedFallbackFs =
++            fsState.getRootFallbackLink().getTargetFileSystem();
++        Path p = Path.getPathWithoutSchemeAndAuthority(
++            new Path(theInternalDir.fullPath));
++        if (theInternalDir.isRoot() || FileContext
++            .getFileContext(linkedFallbackFs, conf).util().exists(p)) {
++          // Fallback link is only applicable for root
++          FileStatus[] statuses = linkedFallbackFs.listStatus(p);
++          for (FileStatus status : statuses) {
++            // Fix the path back to viewfs scheme
++            Path pathFromConfiguredFallbackRoot =
++                new Path(p, status.getPath().getName());
++            status.setPath(
++                new Path(myUri.toString(), pathFromConfiguredFallbackRoot));
++          }
++          return statuses;
+         }
+-        return statuses;
+-      } else {
+-        return new FileStatus[0];
+       }
++      return new FileStatus[0];
+     }
+ 
+     @Override
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/fs/viewfs/TestViewFileSystemLinkFallback.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/fs/viewfs/TestViewFileSystemLinkFallback.java
+index 7266ad7b5276..f7f5453cce05 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/fs/viewfs/TestViewFileSystemLinkFallback.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/fs/viewfs/TestViewFileSystemLinkFallback.java
+@@ -18,6 +18,7 @@
+ package org.apache.hadoop.fs.viewfs;
+ 
+ import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
+ import static org.junit.Assert.assertTrue;
+ import static org.junit.Assert.fail;
+ 
+@@ -36,6 +37,7 @@
+ import org.apache.hadoop.fs.FileSystemTestHelper;
+ import org.apache.hadoop.fs.FsConstants;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.fs.permission.FsPermission;
+ import org.apache.hadoop.hdfs.DFSConfigKeys;
+ import org.apache.hadoop.hdfs.MiniDFSCluster;
+ import org.apache.hadoop.hdfs.MiniDFSNNTopology;
+@@ -343,8 +345,8 @@ public void testListingWithFallbackLinkWithSameMountDirectories()
+         afterFallback.add(stat.getPath());
+       }
+       afterFallback.removeAll(beforeFallback);
+-      assertTrue("The same directory name in fallback link should be shaded",
+-          afterFallback.size() == 1);
++      assertEquals("The same directory name in fallback link should be shaded",
++          1, afterFallback.size());
+       Path[] fallbackArray = new Path[afterFallback.size()];
+       // Only user1 should be listed as fallback link
+       Path expected = new Path(viewFsUri.toString(), "user1");
+@@ -359,4 +361,249 @@ public void testListingWithFallbackLinkWithSameMountDirectories()
+       assertTrue(vfs.getFileStatus(childDir).isDirectory());
+     }
+   }
++
++  /**
++   * Tests ListStatus on non-link parent with fallback configured.
++   * =============================Example.======================================
++   * ===== Fallback path tree =============== Mount Path Tree ==================
++   * ===========================================================================
++   * *             /            *****               /          *****************
++   * *            /             *****              /           *****************
++   * *          user1           *****          user1           *****************
++   * *           /              *****          /               *****************
++   * *         hive             *****        hive              *****************
++   * *       /      \           *****       /                  *****************
++   * * warehouse    warehouse1  *****  warehouse               *****************
++   * * (-rwxr--r--)             ***** (-r-xr--r--)             *****************
++   * *     /                    *****    /                     *****************
++   * * partition-0              ***** partition-0              *****************
++   * ===========================================================================
++   * ===========================================================================
++   * ***         ls /user1/hive                                        *********
++   * ***         viewfs://default/user1/hive/warehouse (-rwxr--r--)    *********
++   * ***         viewfs://default/user1/hive/warehouse1                *********
++   * ===========================================================================
++   */
++  @Test
++  public void testListingWithFallbackLinkWithSameMountDirectoryTree()
++      throws Exception {
++    Configuration conf = new Configuration();
++    conf.setBoolean(Constants.CONFIG_VIEWFS_MOUNT_LINKS_AS_SYMLINKS, false);
++    ConfigUtil.addLink(conf, "/user1/hive/warehouse/partition-0",
++        new Path(targetTestRoot.toString()).toUri());
++    // Creating multiple directories path under the fallback directory.
++    // "/user1/hive/warehouse/partition-0" directory already exists as
++    // configured mount point.
++    Path dir1 = new Path(targetTestRoot,
++        "fallbackDir/user1/hive/warehouse/partition-0");
++    Path dir2 = new Path(targetTestRoot, "fallbackDir/user1/hive/warehouse1");
++    fsTarget.mkdirs(dir1);
++    fsTarget.mkdirs(dir2);
++    fsTarget.setPermission(new Path(targetTestRoot, "fallbackDir/user1/hive/"),
++        FsPermission.valueOf("-rwxr--r--"));
++    URI viewFsUri = new URI(FsConstants.VIEWFS_SCHEME,
++        Constants.CONFIG_VIEWFS_DEFAULT_MOUNT_TABLE, "/", null, null);
++
++    HashSet<Path> beforeFallback = new HashSet<>();
++    try (FileSystem vfs = FileSystem.get(viewFsUri, conf)) {
++      for (FileStatus stat : vfs
++          .listStatus(new Path(viewFsUri.toString(), "/user1/hive/"))) {
++        beforeFallback.add(stat.getPath());
++      }
++    }
++    ConfigUtil
++        .addLinkFallback(conf, new Path(targetTestRoot, "fallbackDir").toUri());
++
++    try (FileSystem vfs = FileSystem.get(viewFsUri, conf)) {
++      HashSet<Path> afterFallback = new HashSet<>();
++      for (FileStatus stat : vfs
++          .listStatus(new Path(viewFsUri.toString(), "/user1/hive/"))) {
++        afterFallback.add(stat.getPath());
++        if (dir1.getName().equals(stat.getPath().getName())) {
++          // make sure fallback dir listed out with correct permissions, but not
++          // with link permissions.
++          assertEquals(FsPermission.valueOf("-rwxr--r--"),
++              stat.getPermission());
++        }
++      }
++      //
++      //viewfs://default/user1/hive/warehouse
++      afterFallback.removeAll(beforeFallback);
++      assertEquals("The same directory name in fallback link should be shaded",
++          1, afterFallback.size());
++    }
++  }
++
++  /**
++   * Tests ListStatus on link parent with fallback configured.
++   * =============================Example.======================================
++   * ===== Fallback path tree =============== Mount Path Tree ==================
++   * ===========================================================================
++   * *             /            *****               /                 **********
++   * *            /             *****              /                  **********
++   * *          user1           *****          user1                  **********
++   * *           /              *****          /                      **********
++   * *         hive             *****        hive                     **********
++   * *       /      \           *****       /                         **********
++   * * warehouse    warehouse1  *****  warehouse                      **********
++   * * (-rwxr--r--)             ***** (-r-xr--r--)                    **********
++   * *     /                    *****    /                            **********
++   * * partition-0              ***** partition-0 ---> targetTestRoot **********
++   * *                          ***** (-r-xr--r--)      (-rwxr--rw-)  **********
++   * ===========================================================================
++   * ===========================================================================
++   * ***       ls /user1/hive/warehouse                                       **
++   * ***       viewfs://default/user1/hive/warehouse/partition-0 (-rwxr--rw-) **
++   * ===========================================================================
++   */
++  @Test
++  public void testLSOnLinkParentWithFallbackLinkWithSameMountDirectoryTree()
++      throws Exception {
++    Configuration conf = new Configuration();
++    conf.setBoolean(Constants.CONFIG_VIEWFS_MOUNT_LINKS_AS_SYMLINKS, false);
++    ConfigUtil.addLink(conf, "/user1/hive/warehouse/partition-0",
++        new Path(targetTestRoot.toString()).toUri());
++    // Creating multiple directories path under the fallback directory.
++    // "/user1/hive/warehouse/partition-0" directory already exists as
++    // configured mount point.
++    Path dir1 = new Path(targetTestRoot,
++        "fallbackDir/user1/hive/warehouse/partition-0");
++    Path dir2 = new Path(targetTestRoot, "fallbackDir/user1/hive/warehouse1");
++    fsTarget.mkdirs(dir1);
++    fsTarget.mkdirs(dir2);
++    fsTarget.setPermission(new Path(targetTestRoot,
++            "fallbackDir/user1/hive/warehouse/partition-0"),
++        FsPermission.valueOf("-rwxr--r--"));
++    fsTarget.setPermission(targetTestRoot, FsPermission.valueOf("-rwxr--rw-"));
++    URI viewFsUri = new URI(FsConstants.VIEWFS_SCHEME,
++        Constants.CONFIG_VIEWFS_DEFAULT_MOUNT_TABLE, "/", null, null);
++
++    HashSet<Path> beforeFallback = new HashSet<>();
++    try (FileSystem vfs = FileSystem.get(viewFsUri, conf)) {
++      for (FileStatus stat : vfs.listStatus(
++          new Path(viewFsUri.toString(), "/user1/hive/warehouse/"))) {
++        beforeFallback.add(stat.getPath());
++      }
++    }
++    ConfigUtil
++        .addLinkFallback(conf, new Path(targetTestRoot, "fallbackDir").toUri());
++
++    try (FileSystem vfs = FileSystem.get(viewFsUri, conf)) {
++      HashSet<Path> afterFallback = new HashSet<>();
++      for (FileStatus stat : vfs.listStatus(
++          new Path(viewFsUri.toString(), "/user1/hive/warehouse/"))) {
++        afterFallback.add(stat.getPath());
++        if (dir1.getName().equals(stat.getPath().getName())) {
++          // make sure fallback dir listed out with correct permissions, but not
++          // with link permissions.
++          assertEquals(FsPermission.valueOf("-rwxr--rw-"),
++              stat.getPermission());
++        }
++      }
++      afterFallback.removeAll(beforeFallback);
++      assertEquals("Just to make sure paths are same.", 0,
++          afterFallback.size());
++    }
++  }
++
++  /**
++   * Tests ListStatus on root with fallback configured.
++   * =============================Example.=======================================
++   * ===== Fallback path tree =============== Mount Path Tree ==================
++   * ===========================================================================
++   * *          /       /          *****               /                     ***
++   * *         /       /           *****              /                      ***
++   * *      user1    user2         *****           user1 ---> targetTestRoot ***
++   * *(-r-xr--r--)   (-r-xr--r--)  *****                      (-rwxr--rw-)   ***
++   * ===========================================================================
++   * ===========================================================================
++   * ***       ls /user1/hive/warehouse                                       **
++   * ***       viewfs://default/user1(-rwxr--rw-)                             **
++   * ***       viewfs://default/user2(-r-xr--r--)                             **
++   * ===========================================================================
++   */
++  @Test
++  public void testLSOnRootWithFallbackLinkWithSameMountDirectories()
++      throws Exception {
++    Configuration conf = new Configuration();
++    conf.setBoolean(Constants.CONFIG_VIEWFS_MOUNT_LINKS_AS_SYMLINKS, false);
++    ConfigUtil
++        .addLink(conf, "/user1", new Path(targetTestRoot.toString()).toUri());
++    // Creating multiple directories path under the fallback directory.
++    // "/user1" directory already exists as configured mount point.
++    Path dir1 = new Path(targetTestRoot, "fallbackDir/user1");
++    Path dir2 = new Path(targetTestRoot, "fallbackDir/user2");
++    fsTarget.mkdirs(dir1);
++    fsTarget.mkdirs(dir2, FsPermission.valueOf("-rwxr--r--"));
++    fsTarget.setPermission(targetTestRoot, FsPermission.valueOf("-rwxr--rw-"));
++    URI viewFsUri = new URI(FsConstants.VIEWFS_SCHEME,
++        Constants.CONFIG_VIEWFS_DEFAULT_MOUNT_TABLE, "/", null, null);
++
++    HashSet<Path> beforeFallback = new HashSet<>();
++    try (FileSystem vfs = FileSystem.get(viewFsUri, conf)) {
++      for (FileStatus stat : vfs
++          .listStatus(new Path(viewFsUri.toString(), "/"))) {
++        beforeFallback.add(stat.getPath());
++      }
++    }
++    ConfigUtil
++        .addLinkFallback(conf, new Path(targetTestRoot, "fallbackDir").toUri());
++
++    try (FileSystem vfs = FileSystem.get(viewFsUri, conf)) {
++      HashSet<Path> afterFallback = new HashSet<>();
++      for (FileStatus stat : vfs
++          .listStatus(new Path(viewFsUri.toString(), "/"))) {
++        afterFallback.add(stat.getPath());
++        if (dir1.getName().equals(stat.getPath().getName())) {
++          // make sure fallback dir listed out with correct permissions, but not
++          // with link permissions.
++          assertEquals(FsPermission.valueOf("-rwxr--rw-"),
++              stat.getPermission());
++        } else {
++          assertEquals("Path is: " + stat.getPath(),
++              FsPermission.valueOf("-rwxr--r--"), stat.getPermission());
++        }
++      }
++      afterFallback.removeAll(beforeFallback);
++      assertEquals(1, afterFallback.size());
++      assertEquals("/user2 dir from fallback should be listed.", "user2",
++          afterFallback.iterator().next().getName());
++    }
++  }
++
++  @Test
++  public void testLSOnLinkParentWhereMountLinkMatchesWithAFileUnderFallback()
++      throws Exception {
++    Configuration conf = new Configuration();
++    conf.setBoolean(Constants.CONFIG_VIEWFS_MOUNT_LINKS_AS_SYMLINKS, true);
++    ConfigUtil.addLink(conf, "/user1/hive/warehouse/part-0",
++        new Path(targetTestRoot.toString()).toUri());
++    // Create a file path in fallback matching to the path of mount link.
++    Path file1 =
++        new Path(targetTestRoot, "fallbackDir/user1/hive/warehouse/part-0");
++    fsTarget.createNewFile(file1);
++    Path dir2 = new Path(targetTestRoot, "fallbackDir/user1/hive/warehouse1");
++    fsTarget.mkdirs(dir2);
++    URI viewFsUri = new URI(FsConstants.VIEWFS_SCHEME,
++        Constants.CONFIG_VIEWFS_DEFAULT_MOUNT_TABLE, "/", null, null);
++
++    ConfigUtil
++        .addLinkFallback(conf, new Path(targetTestRoot, "fallbackDir").toUri());
++
++    try (FileSystem vfs = FileSystem.get(viewFsUri, conf)) {
++      for (FileStatus stat : vfs.listStatus(
++          new Path(viewFsUri.toString(), "/user1/hive/warehouse/"))) {
++        if (file1.getName().equals(stat.getPath().getName())) {
++          // Link represents as symlink.
++          assertFalse(stat.isFile());
++          assertFalse(stat.isDirectory());
++          assertTrue(stat.isSymlink());
++          Path fileUnderDir = new Path(stat.getPath(), "check");
++          assertTrue(vfs.mkdirs(fileUnderDir)); // Creating dir under target
++          assertTrue(fsTarget
++              .exists(new Path(targetTestRoot, fileUnderDir.getName())));
++        }
++      }
++    }
++  }
+ }

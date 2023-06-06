@@ -1,0 +1,841 @@
+
+
+package org.apache.hadoop.fs.s3a.tools;
+
+import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.OutputStreamWriter;
+import java.io.PrintStream;
+import java.io.Writer;
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+import com.amazonaws.AmazonClientException;
+import com.amazonaws.services.s3.model.DeleteObjectsRequest;
+import com.amazonaws.services.s3.model.MultiObjectDeleteException;
+import org.apache.hadoop.thirdparty.com.google.common.annotations.VisibleForTesting;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.commons.io.IOUtils;
+import org.apache.hadoop.classification.InterfaceAudience;
+import org.apache.hadoop.classification.InterfaceStability;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.RemoteIterator;
+import org.apache.hadoop.fs.s3a.Retries;
+import org.apache.hadoop.fs.s3a.S3AFileStatus;
+import org.apache.hadoop.fs.s3a.S3AFileSystem;
+import org.apache.hadoop.fs.s3a.S3ALocatedFileStatus;
+import org.apache.hadoop.fs.s3a.UnknownStoreException;
+import org.apache.hadoop.fs.s3a.impl.DirMarkerTracker;
+import org.apache.hadoop.fs.s3a.impl.DirectoryPolicy;
+import org.apache.hadoop.fs.s3a.impl.DirectoryPolicyImpl;
+import org.apache.hadoop.fs.s3a.impl.StoreContext;
+import org.apache.hadoop.fs.s3a.s3guard.S3GuardTool;
+import org.apache.hadoop.fs.shell.CommandFormat;
+import org.apache.hadoop.thirdparty.com.google.common.base.Preconditions;
+import org.apache.hadoop.util.DurationInfo;
+import org.apache.hadoop.util.ExitUtil;
+
+import static org.apache.hadoop.fs.s3a.Constants.AUTHORITATIVE_PATH;
+import static org.apache.hadoop.fs.s3a.Constants.BULK_DELETE_PAGE_SIZE;
+import static org.apache.hadoop.fs.s3a.Constants.BULK_DELETE_PAGE_SIZE_DEFAULT;
+import static org.apache.hadoop.fs.s3a.Invoker.once;
+import static org.apache.hadoop.service.launcher.LauncherExitCodes.EXIT_INTERRUPTED;
+import static org.apache.hadoop.service.launcher.LauncherExitCodes.EXIT_NOT_ACCEPTABLE;
+import static org.apache.hadoop.service.launcher.LauncherExitCodes.EXIT_NOT_FOUND;
+import static org.apache.hadoop.service.launcher.LauncherExitCodes.EXIT_SUCCESS;
+import static org.apache.hadoop.service.launcher.LauncherExitCodes.EXIT_USAGE;
+
+
+@InterfaceAudience.LimitedPrivate("management tools")
+@InterfaceStability.Unstable
+public final class MarkerTool extends S3GuardTool {
+
+  private static final Logger LOG = LoggerFactory.getLogger(MarkerTool.class);
+
+  
+  public static final String MARKERS = "markers";
+
+  
+  public static final String PURPOSE =
+      "View and manipulate S3 directory markers";
+
+  
+  public static final String OPT_AUDIT = "audit";
+
+  
+  public static final String OPT_CLEAN = "clean";
+
+  
+  public static final String AUDIT = "-" + OPT_AUDIT;
+
+  
+  public static final String CLEAN = "-" + OPT_CLEAN;
+
+  
+  public static final String OPT_MIN = "min";
+
+  
+  public static final String OPT_MAX = "max";
+
+  
+  public static final String OPT_OUT = "out";
+
+  
+  public static final String OPT_LIMIT = "limit";
+
+  
+  public static final String OPT_NONAUTH = "nonauth";
+
+  
+  @VisibleForTesting
+  static final String E_ARGUMENTS = "Wrong number of arguments: %d";
+
+  
+  public static final int UNLIMITED_LISTING = 0;
+
+
+  
+  public static final int UNLIMITED_MIN_MARKERS = -1;
+
+
+  
+  private static final String USAGE = MARKERS
+      + " (-" + OPT_AUDIT
+      + " | -" + OPT_CLEAN + ")"
+      + " [-" + OPT_MIN + " <count>]"
+      + " [-" + OPT_MAX + " <count>]"
+      + " [-" + OPT_OUT + " <filename>]"
+      + " [-" + OPT_LIMIT + " <limit>]"
+      + " [-" + OPT_NONAUTH + "]"
+      + " [-" + VERBOSE + "]"
+
+      + " <PATH>\n"
+      + "\t" + PURPOSE + "\n\n";
+
+  
+  private PrintStream out = System.out;
+
+  
+  private boolean verbose;
+
+  
+  private StoreContext storeContext;
+
+  
+  private MarkerToolOperations operations;
+
+  
+  public MarkerTool(final Configuration conf) {
+    super(conf,
+        OPT_AUDIT,
+        OPT_CLEAN,
+        VERBOSE,
+        OPT_NONAUTH);
+    CommandFormat format = getCommandFormat();
+    format.addOptionWithValue(OPT_MIN);
+    format.addOptionWithValue(OPT_MAX);
+    format.addOptionWithValue(OPT_LIMIT);
+    format.addOptionWithValue(OPT_OUT);
+  }
+
+  @Override
+  public String getUsage() {
+    return USAGE;
+  }
+
+  @Override
+  public String getName() {
+    return MARKERS;
+  }
+
+  @Override
+  public void resetBindings() {
+    super.resetBindings();
+    storeContext = null;
+    operations = null;
+  }
+
+  @Override
+  public int run(final String[] args, final PrintStream stream)
+      throws ExitUtil.ExitException, Exception {
+    this.out = stream;
+    final List<String> parsedArgs;
+    try {
+      parsedArgs = parseArgs(args);
+    } catch (CommandFormat.UnknownOptionException e) {
+      errorln(getUsage());
+      throw new ExitUtil.ExitException(EXIT_USAGE, e.getMessage(), e);
+    }
+    if (parsedArgs.size() != 1) {
+      errorln(getUsage());
+      println(out, "Supplied arguments: ["
+          + String.join(", ", parsedArgs)
+          + "]");
+      throw new ExitUtil.ExitException(EXIT_USAGE,
+          String.format(E_ARGUMENTS, parsedArgs.size()));
+    }
+    
+    CommandFormat command = getCommandFormat();
+    verbose = command.getOpt(VERBOSE);
+
+    
+    int expectedMin = getOptValue(OPT_MIN, 0);
+    
+    int expectedMax = getOptValue(OPT_MAX, 0);
+
+
+    
+    boolean audit = command.getOpt(OPT_AUDIT);
+    boolean clean = command.getOpt(OPT_CLEAN);
+    if (audit == clean) {
+      
+      
+      errorln(getUsage());
+      throw new ExitUtil.ExitException(EXIT_USAGE,
+          "Exactly one of " + AUDIT + " and " + CLEAN);
+    }
+    int limit = getOptValue(OPT_LIMIT, UNLIMITED_LISTING);
+    final String dir = parsedArgs.get(0);
+    Path path = new Path(dir);
+    URI uri = path.toUri();
+    if (uri.getPath().isEmpty()) {
+      
+      path = new Path(path, "/");
+    }
+    FileSystem fs = path.getFileSystem(getConf());
+    boolean nonAuth = command.getOpt(OPT_NONAUTH);
+    ScanResult result;
+    try {
+      result = execute(
+              new ScanArgsBuilder()
+                      .withSourceFS(fs)
+                      .withPath(path)
+                      .withDoPurge(clean)
+                      .withMinMarkerCount(expectedMin)
+                      .withMaxMarkerCount(expectedMax)
+                      .withLimit(limit)
+                      .withNonAuth(nonAuth)
+                      .build());
+    } catch (UnknownStoreException ex) {
+      
+      
+      throw new ExitUtil.ExitException(EXIT_NOT_FOUND,
+              ex.toString(), ex);
+    }
+    if (verbose) {
+      dumpFileSystemStatistics(out);
+    }
+
+    
+    String saveFile = command.getOptValue(OPT_OUT);
+    if (saveFile != null && !saveFile.isEmpty()) {
+      println(out, "Saving result to %s", saveFile);
+      try (Writer writer =
+               new OutputStreamWriter(
+                   new FileOutputStream(saveFile),
+                   StandardCharsets.UTF_8)) {
+        final List<String> surplus = result.getTracker()
+            .getSurplusMarkers()
+            .keySet()
+            .stream()
+            .map(p-> p.toString() + "/")
+            .sorted()
+            .collect(Collectors.toList());
+        IOUtils.writeLines(surplus, "\n", writer);
+      }
+    }
+
+    return result.finish();
+  }
+
+  
+  private int getOptValue(String option, int defVal) {
+    CommandFormat command = getCommandFormat();
+    String value = command.getOptValue(option);
+    if (value != null && !value.isEmpty()) {
+      try {
+        return  Integer.parseInt(value);
+      } catch (NumberFormatException e) {
+        throw new ExitUtil.ExitException(EXIT_USAGE,
+            String.format("Argument for %s is not a number: %s",
+                option, value));
+      }
+    } else {
+      return defVal;
+    }
+  }
+
+  
+  @VisibleForTesting
+  ScanResult execute(final ScanArgs scanArgs)
+      throws IOException {
+    S3AFileSystem fs = bindFilesystem(scanArgs.getSourceFS());
+
+    
+    storeContext = fs.createStoreContext();
+    operations = fs.createMarkerToolOperations();
+    
+    
+    
+    DirectoryPolicy activePolicy = fs.getDirectoryMarkerPolicy();
+    DirectoryPolicy.MarkerPolicy policy = activePolicy
+        .getMarkerPolicy();
+    println(out, "The directory marker policy of %s is \"%s\"",
+        storeContext.getFsURI(),
+        policy);
+    String authPath = storeContext.getConfiguration()
+        .getTrimmed(AUTHORITATIVE_PATH, "");
+    if (policy == DirectoryPolicy.MarkerPolicy.Authoritative) {
+      
+      println(out, "Authoritative path list is \"%s\"", authPath);
+    }
+    
+    Path path = scanArgs.getPath();
+    Path target = path.makeQualified(fs.getUri(), new Path("/"));
+    
+    try {
+      getFilesystem().getFileStatus(target);
+    } catch (UnknownStoreException ex) {
+      
+      
+      throw new ExitUtil.ExitException(EXIT_NOT_FOUND,
+          ex.toString(), ex);
+
+    } catch (FileNotFoundException ex) {
+      throw new ExitUtil.ExitException(EXIT_NOT_FOUND,
+          "Not found: " + target, ex);
+    }
+
+    
+    DirectoryPolicy filterPolicy;
+    if (scanArgs.isNonAuth()) {
+      filterPolicy = new DirectoryPolicyImpl(
+          DirectoryPolicy.MarkerPolicy.Authoritative,
+          fs::allowAuthoritative);
+    } else {
+      filterPolicy = null;
+    }
+    int minMarkerCount = scanArgs.getMinMarkerCount();
+    int maxMarkerCount = scanArgs.getMaxMarkerCount();
+    if (minMarkerCount > maxMarkerCount) {
+      
+      
+      
+      println(out, "Swapping -min (%d) and -max (%d) values",
+          minMarkerCount, maxMarkerCount);
+      int m = minMarkerCount;
+      minMarkerCount = maxMarkerCount;
+      maxMarkerCount = m;
+    }
+    ScanResult result = scan(target,
+        scanArgs.isDoPurge(),
+        minMarkerCount,
+        maxMarkerCount,
+        scanArgs.getLimit(),
+        filterPolicy);
+    return result;
+  }
+
+  
+  public static final class ScanResult {
+
+    
+    private int exitCode;
+
+    
+    private String exitText = "";
+
+    
+    private int totalMarkerCount;
+
+    
+    private int filteredMarkerCount;
+
+    
+    private DirMarkerTracker tracker;
+
+    
+    private MarkerPurgeSummary purgeSummary;
+
+    private ScanResult() {
+    }
+
+    @Override
+    public String toString() {
+      return "ScanResult{" +
+          "exitCode=" + exitCode +
+          ", exitText=" + exitText +
+          ", totalMarkerCount=" + totalMarkerCount +
+          ", filteredMarkerCount=" + filteredMarkerCount +
+          ", tracker=" + tracker +
+          ", purgeSummary=" + purgeSummary +
+          '}';
+    }
+
+    
+    public int getExitCode() {
+      return exitCode;
+    }
+
+    
+    public DirMarkerTracker getTracker() {
+      return tracker;
+    }
+
+    
+    public MarkerPurgeSummary getPurgeSummary() {
+      return purgeSummary;
+    }
+
+    public int getTotalMarkerCount() {
+      return totalMarkerCount;
+    }
+
+    public int getFilteredMarkerCount() {
+      return filteredMarkerCount;
+    }
+
+    
+    public int finish() throws ExitUtil.ExitException {
+      if (exitCode != 0) {
+        throw new ExitUtil.ExitException(exitCode, exitText);
+      }
+      return 0;
+    }
+  }
+
+  
+  @Retries.RetryTranslated
+  private ScanResult scan(
+      final Path path,
+      final boolean doPurge,
+      final int minMarkerCount,
+      final int maxMarkerCount,
+      final int limit,
+      final DirectoryPolicy filterPolicy)
+      throws IOException, ExitUtil.ExitException {
+
+    
+    Preconditions.checkArgument(minMarkerCount <= maxMarkerCount,
+        "The min marker count of %d is greater than the max value of %d",
+        minMarkerCount, maxMarkerCount);
+
+    ScanResult result = new ScanResult();
+
+    
+    result.exitCode = EXIT_SUCCESS;
+    
+    DirMarkerTracker tracker = new DirMarkerTracker(path, true);
+    result.tracker = tracker;
+    boolean completed;
+    try (DurationInfo ignored =
+             new DurationInfo(LOG, "marker scan %s", path)) {
+      completed = scanDirectoryTree(path, tracker, limit);
+    }
+    int objectsFound = tracker.getObjectsFound();
+    println(out, "Listed %d object%s under %s%n",
+        objectsFound,
+        suffix(objectsFound),
+        path);
+    
+    Map<Path, DirMarkerTracker.Marker> surplusMarkers
+        = tracker.getSurplusMarkers();
+    Map<Path, DirMarkerTracker.Marker> leafMarkers
+        = tracker.getLeafMarkers();
+    
+    int markerCount = surplusMarkers.size();
+    result.totalMarkerCount = markerCount;
+    result.filteredMarkerCount = markerCount;
+    if (markerCount == 0) {
+      println(out, "No surplus directory markers were found under %s", path);
+    } else {
+      println(out, "Found %d surplus directory marker%s under %s",
+          markerCount,
+          suffix(markerCount),
+          path);
+
+      for (Path markers : surplusMarkers.keySet()) {
+        println(out, "    %s/", markers);
+      }
+    }
+    if (!leafMarkers.isEmpty()) {
+      println(out, "Found %d empty directory 'leaf' marker%s under %s",
+          leafMarkers.size(),
+          suffix(leafMarkers.size()),
+          path);
+      for (Path markers : leafMarkers.keySet()) {
+        println(out, "    %s/", markers);
+      }
+      println(out, "These are required to indicate empty directories");
+    }
+
+    if (doPurge) {
+      
+      
+      int deletePageSize = storeContext.getConfiguration()
+          .getInt(BULK_DELETE_PAGE_SIZE,
+              BULK_DELETE_PAGE_SIZE_DEFAULT);
+      result.purgeSummary = purgeMarkers(tracker, deletePageSize);
+    } else {
+      
+
+      if (filterPolicy != null) {
+        
+        
+        List<Path> allowed = tracker.removeAllowedMarkers(filterPolicy);
+        int allowedMarkers =  allowed.size();
+        println(out, "%nIgnoring %d marker%s in authoritative paths",
+            allowedMarkers, suffix(allowedMarkers));
+        if (verbose) {
+          allowed.forEach(p -> println(out, p.toString()));
+        }
+        
+        markerCount = surplusMarkers.size();
+        result.filteredMarkerCount = markerCount;
+      }
+      if (markerCount < minMarkerCount || markerCount > maxMarkerCount) {
+        
+        return failScan(result, EXIT_NOT_ACCEPTABLE,
+            "Marker count %d out of range "
+                  + "[%d - %d]",
+              markerCount, minMarkerCount, maxMarkerCount);
+      }
+    }
+
+    
+    if (!completed) {
+      failScan(result, EXIT_INTERRUPTED,
+          "Listing limit (%d) reached before completing the scan", limit);
+    }
+    return result;
+  }
+
+  
+  private ScanResult failScan(
+      ScanResult result,
+      int code,
+      String message,
+      Object...args) {
+    String text = String.format(message, args);
+    result.exitCode = code;
+    result.exitText = text;
+    return result;
+  }
+
+  
+  private String suffix(final int size) {
+    return size == 1 ? "" : "s";
+  }
+
+  
+  @Retries.RetryTranslated
+  private boolean scanDirectoryTree(
+      final Path path,
+      final DirMarkerTracker tracker,
+      final int limit) throws IOException {
+
+    int count = 0;
+    RemoteIterator<S3AFileStatus> listing = operations
+        .listObjects(path, storeContext.pathToKey(path));
+    while (listing.hasNext()) {
+      count++;
+      S3AFileStatus status = listing.next();
+      Path statusPath = status.getPath();
+      S3ALocatedFileStatus locatedStatus = new S3ALocatedFileStatus(
+          status, null);
+      String key = storeContext.pathToKey(statusPath);
+      if (status.isDirectory()) {
+        if (verbose) {
+          println(out, "  Directory Marker %s/", key);
+        }
+        LOG.debug("{}", key);
+        tracker.markerFound(statusPath,
+            key + "/",
+            locatedStatus);
+      } else {
+        tracker.fileFound(statusPath,
+            key,
+            locatedStatus);
+      }
+      if ((count % 1000) == 0) {
+        println(out, "Scanned %,d objects", count);
+      }
+      if (limit > 0 && count >= limit) {
+        println(out, "Limit of scan reached - %,d object%s",
+            limit, suffix(limit));
+        return false;
+      }
+    }
+    return true;
+  }
+
+  
+  public static final class MarkerPurgeSummary {
+
+    
+    private int markersDeleted;
+
+    
+    private int deleteRequests;
+
+    
+    private long totalDeleteRequestDuration;
+
+    @Override
+    public String toString() {
+      return "MarkerPurgeSummary{" +
+          "markersDeleted=" + markersDeleted +
+          ", deleteRequests=" + deleteRequests +
+          ", totalDeleteRequestDuration=" + totalDeleteRequestDuration +
+          '}';
+    }
+
+
+    
+    int getMarkersDeleted() {
+      return markersDeleted;
+    }
+
+    
+    int getDeleteRequests() {
+      return deleteRequests;
+    }
+
+    
+    long getTotalDeleteRequestDuration() {
+      return totalDeleteRequestDuration;
+    }
+  }
+
+  
+  @Retries.RetryTranslated
+  private MarkerPurgeSummary purgeMarkers(
+      final DirMarkerTracker tracker,
+      final int deletePageSize)
+      throws MultiObjectDeleteException, AmazonClientException, IOException {
+
+    MarkerPurgeSummary summary = new MarkerPurgeSummary();
+    
+    Map<Path, DirMarkerTracker.Marker> markers
+        = tracker.getSurplusMarkers();
+    int size = markers.size();
+    
+    List<DeleteObjectsRequest.KeyVersion> collect =
+        markers.values().stream()
+            .map(p -> new DeleteObjectsRequest.KeyVersion(p.getKey()))
+            .collect(Collectors.toList());
+    
+    
+    List<DeleteObjectsRequest.KeyVersion> markerKeys =
+        new ArrayList<>(collect);
+
+    
+    
+    Collections.shuffle(markerKeys);
+    int pages = size / deletePageSize;
+    if (size % deletePageSize > 0) {
+      pages += 1;
+    }
+    if (verbose) {
+      println(out, "%n%d marker%s to delete in %d page%s of %d keys/page",
+          size, suffix(size),
+          pages, suffix(pages),
+          deletePageSize);
+    }
+    DurationInfo durationInfo = new DurationInfo(LOG, "Deleting markers");
+    int start = 0;
+    while (start < size) {
+      
+      int end = Math.min(start + deletePageSize, size);
+      List<DeleteObjectsRequest.KeyVersion> page = markerKeys.subList(start,
+          end);
+      List<Path> undeleted = new ArrayList<>();
+      once("Remove S3 Keys",
+          tracker.getBasePath().toString(), () ->
+              operations.removeKeys(page, true, undeleted, null, false));
+      summary.deleteRequests++;
+      
+      start = end;
+    }
+    durationInfo.close();
+    summary.totalDeleteRequestDuration = durationInfo.value();
+    summary.markersDeleted = size;
+    return summary;
+  }
+
+  public boolean isVerbose() {
+    return verbose;
+  }
+
+  public void setVerbose(final boolean verbose) {
+    this.verbose = verbose;
+  }
+
+  
+  @SuppressWarnings("IOResourceOpenedButNotSafelyClosed")
+  public static MarkerTool.ScanResult execMarkerTool(
+      ScanArgs scanArgs) throws IOException {
+    MarkerTool tool = new MarkerTool(scanArgs.getSourceFS().getConf());
+    tool.setVerbose(LOG.isDebugEnabled());
+
+    return tool.execute(scanArgs);
+  }
+
+  
+  public static final class ScanArgs {
+
+    
+    private final FileSystem sourceFS;
+
+    
+    private final Path path;
+
+    
+    private final boolean doPurge;
+
+    
+    private final int minMarkerCount;
+
+    
+    private final int maxMarkerCount;
+
+    
+    private final int limit;
+
+    
+    private final boolean nonAuth;
+
+    
+    private ScanArgs(final FileSystem sourceFS,
+        final Path path,
+        final boolean doPurge,
+        final int minMarkerCount,
+        final int maxMarkerCount,
+        final int limit,
+        final boolean nonAuth) {
+      this.sourceFS = sourceFS;
+      this.path = path;
+      this.doPurge = doPurge;
+      this.minMarkerCount = minMarkerCount;
+      this.maxMarkerCount = maxMarkerCount;
+      this.limit = limit;
+      this.nonAuth = nonAuth;
+    }
+
+    FileSystem getSourceFS() {
+      return sourceFS;
+    }
+
+    Path getPath() {
+      return path;
+    }
+
+    boolean isDoPurge() {
+      return doPurge;
+    }
+
+    int getMinMarkerCount() {
+      return minMarkerCount;
+    }
+
+    int getMaxMarkerCount() {
+      return maxMarkerCount;
+    }
+
+    int getLimit() {
+      return limit;
+    }
+
+    boolean isNonAuth() {
+      return nonAuth;
+    }
+  }
+
+  
+  public static final class ScanArgsBuilder {
+
+    
+    private FileSystem sourceFS;
+
+    
+    private Path path;
+
+    
+    private boolean doPurge = false;
+
+    
+    private int minMarkerCount = 0;
+
+    
+    private int maxMarkerCount = 0;
+
+    
+    private int limit = UNLIMITED_LISTING;
+
+    
+    private boolean nonAuth = false;
+
+    
+    public ScanArgsBuilder withSourceFS(final FileSystem source) {
+      this.sourceFS = source;
+      return this;
+    }
+
+    
+    public ScanArgsBuilder withPath(final Path p) {
+      this.path = p;
+      return this;
+    }
+
+    
+    public ScanArgsBuilder withDoPurge(final boolean d) {
+      this.doPurge = d;
+      return this;
+    }
+
+    
+    public ScanArgsBuilder withMinMarkerCount(final int min) {
+      this.minMarkerCount = min;
+      return this;
+    }
+
+    
+    public ScanArgsBuilder withMaxMarkerCount(final int max) {
+      this.maxMarkerCount = max;
+      return this;
+    }
+
+    
+    public ScanArgsBuilder withLimit(final int l) {
+      this.limit = l;
+      return this;
+    }
+
+    
+    public ScanArgsBuilder withNonAuth(final boolean b) {
+      this.nonAuth = b;
+      return this;
+    }
+
+    
+    public ScanArgs build() {
+      return new ScanArgs(sourceFS,
+          path,
+          doPurge,
+          minMarkerCount,
+          maxMarkerCount,
+          limit,
+          nonAuth);
+    }
+  }
+}

@@ -1,0 +1,194 @@
+
+package org.apache.hadoop.io.compress;
+
+import java.util.HashSet;
+import java.util.HashMap;
+import java.util.Set;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import org.apache.hadoop.classification.InterfaceAudience;
+import org.apache.hadoop.classification.InterfaceStability;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.util.ReflectionUtils;
+
+import org.apache.hadoop.thirdparty.com.google.common.cache.CacheBuilder;
+import org.apache.hadoop.thirdparty.com.google.common.cache.CacheLoader;
+import org.apache.hadoop.thirdparty.com.google.common.cache.LoadingCache;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+
+@InterfaceAudience.Public
+@InterfaceStability.Evolving
+public class CodecPool {
+  private static final Logger LOG = LoggerFactory.getLogger(CodecPool.class);
+  
+  
+  private static final Map<Class<Compressor>, Set<Compressor>> compressorPool =
+    new HashMap<Class<Compressor>, Set<Compressor>>();
+  
+  
+  private static final Map<Class<Decompressor>, Set<Decompressor>> decompressorPool =
+    new HashMap<Class<Decompressor>, Set<Decompressor>>();
+
+  private static <T> LoadingCache<Class<T>, AtomicInteger> createCache(
+      Class<T> klass) {
+    return CacheBuilder.newBuilder().build(
+        new CacheLoader<Class<T>, AtomicInteger>() {
+          @Override
+          public AtomicInteger load(Class<T> key) throws Exception {
+            return new AtomicInteger();
+          }
+        });
+  }
+
+  
+  private static final LoadingCache<Class<Compressor>, AtomicInteger> compressorCounts =
+      createCache(Compressor.class);
+
+   
+  private static final LoadingCache<Class<Decompressor>, AtomicInteger> decompressorCounts =
+      createCache(Decompressor.class);
+
+  private static <T> T borrow(Map<Class<T>, Set<T>> pool,
+                             Class<? extends T> codecClass) {
+    T codec = null;
+    
+    
+    Set<T> codecSet;
+    synchronized (pool) {
+      codecSet = pool.get(codecClass);
+    }
+
+    if (codecSet != null) {
+      synchronized (codecSet) {
+        if (!codecSet.isEmpty()) {
+          codec = codecSet.iterator().next();
+          codecSet.remove(codec);
+        }
+      }
+    }
+    
+    return codec;
+  }
+
+  private static <T> boolean payback(Map<Class<T>, Set<T>> pool, T codec) {
+    if (codec != null) {
+      Class<T> codecClass = ReflectionUtils.getClass(codec);
+      Set<T> codecSet;
+      synchronized (pool) {
+        codecSet = pool.get(codecClass);
+        if (codecSet == null) {
+          codecSet = new HashSet<>();
+          pool.put(codecClass, codecSet);
+        }
+      }
+
+      synchronized (codecSet) {
+        return codecSet.add(codec);
+      }
+    }
+    return false;
+  }
+  
+  @SuppressWarnings("unchecked")
+  private static <T> int getLeaseCount(
+      LoadingCache<Class<T>, AtomicInteger> usageCounts,
+      Class<? extends T> codecClass) {
+    return usageCounts.getUnchecked((Class<T>) codecClass).get();
+  }
+
+  private static <T> void updateLeaseCount(
+      LoadingCache<Class<T>, AtomicInteger> usageCounts, T codec, int delta) {
+    if (codec != null) {
+      Class<T> codecClass = ReflectionUtils.getClass(codec);
+      usageCounts.getUnchecked(codecClass).addAndGet(delta);
+    }
+  }
+
+  
+  public static Compressor getCompressor(CompressionCodec codec, Configuration conf) {
+    Compressor compressor = borrow(compressorPool, codec.getCompressorType());
+    if (compressor == null) {
+      compressor = codec.createCompressor();
+      LOG.info("Got brand-new compressor ["+codec.getDefaultExtension()+"]");
+    } else {
+      compressor.reinit(conf);
+      if(LOG.isDebugEnabled()) {
+        LOG.debug("Got recycled compressor");
+      }
+    }
+    if (compressor != null &&
+        !compressor.getClass().isAnnotationPresent(DoNotPool.class)) {
+      updateLeaseCount(compressorCounts, compressor, 1);
+    }
+    return compressor;
+  }
+  
+  public static Compressor getCompressor(CompressionCodec codec) {
+    return getCompressor(codec, null);
+  }
+  
+  
+  public static Decompressor getDecompressor(CompressionCodec codec) {
+    Decompressor decompressor = borrow(decompressorPool, codec.getDecompressorType());
+    if (decompressor == null) {
+      decompressor = codec.createDecompressor();
+      LOG.info("Got brand-new decompressor ["+codec.getDefaultExtension()+"]");
+    } else {
+      if(LOG.isDebugEnabled()) {
+        LOG.debug("Got recycled decompressor");
+      }
+    }
+    if (decompressor != null &&
+        !decompressor.getClass().isAnnotationPresent(DoNotPool.class)) {
+      updateLeaseCount(decompressorCounts, decompressor, 1);
+    }
+    return decompressor;
+  }
+  
+  
+  public static void returnCompressor(Compressor compressor) {
+    if (compressor == null) {
+      return;
+    }
+    
+    if (compressor.getClass().isAnnotationPresent(DoNotPool.class)) {
+      compressor.end();
+      return;
+    }
+    compressor.reset();
+    if (payback(compressorPool, compressor)) {
+      updateLeaseCount(compressorCounts, compressor, -1);
+    }
+  }
+  
+  
+  public static void returnDecompressor(Decompressor decompressor) {
+    if (decompressor == null) {
+      return;
+    }
+    
+    if (decompressor.getClass().isAnnotationPresent(DoNotPool.class)) {
+      decompressor.end();
+      return;
+    }
+    decompressor.reset();
+    if (payback(decompressorPool, decompressor)) {
+      updateLeaseCount(decompressorCounts, decompressor, -1);
+    }
+  }
+
+  
+  public static int getLeasedCompressorsCount(CompressionCodec codec) {
+    return (codec == null) ? 0 : getLeaseCount(compressorCounts,
+        codec.getCompressorType());
+  }
+
+  
+  public static int getLeasedDecompressorsCount(CompressionCodec codec) {
+    return (codec == null) ? 0 : getLeaseCount(decompressorCounts,
+        codec.getDecompressorType());
+  }
+}

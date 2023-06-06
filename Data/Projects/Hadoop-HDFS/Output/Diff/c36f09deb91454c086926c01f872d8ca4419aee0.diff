@@ -1,0 +1,560 @@
+diff --git a/hadoop-tools/hadoop-azure/src/main/java/org/apache/hadoop/fs/azure/AzureNativeFileSystemStore.java b/hadoop-tools/hadoop-azure/src/main/java/org/apache/hadoop/fs/azure/AzureNativeFileSystemStore.java
+index 239dec26f1dd..414d2f2ee098 100644
+--- a/hadoop-tools/hadoop-azure/src/main/java/org/apache/hadoop/fs/azure/AzureNativeFileSystemStore.java
++++ b/hadoop-tools/hadoop-azure/src/main/java/org/apache/hadoop/fs/azure/AzureNativeFileSystemStore.java
+@@ -29,6 +29,8 @@
+ import java.net.URISyntaxException;
+ import java.net.URLDecoder;
+ import java.net.URLEncoder;
++import java.nio.charset.Charset;
++import java.nio.charset.StandardCharsets;
+ import java.security.InvalidKeyException;
+ import java.util.Calendar;
+ import java.util.Date;
+@@ -247,6 +249,8 @@ public class AzureNativeFileSystemStore implements NativeFileSystemStore {
+ 
+   private static final int DEFAULT_CONCURRENT_WRITES = 8;
+ 
++  private static final Charset METADATA_ENCODING = StandardCharsets.UTF_8;
++
+   // Concurrent reads reads of data written out of band are disable by default.
+   //
+   private static final boolean DEFAULT_READ_TOLERATE_CONCURRENT_APPEND = false;
+@@ -1662,17 +1666,30 @@ private static void storeFolderAttribute(CloudBlobWrapper blob) {
+     removeMetadataAttribute(blob, OLD_IS_FOLDER_METADATA_KEY);
+   }
+ 
+-  private static void storeLinkAttribute(CloudBlobWrapper blob,
+-      String linkTarget) throws UnsupportedEncodingException {
+-    // We have to URL encode the link attribute as the link URI could
++  private static String encodeMetadataAttribute(String value) throws UnsupportedEncodingException {
++    // We have to URL encode the attribute as it could
+     // have URI special characters which unless encoded will result
+     // in 403 errors from the server. This is due to metadata properties
+     // being sent in the HTTP header of the request which is in turn used
+     // on the server side to authorize the request.
+-    String encodedLinkTarget = null;
+-    if (linkTarget != null) {
+-      encodedLinkTarget = URLEncoder.encode(linkTarget, "UTF-8");
+-    }
++    return value == null ? null : URLEncoder.encode(value, METADATA_ENCODING.name());
++  }
++
++  private static String decodeMetadataAttribute(String encoded) throws UnsupportedEncodingException {
++    return encoded == null ? null : URLDecoder.decode(encoded, METADATA_ENCODING.name());
++  }
++
++  private static String ensureValidAttributeName(String attribute) {
++    // Attribute names must be valid C# identifiers so we have to
++    // convert the namespace dots (e.g. "user.something") in the
++    // attribute names. Using underscores here to be consistent with
++    // the constant metadata keys defined earlier in the file
++    return attribute.replace('.', '_');
++  }
++
++  private static void storeLinkAttribute(CloudBlobWrapper blob,
++      String linkTarget) throws UnsupportedEncodingException {
++    String encodedLinkTarget = encodeMetadataAttribute(linkTarget);
+     storeMetadataAttribute(blob,
+         LINK_BACK_TO_UPLOAD_IN_PROGRESS_METADATA_KEY,
+         encodedLinkTarget);
+@@ -1686,11 +1703,7 @@ private static String getLinkAttributeValue(CloudBlobWrapper blob)
+     String encodedLinkTarget = getMetadataAttribute(blob,
+         LINK_BACK_TO_UPLOAD_IN_PROGRESS_METADATA_KEY,
+         OLD_LINK_BACK_TO_UPLOAD_IN_PROGRESS_METADATA_KEY);
+-    String linkTarget = null;
+-    if (encodedLinkTarget != null) {
+-      linkTarget = URLDecoder.decode(encodedLinkTarget, "UTF-8");
+-    }
+-    return linkTarget;
++    return decodeMetadataAttribute(encodedLinkTarget);
+   }
+ 
+   private static boolean retrieveFolderAttribute(CloudBlobWrapper blob) {
+@@ -2211,6 +2224,36 @@ public FileMetadata retrieveMetadata(String key) throws IOException {
+     }
+   }
+ 
++  @Override
++  public byte[] retrieveAttribute(String key, String attribute) throws IOException {
++    try {
++      checkContainer(ContainerAccessType.PureRead);
++      CloudBlobWrapper blob = getBlobReference(key);
++      blob.downloadAttributes(getInstrumentedContext());
++
++      String value = getMetadataAttribute(blob, ensureValidAttributeName(attribute));
++      value = decodeMetadataAttribute(value);
++      return value == null ? null : value.getBytes(METADATA_ENCODING);
++    } catch (Exception e) {
++      throw new AzureException(e);
++    }
++  }
++
++  @Override
++  public void storeAttribute(String key, String attribute, byte[] value) throws IOException {
++    try {
++      checkContainer(ContainerAccessType.ReadThenWrite);
++      CloudBlobWrapper blob = getBlobReference(key);
++      blob.downloadAttributes(getInstrumentedContext());
++
++      String encodedValue = encodeMetadataAttribute(new String(value, METADATA_ENCODING));
++      storeMetadataAttribute(blob, ensureValidAttributeName(attribute), encodedValue);
++      blob.uploadMetadata(getInstrumentedContext());
++    } catch (Exception e) {
++      throw new AzureException(e);
++    }
++  }
++
+   @Override
+   public InputStream retrieve(String key) throws AzureException, IOException {
+     return retrieve(key, 0);
+diff --git a/hadoop-tools/hadoop-azure/src/main/java/org/apache/hadoop/fs/azure/NativeAzureFileSystem.java b/hadoop-tools/hadoop-azure/src/main/java/org/apache/hadoop/fs/azure/NativeAzureFileSystem.java
+index 9955346f66e1..f5705283b512 100644
+--- a/hadoop-tools/hadoop-azure/src/main/java/org/apache/hadoop/fs/azure/NativeAzureFileSystem.java
++++ b/hadoop-tools/hadoop-azure/src/main/java/org/apache/hadoop/fs/azure/NativeAzureFileSystem.java
+@@ -64,6 +64,7 @@
+ import org.apache.hadoop.fs.Seekable;
+ import org.apache.hadoop.fs.StreamCapabilities;
+ import org.apache.hadoop.fs.Syncable;
++import org.apache.hadoop.fs.XAttrSetFlag;
+ import org.apache.hadoop.fs.azure.metrics.AzureFileSystemInstrumentation;
+ import org.apache.hadoop.fs.azure.metrics.AzureFileSystemMetricsSystem;
+ import org.apache.hadoop.fs.azure.security.Constants;
+@@ -3563,6 +3564,76 @@ public void setOwner(Path p, String username, String groupname)
+     }
+   }
+ 
++  /**
++   * Set the value of an attribute for a path.
++   *
++   * @param path The path on which to set the attribute
++   * @param xAttrName The attribute to set
++   * @param value The byte value of the attribute to set (encoded in utf-8)
++   * @param flag The mode in which to set the attribute
++   * @throws IOException If there was an issue setting the attribute on Azure
++   */
++  @Override
++  public void setXAttr(Path path, String xAttrName, byte[] value, EnumSet<XAttrSetFlag> flag) throws IOException {
++    Path absolutePath = makeAbsolute(path);
++    performAuthCheck(absolutePath, WasbAuthorizationOperations.WRITE, "setXAttr", absolutePath);
++
++    String key = pathToKey(absolutePath);
++    FileMetadata metadata;
++    try {
++      metadata = store.retrieveMetadata(key);
++    } catch (IOException ex) {
++      Throwable innerException = NativeAzureFileSystemHelper.checkForAzureStorageException(ex);
++      if (innerException instanceof StorageException
++          && NativeAzureFileSystemHelper.isFileNotFoundException((StorageException) innerException)) {
++        throw new FileNotFoundException("File " + path + " doesn't exists.");
++      }
++      throw ex;
++    }
++
++    if (metadata == null) {
++      throw new FileNotFoundException("File doesn't exist: " + path);
++    }
++
++    boolean xAttrExists = store.retrieveAttribute(key, xAttrName) != null;
++    XAttrSetFlag.validate(xAttrName, xAttrExists, flag);
++    store.storeAttribute(key, xAttrName, value);
++  }
++
++  /**
++   * Get the value of an attribute for a path.
++   *
++   * @param path The path on which to get the attribute
++   * @param xAttrName The attribute to get
++   * @return The bytes of the attribute's value (encoded in utf-8)
++   *         or null if the attribute does not exist
++   * @throws IOException If there was an issue getting the attribute from Azure
++   */
++  @Override
++  public byte[] getXAttr(Path path, String xAttrName) throws IOException {
++    Path absolutePath = makeAbsolute(path);
++    performAuthCheck(absolutePath, WasbAuthorizationOperations.READ, "getXAttr", absolutePath);
++
++    String key = pathToKey(absolutePath);
++    FileMetadata metadata;
++    try {
++      metadata = store.retrieveMetadata(key);
++    } catch (IOException ex) {
++      Throwable innerException = NativeAzureFileSystemHelper.checkForAzureStorageException(ex);
++      if (innerException instanceof StorageException
++              && NativeAzureFileSystemHelper.isFileNotFoundException((StorageException) innerException)) {
++        throw new FileNotFoundException("File " + path + " doesn't exists.");
++      }
++      throw ex;
++    }
++
++    if (metadata == null) {
++      throw new FileNotFoundException("File doesn't exist: " + path);
++    }
++
++    return store.retrieveAttribute(key, xAttrName);
++  }
++
+   /**
+    * Is the user allowed?
+    * <ol>
+diff --git a/hadoop-tools/hadoop-azure/src/main/java/org/apache/hadoop/fs/azure/NativeFileSystemStore.java b/hadoop-tools/hadoop-azure/src/main/java/org/apache/hadoop/fs/azure/NativeFileSystemStore.java
+index 36e3819c32bc..414a01115c1d 100644
+--- a/hadoop-tools/hadoop-azure/src/main/java/org/apache/hadoop/fs/azure/NativeFileSystemStore.java
++++ b/hadoop-tools/hadoop-azure/src/main/java/org/apache/hadoop/fs/azure/NativeFileSystemStore.java
+@@ -76,6 +76,10 @@ FileMetadata[] list(String prefix, final int maxListingCount,
+   void changePermissionStatus(String key, PermissionStatus newPermission)
+       throws AzureException;
+ 
++  byte[] retrieveAttribute(String key, String attribute) throws IOException;
++
++  void storeAttribute(String key, String attribute, byte[] value) throws IOException;
++
+   /**
+    * API to delete a blob in the back end azure storage.
+    * @param key - key to the blob being deleted.
+diff --git a/hadoop-tools/hadoop-azure/src/main/java/org/apache/hadoop/fs/azurebfs/AzureBlobFileSystem.java b/hadoop-tools/hadoop-azure/src/main/java/org/apache/hadoop/fs/azurebfs/AzureBlobFileSystem.java
+index fb591bbb3707..56ba9e3f8f32 100644
+--- a/hadoop-tools/hadoop-azure/src/main/java/org/apache/hadoop/fs/azurebfs/AzureBlobFileSystem.java
++++ b/hadoop-tools/hadoop-azure/src/main/java/org/apache/hadoop/fs/azurebfs/AzureBlobFileSystem.java
+@@ -26,6 +26,7 @@
+ import java.net.HttpURLConnection;
+ import java.net.URI;
+ import java.net.URISyntaxException;
++import java.util.Hashtable;
+ import java.util.List;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+@@ -56,6 +57,7 @@
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.PathIOException;
++import org.apache.hadoop.fs.XAttrSetFlag;
+ import org.apache.hadoop.fs.azurebfs.constants.AbfsHttpConstants;
+ import org.apache.hadoop.fs.azurebfs.constants.FileSystemConfigurations;
+ import org.apache.hadoop.fs.azurebfs.constants.FileSystemUriSchemes;
+@@ -636,6 +638,83 @@ public void setOwner(final Path path, final String owner, final String group)
+     }
+   }
+ 
++  /**
++   * Set the value of an attribute for a path.
++   *
++   * @param path The path on which to set the attribute
++   * @param name The attribute to set
++   * @param value The byte value of the attribute to set (encoded in latin-1)
++   * @param flag The mode in which to set the attribute
++   * @throws IOException If there was an issue setting the attribute on Azure
++   * @throws IllegalArgumentException If name is null or empty or if value is null
++   */
++  @Override
++  public void setXAttr(final Path path, final String name, final byte[] value, final EnumSet<XAttrSetFlag> flag)
++      throws IOException {
++    LOG.debug("AzureBlobFileSystem.setXAttr path: {}", path);
++
++    if (name == null || name.isEmpty() || value == null) {
++      throw new IllegalArgumentException("A valid name and value must be specified.");
++    }
++
++    Path qualifiedPath = makeQualified(path);
++    performAbfsAuthCheck(FsAction.READ_WRITE, qualifiedPath);
++
++    try {
++      Hashtable<String, String> properties = abfsStore.getPathStatus(path);
++      String xAttrName = ensureValidAttributeName(name);
++      boolean xAttrExists = properties.containsKey(xAttrName);
++      XAttrSetFlag.validate(name, xAttrExists, flag);
++
++      String xAttrValue = abfsStore.decodeAttribute(value);
++      properties.put(xAttrName, xAttrValue);
++      abfsStore.setPathProperties(path, properties);
++    } catch (AzureBlobFileSystemException ex) {
++      checkException(path, ex);
++    }
++  }
++
++  /**
++   * Get the value of an attribute for a path.
++   *
++   * @param path The path on which to get the attribute
++   * @param name The attribute to get
++   * @return The bytes of the attribute's value (encoded in latin-1)
++   *         or null if the attribute does not exist
++   * @throws IOException If there was an issue getting the attribute from Azure
++   * @throws IllegalArgumentException If name is null or empty
++   */
++  @Override
++  public byte[] getXAttr(final Path path, final String name)
++      throws IOException {
++    LOG.debug("AzureBlobFileSystem.getXAttr path: {}", path);
++
++    if (name == null || name.isEmpty()) {
++      throw new IllegalArgumentException("A valid name must be specified.");
++    }
++
++    Path qualifiedPath = makeQualified(path);
++    performAbfsAuthCheck(FsAction.READ, qualifiedPath);
++
++    byte[] value = null;
++    try {
++      Hashtable<String, String> properties = abfsStore.getPathStatus(path);
++      String xAttrName = ensureValidAttributeName(name);
++      if (properties.containsKey(xAttrName)) {
++        String xAttrValue = properties.get(xAttrName);
++        value = abfsStore.encodeAttribute(xAttrValue);
++      }
++    } catch (AzureBlobFileSystemException ex) {
++      checkException(path, ex);
++    }
++    return value;
++  }
++
++  private static String ensureValidAttributeName(String attribute) {
++    // to avoid HTTP 400 Bad Request, InvalidPropertyName
++    return attribute.replace('.', '_');
++  }
++
+   /**
+    * Set permission of a path.
+    *
+diff --git a/hadoop-tools/hadoop-azure/src/main/java/org/apache/hadoop/fs/azurebfs/AzureBlobFileSystemStore.java b/hadoop-tools/hadoop-azure/src/main/java/org/apache/hadoop/fs/azurebfs/AzureBlobFileSystemStore.java
+index aff8111d7dfc..0e8afb5a7c36 100644
+--- a/hadoop-tools/hadoop-azure/src/main/java/org/apache/hadoop/fs/azurebfs/AzureBlobFileSystemStore.java
++++ b/hadoop-tools/hadoop-azure/src/main/java/org/apache/hadoop/fs/azurebfs/AzureBlobFileSystemStore.java
+@@ -21,6 +21,7 @@
+ import java.io.File;
+ import java.io.IOException;
+ import java.io.OutputStream;
++import java.io.UnsupportedEncodingException;
+ import java.net.HttpURLConnection;
+ import java.net.MalformedURLException;
+ import java.net.URI;
+@@ -197,6 +198,14 @@ public void close() throws IOException {
+     IOUtils.cleanupWithLogger(LOG, client);
+   }
+ 
++  byte[] encodeAttribute(String value) throws UnsupportedEncodingException {
++    return value.getBytes(XMS_PROPERTIES_ENCODING);
++  }
++
++  String decodeAttribute(byte[] value) throws UnsupportedEncodingException {
++    return new String(value, XMS_PROPERTIES_ENCODING);
++  }
++
+   private String[] authorityParts(URI uri) throws InvalidUriAuthorityException, InvalidUriException {
+     final String authority = uri.getRawAuthority();
+     if (null == authority) {
+diff --git a/hadoop-tools/hadoop-azure/src/test/java/org/apache/hadoop/fs/azure/NativeAzureFileSystemBaseTest.java b/hadoop-tools/hadoop-azure/src/test/java/org/apache/hadoop/fs/azure/NativeAzureFileSystemBaseTest.java
+index 19d370ebc99f..8ac36c299b65 100644
+--- a/hadoop-tools/hadoop-azure/src/test/java/org/apache/hadoop/fs/azure/NativeAzureFileSystemBaseTest.java
++++ b/hadoop-tools/hadoop-azure/src/test/java/org/apache/hadoop/fs/azure/NativeAzureFileSystemBaseTest.java
+@@ -22,10 +22,12 @@
+ import java.io.IOException;
+ import java.io.InputStream;
+ import java.io.OutputStream;
++import java.nio.charset.StandardCharsets;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Calendar;
+ import java.util.Date;
++import java.util.EnumSet;
+ import java.util.TimeZone;
+ 
+ import org.apache.commons.logging.Log;
+@@ -37,6 +39,7 @@
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.FileUtil;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.fs.XAttrSetFlag;
+ import org.apache.hadoop.fs.contract.ContractTestUtils;
+ import org.apache.hadoop.fs.permission.FsPermission;
+ import org.apache.hadoop.security.UserGroupInformation;
+@@ -51,6 +54,7 @@
+ import static org.apache.hadoop.fs.azure.integration.AzureTestUtils.writeStringToFile;
+ import static org.apache.hadoop.fs.azure.integration.AzureTestUtils.writeStringToStream;
+ import static org.apache.hadoop.test.GenericTestUtils.*;
++import static org.apache.hadoop.test.LambdaTestUtils.intercept;
+ 
+ /*
+  * Tests the Native Azure file system (WASB) against an actual blob store if
+@@ -65,6 +69,10 @@
+ 
+   private final long modifiedTimeErrorMargin = 5 * 1000; // Give it +/-5 seconds
+ 
++  private static final short READ_WRITE_PERMISSIONS = 644;
++  private static final EnumSet<XAttrSetFlag> CREATE_FLAG = EnumSet.of(XAttrSetFlag.CREATE);
++  private static final EnumSet<XAttrSetFlag> REPLACE_FLAG = EnumSet.of(XAttrSetFlag.REPLACE);
++
+   public static final Log LOG = LogFactory.getLog(NativeAzureFileSystemBaseTest.class);
+   protected NativeAzureFileSystem fs;
+ 
+@@ -117,6 +125,60 @@ public void testStoreRetrieveFile() throws Exception {
+     fs.delete(testFile, true);
+   }
+ 
++  @Test
++  public void testSetGetXAttr() throws Exception {
++    byte[] attributeValue1 = "hi".getBytes(StandardCharsets.UTF_8);
++    byte[] attributeValue2 = "你好".getBytes(StandardCharsets.UTF_8);
++    String attributeName1 = "user.asciiAttribute";
++    String attributeName2 = "user.unicodeAttribute";
++    Path testFile = methodPath();
++
++    // after creating a file, the xAttr should not be present
++    createEmptyFile(testFile, FsPermission.createImmutable(READ_WRITE_PERMISSIONS));
++    assertNull(fs.getXAttr(testFile, attributeName1));
++
++    // after setting the xAttr on the file, the value should be retrievable
++    fs.setXAttr(testFile, attributeName1, attributeValue1);
++    assertArrayEquals(attributeValue1, fs.getXAttr(testFile, attributeName1));
++
++    // after setting a second xAttr on the file, the first xAttr values should not be overwritten
++    fs.setXAttr(testFile, attributeName2, attributeValue2);
++    assertArrayEquals(attributeValue1, fs.getXAttr(testFile, attributeName1));
++    assertArrayEquals(attributeValue2, fs.getXAttr(testFile, attributeName2));
++  }
++
++  @Test
++  public void testSetGetXAttrCreateReplace() throws Exception {
++    byte[] attributeValue = "one".getBytes(StandardCharsets.UTF_8);
++    String attributeName = "user.someAttribute";
++    Path testFile = methodPath();
++
++    // after creating a file, it must be possible to create a new xAttr
++    createEmptyFile(testFile, FsPermission.createImmutable(READ_WRITE_PERMISSIONS));
++    fs.setXAttr(testFile, attributeName, attributeValue, CREATE_FLAG);
++    assertArrayEquals(attributeValue, fs.getXAttr(testFile, attributeName));
++
++    // however after the xAttr is created, creating it again must fail
++    intercept(IOException.class, () -> fs.setXAttr(testFile, attributeName, attributeValue, CREATE_FLAG));
++  }
++
++  @Test
++  public void testSetGetXAttrReplace() throws Exception {
++    byte[] attributeValue1 = "one".getBytes(StandardCharsets.UTF_8);
++    byte[] attributeValue2 = "two".getBytes(StandardCharsets.UTF_8);
++    String attributeName = "user.someAttribute";
++    Path testFile = methodPath();
++
++    // after creating a file, it must not be possible to replace an xAttr
++    createEmptyFile(testFile, FsPermission.createImmutable(READ_WRITE_PERMISSIONS));
++    intercept(IOException.class, () -> fs.setXAttr(testFile, attributeName, attributeValue1, REPLACE_FLAG));
++
++    // however after the xAttr is created, replacing it must succeed
++    fs.setXAttr(testFile, attributeName, attributeValue1, CREATE_FLAG);
++    fs.setXAttr(testFile, attributeName, attributeValue2, REPLACE_FLAG);
++    assertArrayEquals(attributeValue2, fs.getXAttr(testFile, attributeName));
++  }
++
+   @Test
+   public void testStoreDeleteFolder() throws Exception {
+     Path testFolder = methodPath();
+diff --git a/hadoop-tools/hadoop-azure/src/test/java/org/apache/hadoop/fs/azurebfs/ITestAzureBlobFileSystemAttributes.java b/hadoop-tools/hadoop-azure/src/test/java/org/apache/hadoop/fs/azurebfs/ITestAzureBlobFileSystemAttributes.java
+new file mode 100644
+index 000000000000..cc86923357aa
+--- /dev/null
++++ b/hadoop-tools/hadoop-azure/src/test/java/org/apache/hadoop/fs/azurebfs/ITestAzureBlobFileSystemAttributes.java
+@@ -0,0 +1,104 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.fs.azurebfs;
++
++import java.io.IOException;
++import java.util.EnumSet;
++
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.fs.XAttrSetFlag;
++import org.junit.Assume;
++import org.junit.Test;
++
++import static org.apache.hadoop.test.LambdaTestUtils.intercept;
++
++/**
++ * Test attribute operations.
++ */
++public class ITestAzureBlobFileSystemAttributes extends AbstractAbfsIntegrationTest {
++  private static final EnumSet<XAttrSetFlag> CREATE_FLAG = EnumSet.of(XAttrSetFlag.CREATE);
++  private static final EnumSet<XAttrSetFlag> REPLACE_FLAG = EnumSet.of(XAttrSetFlag.REPLACE);
++
++  public ITestAzureBlobFileSystemAttributes() throws Exception {
++    super();
++  }
++
++  @Test
++  public void testSetGetXAttr() throws Exception {
++    AzureBlobFileSystem fs = getFileSystem();
++    Assume.assumeTrue(fs.getIsNamespaceEnabled());
++
++    byte[] attributeValue1 = fs.getAbfsStore().encodeAttribute("hi");
++    byte[] attributeValue2 = fs.getAbfsStore().encodeAttribute("你好");
++    String attributeName1 = "user.asciiAttribute";
++    String attributeName2 = "user.unicodeAttribute";
++    Path testFile = path("setGetXAttr");
++
++    // after creating a file, the xAttr should not be present
++    touch(testFile);
++    assertNull(fs.getXAttr(testFile, attributeName1));
++
++    // after setting the xAttr on the file, the value should be retrievable
++    fs.setXAttr(testFile, attributeName1, attributeValue1);
++    assertArrayEquals(attributeValue1, fs.getXAttr(testFile, attributeName1));
++
++    // after setting a second xAttr on the file, the first xAttr values should not be overwritten
++    fs.setXAttr(testFile, attributeName2, attributeValue2);
++    assertArrayEquals(attributeValue1, fs.getXAttr(testFile, attributeName1));
++    assertArrayEquals(attributeValue2, fs.getXAttr(testFile, attributeName2));
++  }
++
++  @Test
++  public void testSetGetXAttrCreateReplace() throws Exception {
++    AzureBlobFileSystem fs = getFileSystem();
++    Assume.assumeTrue(fs.getIsNamespaceEnabled());
++    byte[] attributeValue = fs.getAbfsStore().encodeAttribute("one");
++    String attributeName = "user.someAttribute";
++    Path testFile = path("createReplaceXAttr");
++
++    // after creating a file, it must be possible to create a new xAttr
++    touch(testFile);
++    fs.setXAttr(testFile, attributeName, attributeValue, CREATE_FLAG);
++    assertArrayEquals(attributeValue, fs.getXAttr(testFile, attributeName));
++
++    // however after the xAttr is created, creating it again must fail
++    intercept(IOException.class, () -> fs.setXAttr(testFile, attributeName, attributeValue, CREATE_FLAG));
++  }
++
++  @Test
++  public void testSetGetXAttrReplace() throws Exception {
++    AzureBlobFileSystem fs = getFileSystem();
++    Assume.assumeTrue(fs.getIsNamespaceEnabled());
++    byte[] attributeValue1 = fs.getAbfsStore().encodeAttribute("one");
++    byte[] attributeValue2 = fs.getAbfsStore().encodeAttribute("two");
++    String attributeName = "user.someAttribute";
++    Path testFile = path("replaceXAttr");
++
++    // after creating a file, it must not be possible to replace an xAttr
++    intercept(IOException.class, () -> {
++      touch(testFile);
++      fs.setXAttr(testFile, attributeName, attributeValue1, REPLACE_FLAG);
++    });
++
++    // however after the xAttr is created, replacing it must succeed
++    fs.setXAttr(testFile, attributeName, attributeValue1, CREATE_FLAG);
++    fs.setXAttr(testFile, attributeName, attributeValue2, REPLACE_FLAG);
++    assertArrayEquals(attributeValue2, fs.getXAttr(testFile, attributeName));
++  }
++}

@@ -1,0 +1,405 @@
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/net/DomainNameResolverFactory.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/net/DomainNameResolverFactory.java
+index fdb45dd85d96..3a684f374475 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/net/DomainNameResolverFactory.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/net/DomainNameResolverFactory.java
+@@ -49,7 +49,11 @@ private DomainNameResolverFactory() {
+    */
+   public static DomainNameResolver newInstance(
+       Configuration conf, URI uri, String configKey) {
+-    String host = uri.getHost();
++    return newInstance(conf, uri.getHost(), configKey);
++  }
++
++  public static DomainNameResolver newInstance(
++      Configuration conf, String host, String configKey) {
+     String confKeyWithHost = configKey + "." + host;
+     return newInstance(conf, confKeyWithHost);
+   }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/DFSUtilClient.java b/hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/DFSUtilClient.java
+index 55c64dc130d9..6b3fa280ab98 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/DFSUtilClient.java
++++ b/hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/DFSUtilClient.java
+@@ -17,6 +17,7 @@
+  */
+ package org.apache.hadoop.hdfs;
+ 
++import org.apache.hadoop.net.DomainNameResolver;
+ import org.apache.hadoop.thirdparty.com.google.common.base.Joiner;
+ import org.apache.hadoop.thirdparty.com.google.common.base.Preconditions;
+ import org.apache.hadoop.thirdparty.com.google.common.collect.Maps;
+@@ -72,6 +73,7 @@
+ import java.net.InetSocketAddress;
+ import java.net.Socket;
+ import java.net.URI;
++import java.net.UnknownHostException;
+ import java.nio.channels.SocketChannel;
+ import java.nio.charset.StandardCharsets;
+ import java.text.SimpleDateFormat;
+@@ -406,6 +408,55 @@ public static Map<String, Map<String, InetSocketAddress>> getAddresses(
+     return getAddressesForNsIds(conf, nameserviceIds, defaultAddress, keys);
+   }
+ 
++  /**
++   * Use DNS record to resolve NN and return resolved FQDN.
++   *
++   * @param conf Configuration
++   * @param nsId Nameservice Id to resolve
++   * @param dnr  Class used to resolve DNS
++   * @param defaultValue default address to return in case key is not found.
++   * @param keys Set of keys to look for in the order of preference
++   * @return a map(namenodeId to InetSocketAddress),
++   *         where namenodeId is combination of nsId,
++   *         resolved hostname and port.
++   */
++  static Map<String, InetSocketAddress> getResolvedAddressesForNsId(
++      Configuration conf, String nsId, DomainNameResolver dnr,
++      String defaultValue, String... keys) {
++    Collection<String> nnIds = getNameNodeIds(conf, nsId);
++    Map<String, InetSocketAddress> ret = Maps.newLinkedHashMap();
++    for (String nnId : emptyAsSingletonNull(nnIds)) {
++      String suffix = concatSuffixes(nsId, nnId);
++      String address = checkKeysAndProcess(defaultValue, suffix, conf, keys);
++      if (address != null) {
++        InetSocketAddress isa = NetUtils.createSocketAddr(address);
++        try {
++          // Datanode should just use FQDN
++          String[] resolvedHostNames = dnr
++              .getAllResolvedHostnameByDomainName(isa.getHostName(), true);
++          int port = isa.getPort();
++          for (String hostname : resolvedHostNames) {
++            InetSocketAddress inetSocketAddress = new InetSocketAddress(
++                hostname, port);
++            // Concat nn info with host info to make uniq ID
++            String concatId;
++            if (nnId == null || nnId.isEmpty()) {
++              concatId = String
++                  .join("-", nsId, hostname, String.valueOf(port));
++            } else {
++              concatId = String
++                  .join("-", nsId, nnId, hostname, String.valueOf(port));
++            }
++            ret.put(concatId, inetSocketAddress);
++          }
++        } catch (UnknownHostException e) {
++          LOG.error("Failed to resolve address: " + address);
++        }
++      }
++    }
++    return ret;
++  }
++
+   /**
+    * Returns the configured address for all NameNodes in the cluster.
+    * @param conf configuration
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+index b9a7bc5eaec7..b3834ae96b05 100755
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+@@ -1600,6 +1600,16 @@ public class DFSConfigKeys extends CommonConfigurationKeys {
+   public static final String
+       DFS_DATANODE_SAME_DISK_TIERING_CAPACITY_RATIO_PERCENTAGE_DEFAULT = "";
+ 
++  public static final String
++      DFS_NAMESERVICES_RESOLUTION_ENABLED =
++      "dfs.datanode.nameservices.resolution-enabled";
++  public static final boolean
++      DFS_NAMESERVICES_RESOLUTION_ENABLED_DEFAULT = false;
++
++  public static final String
++      DFS_NAMESERVICES_RESOLVER_IMPL =
++      "dfs.datanode.nameservices.resolver.impl";
++
+   // dfs.client.retry confs are moved to HdfsClientConfigKeys.Retry
+   @Deprecated
+   public static final String  DFS_CLIENT_RETRY_POLICY_ENABLED_KEY
+@@ -1936,4 +1946,5 @@ public class DFSConfigKeys extends CommonConfigurationKeys {
+   public static final long DFS_LEASE_HARDLIMIT_DEFAULT =
+       HdfsClientConfigKeys.DFS_LEASE_HARDLIMIT_DEFAULT;
+ 
++
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSUtil.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSUtil.java
+index 3e47e557b0be..9efb6449739c 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSUtil.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSUtil.java
+@@ -72,9 +72,12 @@
+ import org.apache.hadoop.hdfs.server.namenode.FSDirectory;
+ import org.apache.hadoop.hdfs.server.namenode.INodesInPath;
+ import org.apache.hadoop.ipc.ProtobufRpcEngine;
++import org.apache.hadoop.net.DomainNameResolver;
++import org.apache.hadoop.net.DomainNameResolverFactory;
+ import org.apache.hadoop.security.AccessControlException;
+ import org.apache.hadoop.util.Lists;
+ import org.apache.hadoop.util.Sets;
++import org.apache.hadoop.thirdparty.com.google.common.collect.Maps;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ import org.apache.hadoop.HadoopIllegalArgumentException;
+@@ -628,26 +631,10 @@ public static Map<String, Map<String, InetSocketAddress>> getNNServiceRpcAddress
+       defaultAddress = null;
+     }
+ 
+-    Collection<String> parentNameServices = conf.getTrimmedStringCollection
+-            (DFSConfigKeys.DFS_INTERNAL_NAMESERVICES_KEY);
+-
+-    if (parentNameServices.isEmpty()) {
+-      parentNameServices = conf.getTrimmedStringCollection
+-              (DFSConfigKeys.DFS_NAMESERVICES);
+-    } else {
+-      // Ensure that the internal service is ineed in the list of all available
+-      // nameservices.
+-      Set<String> availableNameServices = Sets.newHashSet(conf
+-              .getTrimmedStringCollection(DFSConfigKeys.DFS_NAMESERVICES));
+-      for (String nsId : parentNameServices) {
+-        if (!availableNameServices.contains(nsId)) {
+-          throw new IOException("Unknown nameservice: " + nsId);
+-        }
+-      }
+-    }
++    Collection<String> parentNameServices = getParentNameServices(conf);
+ 
+     Map<String, Map<String, InetSocketAddress>> addressList =
+-            DFSUtilClient.getAddressesForNsIds(conf, parentNameServices,
++            getAddressesForNsIds(conf, parentNameServices,
+                                                defaultAddress,
+                                                DFS_NAMENODE_SERVICE_RPC_ADDRESS_KEY,
+                                                DFS_NAMENODE_RPC_ADDRESS_KEY);
+@@ -673,6 +660,58 @@ public static Map<String, Map<String, InetSocketAddress>> getNNServiceRpcAddress
+       getNNLifelineRpcAddressesForCluster(Configuration conf)
+       throws IOException {
+ 
++    Collection<String> parentNameServices = getParentNameServices(conf);
++
++    return getAddressesForNsIds(conf, parentNameServices, null,
++        DFS_NAMENODE_LIFELINE_RPC_ADDRESS_KEY);
++  }
++
++  //
++  /**
++   * Returns the configured address for all NameNodes in the cluster.
++   * This is similar with DFSUtilClient.getAddressesForNsIds()
++   * but can access DFSConfigKeys.
++   *
++   * @param conf configuration
++   * @param defaultAddress default address to return in case key is not found.
++   * @param keys Set of keys to look for in the order of preference
++   *
++   * @return a map(nameserviceId to map(namenodeId to InetSocketAddress))
++   */
++  static Map<String, Map<String, InetSocketAddress>> getAddressesForNsIds(
++      Configuration conf, Collection<String> nsIds, String defaultAddress,
++      String... keys) {
++    // Look for configurations of the form
++    // <key>[.<nameserviceId>][.<namenodeId>]
++    // across all of the configured nameservices and namenodes.
++    Map<String, Map<String, InetSocketAddress>> ret = Maps.newLinkedHashMap();
++    for (String nsId : DFSUtilClient.emptyAsSingletonNull(nsIds)) {
++
++      String configKeyWithHost =
++          DFSConfigKeys.DFS_NAMESERVICES_RESOLUTION_ENABLED + "." + nsId;
++      boolean resolveNeeded = conf.getBoolean(configKeyWithHost,
++          DFSConfigKeys.DFS_NAMESERVICES_RESOLUTION_ENABLED_DEFAULT);
++
++      Map<String, InetSocketAddress> isas;
++
++      if (resolveNeeded) {
++        DomainNameResolver dnr = DomainNameResolverFactory.newInstance(
++            conf, nsId, DFSConfigKeys.DFS_NAMESERVICES_RESOLVER_IMPL);
++        isas = DFSUtilClient.getResolvedAddressesForNsId(
++            conf, nsId, dnr, defaultAddress, keys);
++      } else {
++        isas = DFSUtilClient.getAddressesForNameserviceId(
++            conf, nsId, defaultAddress, keys);
++      }
++      if (!isas.isEmpty()) {
++        ret.put(nsId, isas);
++      }
++    }
++    return ret;
++  }
++
++  private static Collection<String> getParentNameServices(Configuration conf)
++      throws IOException {
+     Collection<String> parentNameServices = conf.getTrimmedStringCollection(
+         DFSConfigKeys.DFS_INTERNAL_NAMESERVICES_KEY);
+ 
+@@ -691,8 +730,7 @@ public static Map<String, Map<String, InetSocketAddress>> getNNServiceRpcAddress
+       }
+     }
+ 
+-    return DFSUtilClient.getAddressesForNsIds(conf, parentNameServices, null,
+-        DFS_NAMENODE_LIFELINE_RPC_ADDRESS_KEY);
++    return parentNameServices;
+   }
+ 
+   /**
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BPServiceActor.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BPServiceActor.java
+index 5d3b1ba2556f..59958fb9981b 100755
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BPServiceActor.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BPServiceActor.java
+@@ -218,6 +218,11 @@ void setNameNode(DatanodeProtocolClientSideTranslatorPB dnProtocol) {
+     bpNamenode = dnProtocol;
+   }
+ 
++  @VisibleForTesting
++  String getNnId() {
++    return nnId;
++  }
++
+   @VisibleForTesting
+   DatanodeProtocolClientSideTranslatorPB getNameNodeProxy() {
+     return bpNamenode;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockPoolManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockPoolManager.java
+index 20e5bb7a7534..6df9f143a429 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockPoolManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockPoolManager.java
+@@ -31,6 +31,7 @@
+ import org.apache.hadoop.util.Lists;
+ import org.apache.hadoop.util.Sets;
+ 
++import org.apache.hadoop.thirdparty.com.google.common.annotations.VisibleForTesting;
+ import org.apache.hadoop.thirdparty.com.google.common.base.Joiner;
+ import org.apache.hadoop.thirdparty.com.google.common.base.Preconditions;
+ import org.apache.hadoop.thirdparty.com.google.common.collect.Maps;
+@@ -301,4 +302,9 @@ protected BPOfferService createBPOS(
+     return new BPOfferService(nameserviceId, nnIds, nnAddrs, lifelineNnAddrs,
+         dn);
+   }
++
++  @VisibleForTesting
++  Map<String, BPOfferService> getBpByNameserviceId() {
++    return bpByNameserviceId;
++  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml b/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+index 78d8e033ec78..c3fb0851d24d 100755
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+@@ -6187,6 +6187,7 @@
+         accessed or modified before the specified time interval.
+     </description>
+   </property>
++
+   <property>
+     <name>dfs.datanode.directoryscan.max.notify.count</name>
+     <value>5</value>
+@@ -6195,4 +6196,23 @@
+       namenode right way for received or deleted blocks after one round.
+     </description>
+   </property>
++
++  <property>
++    <name>dfs.datanode.nameservices.resolution-enabled</name>
++    <value>false</value>
++    <description>
++      Determines if the given nameservice address is a domain name which needs to
++      be resolved (using the resolver configured by dfs.nameservices.resolver.impl).
++      This is used by datanode to resolve namenodes.
++    </description>
++  </property>
++
++  <property>
++    <name>dfs.datanode.nameservices.resolver.impl</name>
++    <value></value>
++    <description>
++      Nameservice resolver implementation used by datanode.
++      Effective with dfs.nameservices.resolution-enabled on.
++    </description>
++  </property>
+ </configuration>
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestBlockPoolManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestBlockPoolManager.java
+index 65ff9b0ff9fa..a4f5071aac35 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestBlockPoolManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestBlockPoolManager.java
+@@ -25,12 +25,12 @@
+ import java.util.List;
+ import java.util.Map;
+ 
++import org.apache.hadoop.net.MockDomainNameResolver;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hdfs.DFSConfigKeys;
+ import org.apache.hadoop.hdfs.DFSUtil;
+-import org.apache.hadoop.test.Whitebox;
+ import org.junit.Assert;
+ import org.junit.Before;
+ import org.junit.Test;
+@@ -61,6 +61,14 @@ protected BPOfferService createBPOS(
+         doLog("create #" + idx);
+         final BPOfferService bpos = Mockito.mock(BPOfferService.class);
+         Mockito.doReturn("Mock BPOS #" + idx).when(bpos).toString();
++        List<BPServiceActor> bpsa = new ArrayList<>(nnIds.size());
++        for (int i = 0; i < nnIds.size(); i++) {
++          BPServiceActor actor = Mockito.mock(BPServiceActor.class);
++          Mockito.doReturn(nnIds.get(i)).when(actor).getNnId();
++          Mockito.doReturn(nnAddrs.get(i)).when(actor).getNNSocketAddress();
++          bpsa.add(actor);
++        }
++        Mockito.doReturn(bpsa).when(bpos).getBPServiceActors();
+         // Log refreshes
+         try {
+           Mockito.doAnswer(
+@@ -150,15 +158,59 @@ public void testInternalNameService() throws Exception {
+     conf.set(DFSConfigKeys.DFS_INTERNAL_NAMESERVICES_KEY, "ns1");
+     bpm.refreshNamenodes(conf);
+     assertEquals("create #1\n", log.toString());
+-    @SuppressWarnings("unchecked")
+-    Map<String, BPOfferService> map = (Map<String, BPOfferService>) Whitebox
+-            .getInternalState(bpm, "bpByNameserviceId");
++    Map<String, BPOfferService> map = bpm.getBpByNameserviceId();
+     Assert.assertFalse(map.containsKey("ns2"));
+     Assert.assertFalse(map.containsKey("ns3"));
+     Assert.assertTrue(map.containsKey("ns1"));
+     log.setLength(0);
+   }
+ 
++  @Test
++  public void testNameServiceNeedToBeResolved() throws Exception {
++    Configuration conf = new Configuration();
++    conf.set(DFSConfigKeys.DFS_NAMESERVICES, "ns1,ns2,ns3");
++    addNN(conf, "ns1", "mock1:8020");
++    addNN(conf, "ns2", "mock1:8020");
++    addNN(conf, "ns3", MockDomainNameResolver.DOMAIN + ":8020");
++    addDNSSettings(conf, "ns3");
++    bpm.refreshNamenodes(conf);
++    assertEquals(
++        "create #1\n" +
++            "create #2\n" +
++            "create #3\n", log.toString());
++    Map<String, BPOfferService> map = bpm.getBpByNameserviceId();
++    Assert.assertTrue(map.containsKey("ns1"));
++    Assert.assertTrue(map.containsKey("ns2"));
++    Assert.assertTrue(map.containsKey("ns3"));
++    Assert.assertEquals(2, map.get("ns3").getBPServiceActors().size());
++    Assert.assertEquals("ns3-" +  MockDomainNameResolver.FQDN_1 + "-8020",
++        map.get("ns3").getBPServiceActors().get(0).getNnId());
++    Assert.assertEquals("ns3-" +  MockDomainNameResolver.FQDN_2 + "-8020",
++        map.get("ns3").getBPServiceActors().get(1).getNnId());
++    Assert.assertEquals(
++        new InetSocketAddress(MockDomainNameResolver.FQDN_1, 8020),
++        map.get("ns3").getBPServiceActors().get(0).getNNSocketAddress());
++    Assert.assertEquals(
++        new InetSocketAddress(MockDomainNameResolver.FQDN_2, 8020),
++        map.get("ns3").getBPServiceActors().get(1).getNNSocketAddress());
++    log.setLength(0);
++  }
++
++
++  /**
++   * Add more DNS related settings to the passed in configuration.
++   * @param config Configuration file to add settings to.
++   */
++  private void addDNSSettings(Configuration config,
++      String nameservice) {
++    config.setBoolean(
++        DFSConfigKeys.DFS_NAMESERVICES_RESOLUTION_ENABLED + "."
++            + nameservice, true);
++    config.set(
++        DFSConfigKeys.DFS_NAMESERVICES_RESOLVER_IMPL + "." + nameservice,
++        MockDomainNameResolver.class.getName());
++  }
++
+   private static void addNN(Configuration conf, String ns, String addr) {
+     String key = DFSUtil.addKeySuffixes(
+         DFSConfigKeys.DFS_NAMENODE_RPC_ADDRESS_KEY, ns);

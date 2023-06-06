@@ -1,0 +1,459 @@
+
+
+package org.apache.hadoop.ipc;
+
+import java.io.IOException;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.InvocationTargetException;
+import java.util.AbstractQueue;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Iterator;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.CommonConfigurationKeys;
+import org.apache.hadoop.ipc.protobuf.RpcHeaderProtos.RpcResponseHeaderProto.RpcStatusProto;
+
+import org.apache.hadoop.security.UserGroupInformation;
+import org.apache.hadoop.thirdparty.com.google.common.annotations.VisibleForTesting;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+
+public class CallQueueManager<E extends Schedulable>
+    extends AbstractQueue<E> implements BlockingQueue<E> {
+  public static final Logger LOG =
+      LoggerFactory.getLogger(CallQueueManager.class);
+  
+  private static final int CHECKPOINT_NUM = 20;
+  
+  private static final long CHECKPOINT_INTERVAL_MS = 10;
+
+  @SuppressWarnings("unchecked")
+  static <E> Class<? extends BlockingQueue<E>> convertQueueClass(
+      Class<?> queueClass, Class<E> elementClass) {
+    return (Class<? extends BlockingQueue<E>>)queueClass;
+  }
+
+  @SuppressWarnings("unchecked")
+  static Class<? extends RpcScheduler> convertSchedulerClass(
+      Class<?> schedulerClass) {
+    return (Class<? extends RpcScheduler>)schedulerClass;
+  }
+
+  private volatile boolean clientBackOffEnabled;
+  private boolean serverFailOverEnabled;
+
+  
+  
+  private final AtomicReference<BlockingQueue<E>> putRef;
+  private final AtomicReference<BlockingQueue<E>> takeRef;
+
+  private RpcScheduler scheduler;
+
+  public CallQueueManager(Class<? extends BlockingQueue<E>> backingClass,
+                          Class<? extends RpcScheduler> schedulerClass,
+      boolean clientBackOffEnabled, int maxQueueSize, String namespace,
+      Configuration conf) {
+    int priorityLevels = parseNumLevels(namespace, conf);
+    this.scheduler = createScheduler(schedulerClass, priorityLevels,
+        namespace, conf);
+    int[] capacityWeights = parseCapacityWeights(priorityLevels,
+        namespace, conf);
+    BlockingQueue<E> bq = createCallQueueInstance(backingClass,
+        priorityLevels, maxQueueSize, namespace, capacityWeights, conf);
+    this.clientBackOffEnabled = clientBackOffEnabled;
+    this.serverFailOverEnabled = conf.getBoolean(
+        namespace + "." +
+        CommonConfigurationKeys.IPC_CALLQUEUE_SERVER_FAILOVER_ENABLE,
+        CommonConfigurationKeys.IPC_CALLQUEUE_SERVER_FAILOVER_ENABLE_DEFAULT);
+    this.putRef = new AtomicReference<BlockingQueue<E>>(bq);
+    this.takeRef = new AtomicReference<BlockingQueue<E>>(bq);
+    LOG.info("Using callQueue: {}, queueCapacity: {}, " +
+        "scheduler: {}, ipcBackoff: {}.",
+        backingClass, maxQueueSize, schedulerClass, clientBackOffEnabled);
+  }
+
+  @VisibleForTesting 
+  CallQueueManager(BlockingQueue<E> queue, RpcScheduler scheduler,
+      boolean clientBackOffEnabled, boolean serverFailOverEnabled) {
+    this.putRef = new AtomicReference<BlockingQueue<E>>(queue);
+    this.takeRef = new AtomicReference<BlockingQueue<E>>(queue);
+    this.scheduler = scheduler;
+    this.clientBackOffEnabled = clientBackOffEnabled;
+    this.serverFailOverEnabled = serverFailOverEnabled;
+  }
+
+  private static <T extends RpcScheduler> T createScheduler(
+      Class<T> theClass, int priorityLevels, String ns, Configuration conf) {
+    
+    try {
+      Constructor<T> ctor = theClass.getDeclaredConstructor(int.class,
+          String.class, Configuration.class);
+      return ctor.newInstance(priorityLevels, ns, conf);
+    } catch (RuntimeException e) {
+      throw e;
+    } catch (InvocationTargetException e) {
+      throw new RuntimeException(theClass.getName()
+          + " could not be constructed.", e.getCause());
+    } catch (Exception e) {
+    }
+
+    try {
+      Constructor<T> ctor = theClass.getDeclaredConstructor(int.class);
+      return ctor.newInstance(priorityLevels);
+    } catch (RuntimeException e) {
+      throw e;
+    } catch (InvocationTargetException e) {
+      throw new RuntimeException(theClass.getName()
+          + " could not be constructed.", e.getCause());
+    } catch (Exception e) {
+    }
+
+    
+    try {
+      Constructor<T> ctor = theClass.getDeclaredConstructor();
+      return ctor.newInstance();
+    } catch (RuntimeException e) {
+      throw e;
+    } catch (InvocationTargetException e) {
+      throw new RuntimeException(theClass.getName()
+          + " could not be constructed.", e.getCause());
+    } catch (Exception e) {
+    }
+
+    
+    throw new RuntimeException(theClass.getName() +
+        " could not be constructed.");
+  }
+
+  private <T extends BlockingQueue<E>> T createCallQueueInstance(
+      Class<T> theClass, int priorityLevels, int maxLen, String ns,
+      int[] capacityWeights, Configuration conf) {
+
+    
+    try {
+      Constructor<T> ctor = theClass.getDeclaredConstructor(int.class,
+          int.class, String.class, int[].class, Configuration.class);
+      return ctor.newInstance(priorityLevels, maxLen, ns,
+          capacityWeights, conf);
+    } catch (RuntimeException e) {
+      throw e;
+    } catch (InvocationTargetException e) {
+      throw new RuntimeException(theClass.getName()
+          + " could not be constructed.", e.getCause());
+    } catch (Exception e) {
+    }
+
+    
+    try {
+      Constructor<T> ctor = theClass.getDeclaredConstructor(int.class);
+      return ctor.newInstance(maxLen);
+    } catch (RuntimeException e) {
+      throw e;
+    } catch (InvocationTargetException e) {
+      throw new RuntimeException(theClass.getName()
+          + " could not be constructed.", e.getCause());
+    } catch (Exception e) {
+    }
+
+    
+    try {
+      Constructor<T> ctor = theClass.getDeclaredConstructor();
+      return ctor.newInstance();
+    } catch (RuntimeException e) {
+      throw e;
+    } catch (InvocationTargetException e) {
+      throw new RuntimeException(theClass.getName()
+          + " could not be constructed.", e.getCause());
+    } catch (Exception e) {
+    }
+
+    
+    throw new RuntimeException(theClass.getName() +
+      " could not be constructed.");
+  }
+
+  boolean isClientBackoffEnabled() {
+    return clientBackOffEnabled;
+  }
+
+  
+  boolean shouldBackOff(Schedulable e) {
+    return scheduler.shouldBackOff(e);
+  }
+
+  void addResponseTime(String name, Schedulable e, ProcessingDetails details) {
+    scheduler.addResponseTime(name, e, details);
+  }
+
+  
+  int getPriorityLevel(Schedulable e) {
+    return scheduler.getPriorityLevel(e);
+  }
+
+  int getPriorityLevel(UserGroupInformation user) {
+    if (scheduler instanceof DecayRpcScheduler) {
+      return ((DecayRpcScheduler)scheduler).getPriorityLevel(user);
+    }
+    return 0;
+  }
+
+  void setPriorityLevel(UserGroupInformation user, int priority) {
+    if (scheduler instanceof DecayRpcScheduler) {
+      ((DecayRpcScheduler)scheduler).setPriorityLevel(user, priority);
+    }
+  }
+
+  void setClientBackoffEnabled(boolean value) {
+    clientBackOffEnabled = value;
+  }
+
+  
+  @Override
+  public void put(E e) throws InterruptedException {
+    if (!isClientBackoffEnabled()) {
+      putRef.get().put(e);
+    } else if (shouldBackOff(e)) {
+      throwBackoff();
+    } else {
+      
+      addInternal(e, false);
+    }
+  }
+
+  @Override
+  public boolean add(E e) {
+    return addInternal(e, true);
+  }
+
+  @VisibleForTesting
+  boolean addInternal(E e, boolean checkBackoff) {
+    if (checkBackoff && isClientBackoffEnabled() && shouldBackOff(e)) {
+      throwBackoff();
+    }
+    try {
+      return putRef.get().add(e);
+    } catch (CallQueueOverflowException ex) {
+      
+      
+      throw ex;
+    } catch (IllegalStateException ise) {
+      throwBackoff();
+    }
+    return true;
+  }
+
+  
+  private void throwBackoff() throws IllegalStateException {
+    throw serverFailOverEnabled ?
+        CallQueueOverflowException.FAILOVER :
+        CallQueueOverflowException.DISCONNECT;
+  }
+
+  
+  @Override
+  public boolean offer(E e) {
+    return putRef.get().offer(e);
+  }
+
+  @Override
+  public boolean offer(E e, long timeout, TimeUnit unit)
+      throws InterruptedException {
+    return putRef.get().offer(e, timeout, unit);
+  }
+
+  @Override
+  public E peek() {
+    return takeRef.get().peek();
+  }
+
+  @Override
+  public E poll() {
+    return takeRef.get().poll();
+  }
+
+  @Override
+  public E poll(long timeout, TimeUnit unit) throws InterruptedException {
+    return takeRef.get().poll(timeout, unit);
+  }
+
+  
+  @Override
+  public E take() throws InterruptedException {
+    E e = null;
+
+    while (e == null) {
+      e = takeRef.get().poll(1000L, TimeUnit.MILLISECONDS);
+    }
+
+    return e;
+  }
+
+  @Override
+  public int size() {
+    return takeRef.get().size();
+  }
+
+  @Override
+  public int remainingCapacity() {
+    return takeRef.get().remainingCapacity();
+  }
+
+  
+  @SuppressWarnings("deprecation")
+  private static int parseNumLevels(String ns, Configuration conf) {
+    
+    
+    
+    int retval = conf.getInt(ns + "." +
+        FairCallQueue.IPC_CALLQUEUE_PRIORITY_LEVELS_KEY, 0);
+    if (retval == 0) { 
+      retval = conf.getInt(ns + "." +
+          CommonConfigurationKeys.IPC_SCHEDULER_PRIORITY_LEVELS_KEY,
+          CommonConfigurationKeys.IPC_SCHEDULER_PRIORITY_LEVELS_DEFAULT_KEY);
+    } else {
+      LOG.warn(ns + "." + FairCallQueue.IPC_CALLQUEUE_PRIORITY_LEVELS_KEY +
+          " is deprecated. Please use " + ns + "." +
+          CommonConfigurationKeys.IPC_SCHEDULER_PRIORITY_LEVELS_KEY + ".");
+    }
+    if(retval < 1) {
+      throw new IllegalArgumentException("numLevels must be at least 1");
+    }
+    return retval;
+  }
+
+  
+  private static int[] parseCapacityWeights(
+      int priorityLevels, String ns, Configuration conf) {
+    int[] weights = conf.getInts(ns + "." +
+      CommonConfigurationKeys.IPC_CALLQUEUE_CAPACITY_WEIGHTS_KEY);
+    if (weights.length == 0) {
+      weights = getDefaultQueueCapacityWeights(priorityLevels);
+    } else if (weights.length != priorityLevels) {
+      throw new IllegalArgumentException(
+          CommonConfigurationKeys.IPC_CALLQUEUE_CAPACITY_WEIGHTS_KEY + " must "
+              + "specify " + priorityLevels + " capacity weights: one for each "
+              + "priority level");
+    } else {
+      
+      for (int w : weights) {
+        if (w <= 0) {
+          throw new IllegalArgumentException(
+              CommonConfigurationKeys.IPC_CALLQUEUE_CAPACITY_WEIGHTS_KEY +
+                  " only takes positive weights. " + w + " capacity weight " +
+                  "found");
+        }
+      }
+    }
+    return weights;
+  }
+
+  
+  public static int[] getDefaultQueueCapacityWeights(int priorityLevels) {
+    int[] weights = new int[priorityLevels];
+    Arrays.fill(weights, 1);
+    return weights;
+  }
+
+  
+  public synchronized void swapQueue(
+      Class<? extends RpcScheduler> schedulerClass,
+      Class<? extends BlockingQueue<E>> queueClassToUse, int maxSize,
+      String ns, Configuration conf) {
+    int priorityLevels = parseNumLevels(ns, conf);
+    this.scheduler.stop();
+    RpcScheduler newScheduler = createScheduler(schedulerClass, priorityLevels,
+        ns, conf);
+    int[] capacityWeights = parseCapacityWeights(priorityLevels, ns, conf);
+    BlockingQueue<E> newQ = createCallQueueInstance(queueClassToUse,
+        priorityLevels, maxSize, ns, capacityWeights, conf);
+
+    
+    BlockingQueue<E> oldQ = putRef.get();
+
+    
+    putRef.set(newQ);
+
+    
+    while (!queueIsReallyEmpty(oldQ)) {}
+
+    
+    takeRef.set(newQ);
+
+    this.scheduler = newScheduler;
+
+    LOG.info("Old Queue: " + stringRepr(oldQ) + ", " +
+      "Replacement: " + stringRepr(newQ));
+  }
+
+  
+  private boolean queueIsReallyEmpty(BlockingQueue<?> q) {
+    for (int i = 0; i < CHECKPOINT_NUM; i++) {
+      try {
+        Thread.sleep(CHECKPOINT_INTERVAL_MS);
+      } catch (InterruptedException ie) {
+        return false;
+      }
+      if (!q.isEmpty()) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private String stringRepr(Object o) {
+    return o.getClass().getName() + '@' + Integer.toHexString(o.hashCode());
+  }
+
+  @Override
+  public int drainTo(Collection<? super E> c) {
+    return takeRef.get().drainTo(c);
+  }
+
+  @Override
+  public int drainTo(Collection<? super E> c, int maxElements) {
+    return takeRef.get().drainTo(c, maxElements);
+  }
+
+  @Override
+  public Iterator<E> iterator() {
+    return takeRef.get().iterator();
+  }
+
+  
+  
+  
+  @SuppressWarnings("serial")
+  static class CallQueueOverflowException extends IllegalStateException {
+    private static String TOO_BUSY = "Server too busy";
+    static final CallQueueOverflowException KEEPALIVE =
+        new CallQueueOverflowException(
+            new RetriableException(TOO_BUSY),
+            RpcStatusProto.ERROR);
+    static final CallQueueOverflowException DISCONNECT =
+        new CallQueueOverflowException(
+            new RetriableException(TOO_BUSY + " - disconnecting"),
+            RpcStatusProto.FATAL);
+    static final CallQueueOverflowException FAILOVER =
+        new CallQueueOverflowException(
+            new StandbyException(TOO_BUSY + " - disconnect and failover"),
+            RpcStatusProto.FATAL);
+    CallQueueOverflowException(final IOException ioe,
+        final RpcStatusProto status) {
+      super("Queue full", new RpcServerException(ioe.getMessage(), ioe){
+        @Override
+        public RpcStatusProto getRpcStatusProto() {
+          return status;
+        }
+      });
+    }
+    @Override
+    public IOException getCause() {
+      return (IOException)super.getCause();
+    }
+  }
+}

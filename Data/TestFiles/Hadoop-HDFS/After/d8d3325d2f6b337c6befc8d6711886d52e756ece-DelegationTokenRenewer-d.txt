@@ -1,0 +1,227 @@
+
+
+package org.apache.hadoop.fs;
+
+import org.apache.hadoop.classification.VisibleForTesting;
+
+import java.io.IOException;
+import java.lang.ref.WeakReference;
+import java.util.concurrent.DelayQueue;
+import java.util.concurrent.Delayed;
+import java.util.concurrent.TimeUnit;
+
+import org.apache.hadoop.classification.InterfaceAudience;
+import org.apache.hadoop.security.token.Token;
+import org.apache.hadoop.security.token.TokenIdentifier;
+import org.apache.hadoop.util.Time;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+
+@InterfaceAudience.Private
+public class DelegationTokenRenewer
+    extends Thread {
+  private static final Logger LOG = LoggerFactory
+      .getLogger(DelegationTokenRenewer.class);
+
+  
+  public interface Renewable {
+    
+    public Token<?> getRenewToken();
+
+    
+    public <T extends TokenIdentifier> void setDelegationToken(Token<T> token);
+  }
+
+  
+  public static class RenewAction<T extends FileSystem & Renewable>
+      implements Delayed {
+    
+    private long renewalTime;
+    
+    private final WeakReference<T> weakFs;
+    private Token<?> token; 
+    boolean isValid = true;
+
+    private RenewAction(final T fs) {
+      this.weakFs = new WeakReference<T>(fs);
+      this.token = fs.getRenewToken();
+      updateRenewalTime(renewCycle);
+    }
+ 
+    public boolean isValid() {
+      return isValid;
+    }
+    
+    
+    @Override
+    public long getDelay(final TimeUnit unit) {
+      final long millisLeft = renewalTime - Time.now();
+      return unit.convert(millisLeft, TimeUnit.MILLISECONDS);
+    }
+
+    @Override
+    public int compareTo(final Delayed delayed) {
+      final RenewAction<?> that = (RenewAction<?>)delayed;
+      return this.renewalTime < that.renewalTime? -1
+          : this.renewalTime == that.renewalTime? 0: 1;
+    }
+
+    @Override
+    public int hashCode() {
+      return token.hashCode();
+    }
+
+    @Override
+    public boolean equals(final Object that) {
+      if (this == that) {
+        return true;
+      } else if (!(that instanceof RenewAction)) {
+        return false;
+      }
+      return token.equals(((RenewAction<?>)that).token);
+    }
+
+    
+    private void updateRenewalTime(long delay) {
+      renewalTime = Time.now() + delay - delay/10;
+    }
+
+    
+    private boolean renew() throws IOException, InterruptedException {
+      final T fs = weakFs.get();
+      final boolean b = fs != null;
+      if (b) {
+        synchronized(fs) {
+          try {
+            long expires = token.renew(fs.getConf());
+            updateRenewalTime(expires - Time.now());
+          } catch (IOException ie) {
+            try {
+              Token<?>[] tokens = fs.addDelegationTokens(null, null);
+              if (tokens.length == 0) {
+                throw new IOException("addDelegationTokens returned no tokens");
+              }
+              token = tokens[0];
+              updateRenewalTime(renewCycle);
+              fs.setDelegationToken(token);
+            } catch (IOException ie2) {
+              isValid = false;
+              throw new IOException("Can't renew or get new delegation token ", ie);
+            }
+          }
+        }
+      }
+      return b;
+    }
+
+    private void cancel() throws IOException, InterruptedException {
+      final T fs = weakFs.get();
+      if (fs != null) {
+        token.cancel(fs.getConf());
+      }
+    }
+
+    @Override
+    public String toString() {
+      Renewable fs = weakFs.get();
+      return fs == null? "evaporated token renew"
+          : "The token will be renewed in " + getDelay(TimeUnit.SECONDS)
+            + " secs, renewToken=" + token;
+    }
+  }
+
+  
+  private static final long RENEW_CYCLE = 24 * 60 * 60 * 1000; 
+
+  @InterfaceAudience.Private
+  @VisibleForTesting
+  public static long renewCycle = RENEW_CYCLE;
+
+  
+  private volatile DelayQueue<RenewAction<?>> queue = new DelayQueue<RenewAction<?>>();
+  
+  
+  @VisibleForTesting
+  protected int getRenewQueueLength() {
+    return queue.size();
+  }
+
+  
+  private static DelegationTokenRenewer INSTANCE = null;
+
+  private DelegationTokenRenewer(final Class<? extends FileSystem> clazz) {
+    super(clazz.getSimpleName() + "-" + DelegationTokenRenewer.class.getSimpleName());
+    setDaemon(true);
+  }
+
+  public static synchronized DelegationTokenRenewer getInstance() {
+    if (INSTANCE == null) {
+      INSTANCE = new DelegationTokenRenewer(FileSystem.class);
+    }
+    return INSTANCE;
+  }
+
+  @VisibleForTesting
+  static synchronized void reset() {
+    if (INSTANCE != null) {
+      INSTANCE.queue.clear();
+      INSTANCE.interrupt();
+      try {
+        INSTANCE.join();
+      } catch (InterruptedException e) {
+        LOG.warn("Failed to reset renewer");
+      } finally {
+        INSTANCE = null;
+      }
+    }
+  }
+  
+  
+  @SuppressWarnings("static-access")
+  public <T extends FileSystem & Renewable> RenewAction<T> addRenewAction(final T fs) {
+    synchronized (this) {
+      if (!isAlive()) {
+        start();
+      }
+    }
+    RenewAction<T> action = new RenewAction<T>(fs);
+    if (action.token != null) {
+      queue.add(action);
+    } else {
+      FileSystem.LOG.error("does not have a token for renewal");
+    }
+    return action;
+  }
+
+  
+  public <T extends FileSystem & Renewable> void removeRenewAction(
+      final T fs) throws IOException {
+    RenewAction<T> action = new RenewAction<T>(fs);
+    if (queue.remove(action)) {
+      try {
+        action.cancel();
+      } catch (InterruptedException ie) {
+        LOG.error("Interrupted while canceling token for {} filesystem.", fs.getUri());
+        LOG.debug("Exception in removeRenewAction.", ie);
+      }
+    }
+  }
+
+  @Override
+  public void run() {
+    for(;;) {
+      RenewAction<?> action = null;
+      try {
+        action = queue.take();
+        if (action.renew()) {
+          queue.add(action);
+        }
+      } catch (InterruptedException ie) {
+        return;
+      } catch (Exception ie) {
+        FileSystem.LOG.warn("Failed to renew token, action=" + action, ie);
+      }
+    }
+  }
+}

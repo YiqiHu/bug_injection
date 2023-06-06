@@ -1,0 +1,130 @@
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/DirectoryWithQuotaFeature.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/DirectoryWithQuotaFeature.java
+index 9597c6aeeb36..cddefd35afd1 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/DirectoryWithQuotaFeature.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/DirectoryWithQuotaFeature.java
+@@ -176,6 +176,11 @@ void setSpaceConsumed(QuotaCounts c) {
+     usage.setTypeSpaces(c.getTypeSpaces());
+   }
+ 
++  /** @return the namespace and storagespace and typespace allowed. */
++  public QuotaCounts getSpaceAllowed() {
++    return new QuotaCounts.Builder().quotaCount(quota).build();
++  }
++
+   /** @return the namespace and storagespace and typespace consumed. */
+   public QuotaCounts getSpaceConsumed() {
+     return new QuotaCounts.Builder().quotaCount(usage).build();
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/Snapshot.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/Snapshot.java
+index 3e78c82ea310..20d6de53253b 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/Snapshot.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/Snapshot.java
+@@ -24,17 +24,18 @@
+ import java.util.Arrays;
+ import java.util.Comparator;
+ import java.util.Date;
+-import java.util.stream.Collectors;
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hdfs.DFSUtil;
+ import org.apache.hadoop.hdfs.protocol.HdfsConstants;
+ import org.apache.hadoop.hdfs.server.namenode.AclFeature;
+ import org.apache.hadoop.hdfs.server.namenode.ContentSummaryComputationContext;
++import org.apache.hadoop.hdfs.server.namenode.DirectoryWithQuotaFeature;
+ import org.apache.hadoop.hdfs.server.namenode.FSImageFormat;
+ import org.apache.hadoop.hdfs.server.namenode.FSImageSerialization;
+ import org.apache.hadoop.hdfs.server.namenode.INode;
+ import org.apache.hadoop.hdfs.server.namenode.INodeDirectory;
++import org.apache.hadoop.hdfs.server.namenode.QuotaCounts;
+ import org.apache.hadoop.hdfs.server.namenode.XAttrFeature;
+ import org.apache.hadoop.hdfs.util.ReadOnlyList;
+ 
+@@ -151,15 +152,26 @@ static Snapshot read(DataInput in, FSImageFormat.Loader loader)
+   /** The root directory of the snapshot. */
+   static public class Root extends INodeDirectory {
+     Root(INodeDirectory other) {
+-      // Always preserve ACL, XAttr.
+-      super(other, false, Arrays.asList(other.getFeatures()).stream().filter(
+-          input -> {
+-            if (AclFeature.class.isInstance(input)
+-                || XAttrFeature.class.isInstance(input)) {
+-              return true;
++      // Always preserve ACL, XAttr and Quota.
++      super(other, false,
++          Arrays.stream(other.getFeatures()).filter(feature ->
++              feature instanceof AclFeature
++                  || feature instanceof XAttrFeature
++                  || feature instanceof DirectoryWithQuotaFeature
++          ).map(feature -> {
++            if (feature instanceof DirectoryWithQuotaFeature) {
++              // Return copy if feature is quota because a ref could be updated
++              final QuotaCounts quota =
++                  ((DirectoryWithQuotaFeature) feature).getSpaceAllowed();
++              return new DirectoryWithQuotaFeature.Builder()
++                  .nameSpaceQuota(quota.getNameSpace())
++                  .storageSpaceQuota(quota.getStorageSpace())
++                  .typeQuotas(quota.getTypeSpaces())
++                  .build();
++            } else {
++              return feature;
+             }
+-            return false;
+-          }).collect(Collectors.toList()).toArray(new Feature[0]));
++          }).toArray(Feature[]::new));
+     }
+ 
+     boolean isMarkedAsDeleted() {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/snapshot/TestSnapshotDiffReport.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/snapshot/TestSnapshotDiffReport.java
+index 18ec3c581d50..b16bcb90d38d 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/snapshot/TestSnapshotDiffReport.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/snapshot/TestSnapshotDiffReport.java
+@@ -813,6 +813,24 @@ public void testDiffReport2() throws Exception {
+         new DiffReportEntry(DiffType.DELETE, DFSUtil.string2Bytes("subsub1")));
+   }
+ 
++  @Test
++  public void testDiffReportWithQuota() throws Exception {
++    final Path testdir = new Path(sub1, "testdir1");
++    hdfs.mkdirs(testdir);
++    hdfs.allowSnapshot(testdir);
++    // Set quota BEFORE creating the snapshot
++    hdfs.setQuota(testdir, 10, 10);
++    hdfs.createSnapshot(testdir, "s0");
++    final SnapshotDiffReport report =
++        hdfs.getSnapshotDiffReport(testdir, "s0", "");
++    // The diff should be null. Snapshot dir inode should keep the quota.
++    Assert.assertEquals(0, report.getDiffList().size());
++    // Cleanup
++    hdfs.deleteSnapshot(testdir, "s0");
++    hdfs.disallowSnapshot(testdir);
++    hdfs.delete(testdir, true);
++  }
++
+   /**
+    * Rename a directory to its prior descendant, and verify the diff report.
+    */
+@@ -1005,7 +1023,6 @@ public void testDiffReportWithRenameAndSnapshotDeletion() throws Exception {
+ 
+     // we always put modification on the file before rename
+     verifyDiffReport(root, "s1", "",
+-        new DiffReportEntry(DiffType.MODIFY, DFSUtil.string2Bytes("")),
+         new DiffReportEntry(DiffType.MODIFY, DFSUtil.string2Bytes("foo2")),
+         new DiffReportEntry(DiffType.RENAME, DFSUtil.string2Bytes("foo2/bar"),
+             DFSUtil.string2Bytes("foo2/bar-new")));
+@@ -1091,8 +1108,7 @@ public void testDiffReportWithOpenFiles() throws Exception {
+         new DiffReportEntry(DiffType.MODIFY,
+             DFSUtil.string2Bytes(flumeFileName)));
+ 
+-    verifyDiffReport(level0A, flumeSnap2Name, "",
+-        new DiffReportEntry(DiffType.MODIFY, DFSUtil.string2Bytes("")));
++    verifyDiffReport(level0A, flumeSnap2Name, "");
+ 
+     verifyDiffReport(level0A, flumeSnap1Name, flumeSnap2Name,
+         new DiffReportEntry(DiffType.MODIFY, DFSUtil.string2Bytes("")),
+@@ -1128,7 +1144,6 @@ public void testDiffReportWithOpenFiles() throws Exception {
+             DFSUtil.string2Bytes(flumeFileName)));
+ 
+     verifyDiffReport(level0A, flumeSnap2Name, "",
+-        new DiffReportEntry(DiffType.MODIFY, DFSUtil.string2Bytes("")),
+         new DiffReportEntry(DiffType.MODIFY,
+             DFSUtil.string2Bytes(flumeFileName)));
+ 

@@ -1,0 +1,421 @@
+
+
+package org.apache.hadoop.fs.s3a.impl;
+
+import javax.annotation.Nullable;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.stream.Collectors;
+
+import com.amazonaws.services.s3.model.DeleteObjectsRequest;
+import com.amazonaws.services.s3.model.DeleteObjectsResult;
+import org.apache.hadoop.thirdparty.com.google.common.util.concurrent.ListeningExecutorService;
+import org.apache.hadoop.thirdparty.com.google.common.util.concurrent.MoreExecutors;;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.PathIsNotEmptyDirectoryException;
+import org.apache.hadoop.fs.RemoteIterator;
+import org.apache.hadoop.fs.s3a.Invoker;
+import org.apache.hadoop.fs.s3a.Retries;
+import org.apache.hadoop.fs.s3a.S3AFileStatus;
+import org.apache.hadoop.fs.s3a.S3ALocatedFileStatus;
+import org.apache.hadoop.fs.s3a.Tristate;
+import org.apache.hadoop.fs.s3a.s3guard.BulkOperationState;
+import org.apache.hadoop.fs.s3a.s3guard.MetadataStore;
+import org.apache.hadoop.fs.s3a.s3guard.S3Guard;
+import org.apache.hadoop.io.IOUtils;
+import org.apache.hadoop.util.DurationInfo;
+
+import static org.apache.hadoop.thirdparty.com.google.common.base.Preconditions.checkArgument;
+import static org.apache.hadoop.fs.s3a.impl.CallableSupplier.maybeAwaitCompletion;
+import static org.apache.hadoop.fs.s3a.impl.CallableSupplier.submit;
+
+
+public class DeleteOperation extends ExecutingStoreOperation<Boolean> {
+
+  private static final Logger LOG = LoggerFactory.getLogger(
+      DeleteOperation.class);
+
+  
+  private final S3AFileStatus status;
+
+  
+  private final boolean recursive;
+
+  
+  private final OperationCallbacks callbacks;
+
+  
+  private final int pageSize;
+
+  
+  private final MetadataStore metadataStore;
+
+  
+  private final ListeningExecutorService executor;
+
+  
+  private List<DeleteEntry> keys;
+
+  
+  private List<Path> paths;
+
+  
+  private CompletableFuture<Void> deleteFuture;
+
+  
+  private BulkOperationState operationState;
+
+  
+  private long filesDeleted;
+
+  
+  private long extraFilesDeleted;
+
+  
+  public DeleteOperation(final StoreContext context,
+      final S3AFileStatus status,
+      final boolean recursive,
+      final OperationCallbacks callbacks,
+      final int pageSize) {
+
+    super(context);
+    this.status = status;
+    this.recursive = recursive;
+    this.callbacks = callbacks;
+    checkArgument(pageSize > 0
+            && pageSize <= InternalConstants.MAX_ENTRIES_TO_DELETE,
+        "page size out of range: %s", pageSize);
+    this.pageSize = pageSize;
+    metadataStore = context.getMetadataStore();
+    executor = MoreExecutors.listeningDecorator(
+        context.createThrottledExecutor(1));
+  }
+
+  public long getFilesDeleted() {
+    return filesDeleted;
+  }
+
+  public long getExtraFilesDeleted() {
+    return extraFilesDeleted;
+  }
+
+  
+  @Retries.RetryTranslated
+  public Boolean execute() throws IOException {
+    executeOnlyOnce();
+
+    StoreContext context = getStoreContext();
+    Path path = status.getPath();
+    LOG.debug("Delete path {} - recursive {}", path, recursive);
+    LOG.debug("Type = {}",
+        status.isFile() ? "File"
+            : (status.isEmptyDirectory() == Tristate.TRUE
+                ? "Empty Directory"
+                : "Directory"));
+
+    String key = context.pathToKey(path);
+    if (status.isDirectory()) {
+      LOG.debug("delete: Path is a directory: {}", path);
+      checkArgument(
+          status.isEmptyDirectory() != Tristate.UNKNOWN,
+          "File status must have directory emptiness computed");
+
+      if (!key.endsWith("/")) {
+        key = key + "/";
+      }
+
+      if ("/".equals(key)) {
+        LOG.error("S3A: Cannot delete the root directory."
+                + " Path: {}. Recursive: {}",
+            status.getPath(), recursive);
+        return false;
+      }
+
+      if (!recursive && status.isEmptyDirectory() == Tristate.FALSE) {
+        throw new PathIsNotEmptyDirectoryException(path.toString());
+      }
+      if (status.isEmptyDirectory() == Tristate.TRUE) {
+        LOG.debug("deleting empty directory {}", path);
+        deleteObjectAtPath(path, key, false);
+      } else {
+        deleteDirectoryTree(path, key);
+      }
+
+    } else {
+      
+      LOG.debug("deleting simple file {}", path);
+      deleteObjectAtPath(path, key, true);
+    }
+    LOG.debug("Deleted {} objects", filesDeleted);
+    return true;
+  }
+
+  
+  @Retries.RetryTranslated
+  protected void deleteDirectoryTree(final Path path,
+      final String dirKey) throws IOException {
+    
+    
+    operationState = S3Guard.initiateBulkWrite(
+        metadataStore,
+        BulkOperationState.OperationType.Delete,
+        path);
+    try (DurationInfo ignored =
+             new DurationInfo(LOG, false, "deleting %s", dirKey)) {
+
+      
+      resetDeleteList();
+      deleteFuture = null;
+
+      
+      LOG.debug("Getting objects for directory prefix {} to delete", dirKey);
+      final RemoteIterator<S3ALocatedFileStatus> locatedFiles =
+          callbacks.listFilesAndDirectoryMarkers(path, status,
+              false, true);
+
+      
+      
+      
+      while (locatedFiles.hasNext()) {
+        
+        S3AFileStatus child = locatedFiles.next().toS3AFileStatus();
+        queueForDeletion(child);
+      }
+      LOG.debug("Deleting final batch of listed files");
+      submitNextBatch();
+      maybeAwaitCompletion(deleteFuture);
+
+      
+      
+      
+      
+      
+      
+      
+
+      if (callbacks.allowAuthoritative(path)) {
+        LOG.debug("Path is authoritatively guarded;"
+            + " listing files on S3 for completeness");
+        
+        final RemoteIterator<S3AFileStatus> objects =
+            callbacks.listObjects(path, dirKey);
+
+        
+        
+        
+        while (objects.hasNext()) {
+          
+          extraFilesDeleted++;
+          S3AFileStatus next = objects.next();
+          LOG.debug("Found Unlisted entry {}", next);
+          queueForDeletion(deletionKey(next), null,
+              next.isDirectory());
+        }
+        if (extraFilesDeleted > 0) {
+          LOG.debug("Raw S3 Scan found {} extra file(s) to delete",
+              extraFilesDeleted);
+          
+          
+          submitNextBatch();
+          maybeAwaitCompletion(deleteFuture);
+        }
+      }
+
+      
+      
+      try (DurationInfo ignored2 =
+               new DurationInfo(LOG, false, "Delete metastore")) {
+        metadataStore.deleteSubtree(path, operationState);
+      }
+    } finally {
+      IOUtils.cleanupWithLogger(LOG, operationState);
+    }
+    LOG.debug("Delete \"{}\" completed; deleted {} objects", path,
+        filesDeleted);
+  }
+
+  
+  private String deletionKey(final S3AFileStatus stat) {
+    return getStoreContext().fullKey(stat);
+  }
+
+  
+  private void queueForDeletion(
+      final S3AFileStatus stat) throws IOException {
+    queueForDeletion(deletionKey(stat), stat.getPath(), stat.isDirectory());
+  }
+
+  
+  private void queueForDeletion(final String key,
+      @Nullable final Path deletePath,
+      boolean isDirMarker) throws IOException {
+    LOG.debug("Adding object to delete: \"{}\"", key);
+    keys.add(new DeleteEntry(key, isDirMarker));
+    if (deletePath != null) {
+      if (!isDirMarker) {
+        paths.add(deletePath);
+      }
+    }
+
+    if (keys.size() == pageSize) {
+      submitNextBatch();
+    }
+  }
+
+  
+  private void submitNextBatch()
+      throws IOException {
+    
+    
+    maybeAwaitCompletion(deleteFuture);
+
+    
+    deleteFuture = submitDelete(keys, paths);
+    
+    resetDeleteList();
+  }
+
+  
+  private void resetDeleteList() {
+    keys = new ArrayList<>(pageSize);
+    paths = new ArrayList<>(pageSize);
+  }
+
+  
+  @Retries.RetryTranslated
+  private void deleteObjectAtPath(
+      final Path path,
+      final String key,
+      final boolean isFile)
+      throws IOException {
+    LOG.debug("delete: {} {}", (isFile ? "file" : "dir marker"), key);
+    filesDeleted++;
+    callbacks.deleteObjectAtPath(path, key, isFile, operationState);
+  }
+
+  
+  private CompletableFuture<Void> submitDelete(
+      final List<DeleteEntry> keyList,
+      final List<Path> pathList) {
+
+    if (keyList.isEmpty() && pathList.isEmpty()) {
+      return null;
+    }
+    filesDeleted += keyList.size();
+    return submit(executor, () -> {
+      asyncDeleteAction(operationState,
+          keyList,
+          pathList,
+          LOG.isDebugEnabled());
+      return null;
+    });
+  }
+
+  
+  @Retries.RetryTranslated
+  private void asyncDeleteAction(
+      final BulkOperationState state,
+      final List<DeleteEntry> keyList,
+      final List<Path> pathList,
+      final boolean auditDeletedKeys)
+      throws IOException {
+    List<DeleteObjectsResult.DeletedObject> deletedObjects = new ArrayList<>();
+    try (DurationInfo ignored =
+             new DurationInfo(LOG, false,
+                 "Delete page of %d keys", keyList.size())) {
+      DeleteObjectsResult result = null;
+      List<Path> undeletedObjects = new ArrayList<>();
+      if (!keyList.isEmpty()) {
+        
+        List<DeleteObjectsRequest.KeyVersion> files = keyList.stream()
+            .filter(e -> !e.isDirMarker)
+            .map(e -> e.keyVersion)
+            .collect(Collectors.toList());
+        LOG.debug("Deleting of {} file objects", files.size());
+        result = Invoker.once("Remove S3 Files",
+            status.getPath().toString(),
+            () -> callbacks.removeKeys(
+                files,
+                false,
+                undeletedObjects,
+                state,
+                !auditDeletedKeys));
+        if (result != null) {
+          deletedObjects.addAll(result.getDeletedObjects());
+        }
+        
+        List<DeleteObjectsRequest.KeyVersion> dirs = keyList.stream()
+            .filter(e -> e.isDirMarker)
+            .map(e -> e.keyVersion)
+            .collect(Collectors.toList());
+        LOG.debug("Deleting of {} directory markers", dirs.size());
+        
+        
+        result = Invoker.once("Remove S3 Dir Markers",
+            status.getPath().toString(),
+            () -> callbacks.removeKeys(
+                dirs,
+                true,
+                undeletedObjects,
+                state,
+                !auditDeletedKeys));
+        if (result != null) {
+          deletedObjects.addAll(result.getDeletedObjects());
+        }
+      }
+      if (!pathList.isEmpty()) {
+        
+        
+        
+        metadataStore.deletePaths(pathList, state);
+      }
+      if (auditDeletedKeys) {
+        
+        if (deletedObjects.size() != keyList.size()) {
+          
+          LOG.warn("Size mismatch in deletion operation. "
+                  + "Expected count of deleted files: {}; "
+                  + "actual: {}",
+              keyList.size(), deletedObjects.size());
+          
+          for (DeleteObjectsResult.DeletedObject del : deletedObjects) {
+            keyList.removeIf(kv -> kv.getKey().equals(del.getKey()));
+          }
+          for (DeleteEntry kv : keyList) {
+            LOG.debug("{}", kv.getKey());
+          }
+        }
+      }
+    }
+  }
+
+  
+  private static final class DeleteEntry {
+    private final DeleteObjectsRequest.KeyVersion keyVersion;
+
+    private final boolean isDirMarker;
+
+    private DeleteEntry(final String key, final boolean isDirMarker) {
+      this.keyVersion = new DeleteObjectsRequest.KeyVersion(key);
+      this.isDirMarker = isDirMarker;
+    }
+
+    public String getKey() {
+      return keyVersion.getKey();
+    }
+
+    @Override
+    public String toString() {
+      return "DeleteEntry{" +
+          "key='" + getKey() + '\'' +
+          ", isDirMarker=" + isDirMarker +
+          '}';
+    }
+  }
+
+}

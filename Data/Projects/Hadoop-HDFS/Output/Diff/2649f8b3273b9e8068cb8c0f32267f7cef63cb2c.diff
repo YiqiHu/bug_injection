@@ -1,0 +1,203 @@
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api/src/main/java/org/apache/hadoop/yarn/conf/YarnConfiguration.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api/src/main/java/org/apache/hadoop/yarn/conf/YarnConfiguration.java
+index be7cc89f5da7..63031df21fa1 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api/src/main/java/org/apache/hadoop/yarn/conf/YarnConfiguration.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api/src/main/java/org/apache/hadoop/yarn/conf/YarnConfiguration.java
+@@ -1241,7 +1241,12 @@ public static boolean isAclEnabled(Configuration conf) {
+   public static final String NM_DELETE_THREAD_COUNT = 
+     NM_PREFIX +  "delete.thread-count";
+   public static final int DEFAULT_NM_DELETE_THREAD_COUNT = 4;
+-  
++
++  public static final String NM_CONTAINER_EXECUTOR_EXIT_FILE_TIMEOUT =
++      NM_PREFIX + "container-executor.exit-code-file.timeout-ms";
++  public static final int DEFAULT_NM_CONTAINER_EXECUTOR_EXIT_FILE_TIMEOUT =
++      2000;
++
+   /** Keytab for NM.*/
+   public static final String NM_KEYTAB = NM_PREFIX + "keytab";
+   
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/resources/yarn-default.xml b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/resources/yarn-default.xml
+index 5277be40b098..2570e23ce6f5 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/resources/yarn-default.xml
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/resources/yarn-default.xml
+@@ -1151,6 +1151,15 @@
+     <value>4</value>
+   </property>
+ 
++  <property>
++    <description>
++      How long the container executor should wait for the exit code file to
++      appear after a reacquired container has exited.
++    </description>
++    <name>yarn.nodemanager.container-executor.exit-code-file.timeout-ms</name>
++    <value>2000</value>
++  </property>
++
+   <property>
+     <description>Max number of OPPORTUNISTIC containers to queue at the
+       nodemanager.</description>
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/ContainerExecutor.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/ContainerExecutor.java
+index e04520a29e0c..58a681f8e43d 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/ContainerExecutor.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/ContainerExecutor.java
+@@ -100,6 +100,8 @@ public abstract class ContainerExecutor implements Configurable {
+       new ConcurrentHashMap<>();
+   private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
+   private String[] whitelistVars;
++  private int exitCodeFileTimeout =
++      YarnConfiguration.DEFAULT_NM_CONTAINER_EXECUTOR_EXIT_FILE_TIMEOUT;
+ 
+   @Override
+   public void setConf(Configuration conf) {
+@@ -107,6 +109,9 @@ public void setConf(Configuration conf) {
+     if (conf != null) {
+       whitelistVars = conf.get(YarnConfiguration.NM_ENV_WHITELIST,
+           YarnConfiguration.DEFAULT_NM_ENV_WHITELIST).split(",");
++      exitCodeFileTimeout = conf.getInt(
++          YarnConfiguration.NM_CONTAINER_EXECUTOR_EXIT_FILE_TIMEOUT,
++          YarnConfiguration.DEFAULT_NM_CONTAINER_EXECUTOR_EXIT_FILE_TIMEOUT);
+     }
+   }
+ 
+@@ -323,7 +328,7 @@ public int reacquireContainer(ContainerReacquisitionContext ctx)
+ 
+     // wait for exit code file to appear
+     final int sleepMsec = 100;
+-    int msecLeft = 2000;
++    int msecLeft = this.exitCodeFileTimeout;
+     String exitCodeFile = ContainerLaunch.getExitCodeFile(pidPath.toString());
+     File file = new File(exitCodeFile);
+ 
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/TestContainerExecutor.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/TestContainerExecutor.java
+index c9f35c696687..8faa15c8f52c 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/TestContainerExecutor.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/TestContainerExecutor.java
+@@ -18,36 +18,53 @@
+ 
+ package org.apache.hadoop.yarn.server.nodemanager;
+ 
++import java.io.File;
++import java.io.IOException;
++import java.nio.charset.Charset;
+ import java.nio.file.Files;
+ import java.nio.file.Paths;
+ import java.util.Arrays;
+ import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
++import java.util.Timer;
++import java.util.TimerTask;
+ 
+ import com.google.common.collect.Lists;
+ import org.apache.commons.io.FileUtils;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.util.Shell;
++import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
++import org.apache.hadoop.yarn.api.records.ApplicationId;
++import org.apache.hadoop.yarn.api.records.ContainerId;
+ import org.apache.hadoop.yarn.api.records.Resource;
+ import org.apache.hadoop.yarn.conf.YarnConfiguration;
+ 
+ import org.apache.hadoop.yarn.server.nodemanager.containermanager.container.Container;
++import org.apache.hadoop.yarn.server.nodemanager.containermanager.launcher.ContainerLaunch;
+ import org.apache.hadoop.yarn.server.nodemanager.containermanager.runtime.ContainerExecutionException;
+ import org.apache.hadoop.yarn.server.nodemanager.executor.ContainerExecContext;
++import org.apache.hadoop.yarn.server.nodemanager.executor.ContainerReacquisitionContext;
+ import org.apache.hadoop.yarn.server.nodemanager.executor.ContainerReapContext;
+ import org.apache.hadoop.yarn.server.nodemanager.util.NodeManagerHardwareUtils;
+ import org.junit.Assert;
+ import org.junit.Test;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
+ 
+ import static org.apache.hadoop.test.PlatformAssumptions.assumeWindows;
+ import static org.junit.Assert.*;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.doReturn;
+ import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.spy;
+ import static org.mockito.Mockito.when;
+ 
+ @SuppressWarnings("deprecation")
+ public class TestContainerExecutor {
++  private static final Logger LOG =
++      LoggerFactory.getLogger(TestContainerExecutor.class);
+   
+   private ContainerExecutor containerExecutor = new DefaultContainerExecutor();
+ 
+@@ -213,4 +230,74 @@ public void testCleanupBeforeLaunch() throws Exception {
+     containerExecutor.cleanupBeforeRelaunch(container);
+     Assert.assertTrue(!Files.exists(linkName));
+   }
++
++  /**
++   * The timeout for waiting the exit code file is configured as 4 seconds,
++   * and the tests create it after 3 seconds. The CE should successfully
++   * reacquire the container.
++   * @throws Exception
++   */
++  @Test
++  public void testAcquireWithExitCodeTimeout() throws Exception {
++    ApplicationId appId = ApplicationId.newInstance(12345, 67890);
++    ApplicationAttemptId attemptId =
++        ApplicationAttemptId.newInstance(appId, 54321);
++    ContainerId cid = ContainerId.newContainerId(attemptId, 9876);
++
++    ContainerExecutor mockCE = spy(containerExecutor);
++
++    File root = new File(System.getProperty("test.build.data", "/tmp"));
++    File testDir = new File(root, TestContainerExecutor.class.getName())
++        .getAbsoluteFile();
++    File pidFile = new File(testDir, "pid");
++    Path pidPath = new Path(pidFile.toString());
++
++    doReturn(pidPath).when(mockCE).getPidFilePath(cid);
++    doReturn(false).when(mockCE).isContainerAlive(any());
++    doReturn(true).when(mockCE).isContainerActive(cid);
++
++    Configuration conf = new YarnConfiguration();
++    conf.setInt(YarnConfiguration.NM_CONTAINER_EXECUTOR_EXIT_FILE_TIMEOUT,
++        4000);
++    mockCE.setConf(conf);
++
++    String exitCodeFileString =
++        ContainerLaunch.getExitCodeFile(pidFile.toString());
++    File exitCodeFile = new File(exitCodeFileString);
++
++    Timer timer = new Timer();
++
++    try {
++      int writtenExitCode = 10;
++
++      FileUtils.writeStringToFile(pidFile, "2992",
++          Charset.defaultCharset(), false);
++
++      TimerTask task = new java.util.TimerTask() {
++        @Override
++        public void run() {
++          try {
++            FileUtils.writeStringToFile(exitCodeFile,
++                Integer.toString(writtenExitCode),
++                Charset.defaultCharset(), false);
++          } catch (IOException ioe) {
++            LOG.warn("Could not write pid file");
++          }
++        }
++      };
++      timer.schedule(task, 3000);
++
++      int returnCode = mockCE.reacquireContainer(
++          new ContainerReacquisitionContext.Builder()
++              .setUser("foouser")
++              .setContainerId(cid)
++              .build());
++      assertEquals(writtenExitCode, returnCode);
++    } finally {
++      timer.cancel();
++      if (testDir.exists()) {
++        FileUtils.deleteQuietly(testDir);
++      }
++    }
++  }
+ }

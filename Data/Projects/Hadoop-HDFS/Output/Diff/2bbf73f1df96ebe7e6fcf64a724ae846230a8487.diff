@@ -1,0 +1,361 @@
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
+index cc1371ae99c0..b85b9c16686d 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
+@@ -96,6 +96,7 @@
+ import org.apache.hadoop.fs.FSDataOutputStream;
+ import org.apache.hadoop.fs.Globber;
+ import org.apache.hadoop.fs.s3a.auth.SignerManager;
++import org.apache.hadoop.fs.s3a.auth.delegation.DelegationOperations;
+ import org.apache.hadoop.fs.s3a.auth.delegation.DelegationTokenProvider;
+ import org.apache.hadoop.fs.s3a.impl.ChangeDetectionPolicy;
+ import org.apache.hadoop.fs.s3a.impl.ContextAccessors;
+@@ -541,7 +542,9 @@ private void bindAWSClient(URI name, boolean dtEnabled) throws IOException {
+       LOG.debug("Using delegation tokens");
+       S3ADelegationTokens tokens = new S3ADelegationTokens();
+       this.delegationTokens = Optional.of(tokens);
+-      tokens.bindToFileSystem(getCanonicalUri(), this);
++      tokens.bindToFileSystem(getCanonicalUri(),
++          createStoreContext(),
++          createDelegationOperations());
+       tokens.init(conf);
+       tokens.start();
+       // switch to the DT provider and bypass all other configured
+@@ -574,6 +577,26 @@ private void bindAWSClient(URI name, boolean dtEnabled) throws IOException {
+         .createS3Client(getUri(), bucket, credentials, uaSuffix);
+   }
+ 
++  /**
++   * Implementation of all operations used by delegation tokens.
++   */
++  private class DelegationOperationsImpl implements DelegationOperations {
++
++    @Override
++    public List<RoleModel.Statement> listAWSPolicyRules(final Set<AccessLevel> access) {
++      return S3AFileSystem.this.listAWSPolicyRules(access);
++    }
++  }
++
++  /**
++   * Create an instance of the delegation operations.
++   * @return callbacks for DT support.
++   */
++  @VisibleForTesting
++  public DelegationOperations createDelegationOperations() {
++    return new DelegationOperationsImpl();
++  }
++
+   /**
+    * Set the encryption secrets for requests.
+    * @param secrets secrets
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/auth/delegation/AbstractDTService.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/auth/delegation/AbstractDTService.java
+index dcb83c2c28b6..b1211545cbe4 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/auth/delegation/AbstractDTService.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/auth/delegation/AbstractDTService.java
+@@ -24,7 +24,7 @@
+ import com.google.common.base.Preconditions;
+ 
+ import org.apache.hadoop.conf.Configuration;
+-import org.apache.hadoop.fs.s3a.S3AFileSystem;
++import org.apache.hadoop.fs.s3a.impl.StoreContext;
+ import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.service.AbstractService;
+ 
+@@ -53,21 +53,26 @@
+ 
+   /**
+    * URI of the filesystem.
+-   * Valid after {@link #bindToFileSystem(URI, S3AFileSystem)}.
++   * Valid after {@link #bindToFileSystem(URI, StoreContext, DelegationOperations)}.
+    */
+   private URI canonicalUri;
+ 
+   /**
+-   * The owning filesystem.
+-   * Valid after {@link #bindToFileSystem(URI, S3AFileSystem)}.
++   * Owner of the filesystem.
++   * Valid after {@link #bindToFileSystem(URI, StoreContext, DelegationOperations)}.
+    */
+-  private S3AFileSystem fileSystem;
++  private UserGroupInformation owner;
+ 
+   /**
+-   * Owner of the filesystem.
+-   * Valid after {@link #bindToFileSystem(URI, S3AFileSystem)}.
++   * Store Context for callbacks into the FS.
++   * Valid after {@link #bindToFileSystem(URI, StoreContext, DelegationOperations)}.
+    */
+-  private UserGroupInformation owner;
++  private StoreContext storeContext;
++
++  /**
++   * Callbacks for DT-related operations.
++   */
++  private DelegationOperations policyProvider;
+ 
+   /**
+    * Protected constructor.
+@@ -88,18 +93,21 @@ protected AbstractDTService(final String name) {
+    * is not live for actual use and will not yet have interacted with
+    * AWS services.
+    * @param uri the canonical URI of the FS.
+-   * @param fs owning FS.
++   * @param context store context
++   * @param delegationOperations delegation operations
+    * @throws IOException failure.
+    */
+   public void bindToFileSystem(
+       final URI uri,
+-      final S3AFileSystem fs) throws IOException {
++      final StoreContext context,
++      final DelegationOperations delegationOperations) throws IOException {
+     requireServiceState(STATE.NOTINITED);
+     Preconditions.checkState(canonicalUri == null,
+         "bindToFileSystem called twice");
+     this.canonicalUri = requireNonNull(uri);
+-    this.fileSystem = requireNonNull(fs);
+-    this.owner = fs.getOwner();
++    this.storeContext = requireNonNull(context);
++    this.owner = context.getOwner();
++    this.policyProvider = delegationOperations;
+   }
+ 
+   /**
+@@ -111,14 +119,6 @@ public URI getCanonicalUri() {
+     return canonicalUri;
+   }
+ 
+-  /**
+-   * Get the owner of the FS.
+-   * @return the owner fs
+-   */
+-  protected S3AFileSystem getFileSystem() {
+-    return fileSystem;
+-  }
+-
+   /**
+    * Get the owner of this Service.
+    * @return owner; non-null after binding to an FS.
+@@ -127,6 +127,14 @@ public UserGroupInformation getOwner() {
+     return owner;
+   }
+ 
++  protected StoreContext getStoreContext() {
++    return storeContext;
++  }
++
++  protected DelegationOperations getPolicyProvider() {
++    return policyProvider;
++  }
++
+   /**
+    * Require that the service is in a given state.
+    * @param state desired state.
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/auth/delegation/AbstractDelegationTokenBinding.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/auth/delegation/AbstractDelegationTokenBinding.java
+index f940c40d34ab..fc7b095f0ddb 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/auth/delegation/AbstractDelegationTokenBinding.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/auth/delegation/AbstractDelegationTokenBinding.java
+@@ -28,7 +28,6 @@
+ 
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.s3a.AWSCredentialProviderList;
+-import org.apache.hadoop.fs.s3a.S3AFileSystem;
+ import org.apache.hadoop.fs.s3a.auth.RoleModel;
+ import org.apache.hadoop.io.Text;
+ import org.apache.hadoop.security.token.SecretManager;
+@@ -55,7 +54,8 @@
+  *  instance which created it --which itself follows the lifecycle of the FS.
+  *
+  *  One big difference is that
+- *  {@link #bindToFileSystem(URI, S3AFileSystem)} will be called
++ *  {@link AbstractDTService#bindToFileSystem(URI, org.apache.hadoop.fs.s3a.impl.StoreContext, DelegationOperations)}
++ *  will be called
+  *  before the {@link #init(Configuration)} operation, this is where
+  *  the owning FS is passed in.
+  *
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/auth/delegation/DelegationOperations.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/auth/delegation/DelegationOperations.java
+new file mode 100644
+index 000000000000..d46276a87086
+--- /dev/null
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/auth/delegation/DelegationOperations.java
+@@ -0,0 +1,28 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.fs.s3a.auth.delegation;
++
++/**
++ * All operations used for delegation which aren't in the store context.
++ * Initially this is just the AWS policy operations; it's
++ * here so that any future evolution isn't going to break the signatures of
++ * external DT implementations.
++ */
++public interface DelegationOperations extends AWSPolicyProvider {
++}
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/auth/delegation/FullCredentialsTokenBinding.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/auth/delegation/FullCredentialsTokenBinding.java
+index 24020e3db47f..d80e780521d5 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/auth/delegation/FullCredentialsTokenBinding.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/auth/delegation/FullCredentialsTokenBinding.java
+@@ -120,7 +120,7 @@ public AWSCredentialProviderList deployUnbonded() throws IOException {
+         "Full Credentials Token Binding",
+         new MarshalledCredentialProvider(
+             FULL_TOKEN,
+-            getFileSystem().getUri(),
++            getStoreContext().getFsURI(),
+             getConfig(),
+             awsCredentials,
+             MarshalledCredentials.CredentialTypeRequired.AnyNonEmpty));
+@@ -159,9 +159,10 @@ public AWSCredentialProviderList bindToTokenIdentifier(
+         convertTokenIdentifier(retrievedIdentifier,
+             FullCredentialsTokenIdentifier.class);
+     return new AWSCredentialProviderList(
+-        "", new MarshalledCredentialProvider(
++        "Full Credentials Token Binding",
++        new MarshalledCredentialProvider(
+             FULL_TOKEN,
+-            getFileSystem().getUri(),
++            getStoreContext().getFsURI(),
+             getConfig(),
+             tokenIdentifier.getMarshalledCredentials(),
+             MarshalledCredentials.CredentialTypeRequired.AnyNonEmpty));
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/auth/delegation/RoleTokenBinding.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/auth/delegation/RoleTokenBinding.java
+index db72b630905b..3c860338559b 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/auth/delegation/RoleTokenBinding.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/auth/delegation/RoleTokenBinding.java
+@@ -110,7 +110,8 @@ public AWSCredentialProviderList bindToTokenIdentifier(
+     return new AWSCredentialProviderList(
+         "Role Token Binding",
+         new MarshalledCredentialProvider(
+-            COMPONENT, getFileSystem().getUri(),
++            COMPONENT,
++            getStoreContext().getFsURI(),
+             getConfig(),
+             marshalledCredentials,
+             MarshalledCredentials.CredentialTypeRequired.SessionOnly));
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/auth/delegation/S3ADelegationTokens.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/auth/delegation/S3ADelegationTokens.java
+index a7720c2495b7..5005436c8242 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/auth/delegation/S3ADelegationTokens.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/auth/delegation/S3ADelegationTokens.java
+@@ -34,9 +34,9 @@
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.s3a.AWSCredentialProviderList;
+-import org.apache.hadoop.fs.s3a.S3AFileSystem;
+ import org.apache.hadoop.fs.s3a.S3AInstrumentation;
+ import org.apache.hadoop.fs.s3a.auth.RoleModel;
++import org.apache.hadoop.fs.s3a.impl.StoreContext;
+ import org.apache.hadoop.io.Text;
+ import org.apache.hadoop.security.Credentials;
+ import org.apache.hadoop.security.UserGroupInformation;
+@@ -154,11 +154,13 @@ public S3ADelegationTokens() throws IOException {
+   }
+ 
+   @Override
+-  public void bindToFileSystem(final URI uri, final S3AFileSystem fs)
++  public void bindToFileSystem(final URI uri,
++      final StoreContext context,
++      final DelegationOperations delegationOperations)
+       throws IOException {
+-    super.bindToFileSystem(uri, fs);
++    super.bindToFileSystem(uri, context, delegationOperations);
+     service = getTokenService(getCanonicalUri());
+-    stats = fs.getInstrumentation().newDelegationTokenStatistics();
++    stats = context.getInstrumentation().newDelegationTokenStatistics();
+   }
+ 
+   /**
+@@ -179,7 +181,9 @@ protected void serviceInit(final Configuration conf) throws Exception {
+         SessionTokenBinding.class,
+         AbstractDelegationTokenBinding.class);
+     tokenBinding = binding.newInstance();
+-    tokenBinding.bindToFileSystem(getCanonicalUri(), getFileSystem());
++    tokenBinding.bindToFileSystem(getCanonicalUri(),
++        getStoreContext(),
++        getPolicyProvider());
+     tokenBinding.init(conf);
+     tokenBindingName = tokenBinding.getKind().toString();
+     LOG.debug("Filesystem {} is using delegation tokens of kind {}",
+@@ -415,7 +419,7 @@ public Token<AbstractS3ATokenIdentifier> createDelegationToken(
+         "Null encryption secrets");
+     // this isn't done in in advance as it needs S3Guard initialized in the
+     // filesystem before it can generate complete policies.
+-    List<RoleModel.Statement> statements = getFileSystem()
++    List<RoleModel.Statement> statements = getPolicyProvider()
+         .listAWSPolicyRules(ACCESS_POLICY);
+     Optional<RoleModel.Policy> rolePolicy =
+         statements.isEmpty() ?
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/auth/delegation/SessionTokenBinding.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/auth/delegation/SessionTokenBinding.java
+index 6ee32a896094..3e4903122f30 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/auth/delegation/SessionTokenBinding.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/auth/delegation/SessionTokenBinding.java
+@@ -226,7 +226,7 @@ public AWSCredentialProviderList bindToTokenIdentifier(
+         "Session Token Binding",
+         new MarshalledCredentialProvider(
+             SESSION_TOKEN,
+-            getFileSystem().getUri(),
++            getStoreContext().getFsURI(),
+             getConfig(),
+             marshalledCredentials,
+             MarshalledCredentials.CredentialTypeRequired.SessionOnly));
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/auth/delegation/AbstractDelegationIT.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/auth/delegation/AbstractDelegationIT.java
+index d9c18d9df2d6..67ed3d5e0a2f 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/auth/delegation/AbstractDelegationIT.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/auth/delegation/AbstractDelegationIT.java
+@@ -205,7 +205,10 @@ public S3ADelegationTokens instantiateDTSupport(Configuration conf)
+       throws IOException {
+     S3AFileSystem fs = getFileSystem();
+     S3ADelegationTokens tokens = new S3ADelegationTokens();
+-    tokens.bindToFileSystem(fs.getCanonicalUri(), fs);
++    tokens.bindToFileSystem(
++        fs.getCanonicalUri(),
++        fs.createStoreContext(),
++        fs.createDelegationOperations());
+     tokens.init(conf);
+     return tokens;
+   }
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/auth/delegation/ITestRoleDelegationTokens.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/auth/delegation/ITestRoleDelegationTokens.java
+index 48182f798597..1085c262ffea 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/auth/delegation/ITestRoleDelegationTokens.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/auth/delegation/ITestRoleDelegationTokens.java
+@@ -93,7 +93,9 @@ public void testBindingWithoutARN() throws Throwable {
+     conf.unset(DelegationConstants.DELEGATION_TOKEN_ROLE_ARN);
+     try (S3ADelegationTokens delegationTokens2 = new S3ADelegationTokens()) {
+       final S3AFileSystem fs = getFileSystem();
+-      delegationTokens2.bindToFileSystem(fs.getUri(), fs);
++      delegationTokens2.bindToFileSystem(fs.getUri(),
++          fs.createStoreContext(),
++          fs.createDelegationOperations());
+       delegationTokens2.init(conf);
+       delegationTokens2.start();
+ 
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/auth/delegation/ITestSessionDelegationTokens.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/auth/delegation/ITestSessionDelegationTokens.java
+index 79011b59dab4..7a70ac95fc4d 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/auth/delegation/ITestSessionDelegationTokens.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/auth/delegation/ITestSessionDelegationTokens.java
+@@ -263,7 +263,10 @@ protected AbstractS3ATokenIdentifier verifyCredentialPropagation(
+         TemporaryAWSCredentialsProvider.NAME);
+     session.setSecretsInConfiguration(conf);
+     try(S3ADelegationTokens delegationTokens2 = new S3ADelegationTokens()) {
+-      delegationTokens2.bindToFileSystem(fs.getCanonicalUri(), fs);
++      delegationTokens2.bindToFileSystem(
++          fs.getCanonicalUri(),
++          fs.createStoreContext(),
++          fs.createDelegationOperations());
+       delegationTokens2.init(conf);
+       delegationTokens2.start();
+ 

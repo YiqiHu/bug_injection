@@ -1,0 +1,137 @@
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-applications/hadoop-yarn-services/hadoop-yarn-services-api/src/main/java/org/apache/hadoop/yarn/service/client/ApiServiceClient.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-applications/hadoop-yarn-services/hadoop-yarn-services-api/src/main/java/org/apache/hadoop/yarn/service/client/ApiServiceClient.java
+index 3c2c3c438c5c..339fa4b5a45c 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-applications/hadoop-yarn-services/hadoop-yarn-services-api/src/main/java/org/apache/hadoop/yarn/service/client/ApiServiceClient.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-applications/hadoop-yarn-services/hadoop-yarn-services-api/src/main/java/org/apache/hadoop/yarn/service/client/ApiServiceClient.java
+@@ -24,6 +24,7 @@
+ import java.text.MessageFormat;
+ import java.util.List;
+ import java.util.Map;
++import java.security.PrivilegedExceptionAction;
+ 
+ import javax.ws.rs.core.HttpHeaders;
+ import javax.ws.rs.core.MediaType;
+@@ -657,13 +658,26 @@ public int actionUpgradeComponents(String appName, List<String> components)
+ 
+   @Override
+   public int actionCleanUp(String appName, String userName) throws
+-      IOException, YarnException {
+-    ServiceClient sc = new ServiceClient();
+-    sc.init(getConfig());
+-    sc.start();
+-    int result = sc.actionCleanUp(appName, userName);
+-    sc.close();
+-    return result;
++      IOException, YarnException, InterruptedException {
++    UserGroupInformation proxyUser;
++    UserGroupInformation ugi;
++    if (UserGroupInformation.isSecurityEnabled()) {
++      proxyUser = UserGroupInformation.getLoginUser();
++      ugi = UserGroupInformation.createProxyUser(userName, proxyUser);
++    } else {
++      ugi = UserGroupInformation.createRemoteUser(userName);
++    }
++    return ugi.doAs((PrivilegedExceptionAction<Integer>) () -> {
++      ServiceClient sc = new ServiceClient();
++      try {
++        sc.init(getConfig());
++        sc.start();
++        int result = sc.actionCleanUp(appName, userName);
++        return result;
++      } finally {
++        sc.close();
++      }
++    });
+   }
+ 
+   @Override
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-applications/hadoop-yarn-services/hadoop-yarn-services-api/src/test/java/org/apache/hadoop/yarn/service/client/TestSystemServiceManagerImpl.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-applications/hadoop-yarn-services/hadoop-yarn-services-api/src/test/java/org/apache/hadoop/yarn/service/client/TestSystemServiceManagerImpl.java
+index 892f2b431d2c..4954b478a529 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-applications/hadoop-yarn-services/hadoop-yarn-services-api/src/test/java/org/apache/hadoop/yarn/service/client/TestSystemServiceManagerImpl.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-applications/hadoop-yarn-services/hadoop-yarn-services-api/src/test/java/org/apache/hadoop/yarn/service/client/TestSystemServiceManagerImpl.java
+@@ -18,6 +18,10 @@
+ package org.apache.hadoop.yarn.service.client;
+ 
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hdfs.HdfsConfiguration;
++import org.apache.hadoop.hdfs.MiniDFSCluster;
+ import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.yarn.api.records.ApplicationId;
+ import org.apache.hadoop.yarn.exceptions.YarnException;
+@@ -40,6 +44,8 @@
+ import java.util.Map;
+ import java.util.Set;
+ 
++import static org.junit.Assert.fail;
++
+ /**
+  * Test class for system service manager.
+  */
+@@ -207,4 +213,53 @@ private void verifyForLaunchedUserServices() {
+       Assert.assertTrue(services.containsAll(serviceSet));
+     }
+   }
++
++  @Test
++  public void testFileSystemCloseWhenCleanUpService() throws Exception {
++    FileSystem fs = null;
++    Path path = new Path("/tmp/servicedir");
++
++    HdfsConfiguration hdfsConfig = new HdfsConfiguration();
++    MiniDFSCluster hdfsCluster = new MiniDFSCluster.Builder(hdfsConfig)
++        .numDataNodes(1).build();
++
++    fs = hdfsCluster.getFileSystem();
++    if (!fs.exists(path)) {
++      fs.mkdirs(path);
++    }
++
++    SystemServiceManagerImpl serviceManager = new SystemServiceManagerImpl();
++
++    hdfsConfig.set(YarnServiceConf.YARN_SERVICES_SYSTEM_SERVICE_DIRECTORY,
++        path.toString());
++    serviceManager.init(hdfsConfig);
++
++    // the FileSystem object owned by SystemServiceManager must not be closed
++    // when cleanup a service
++    hdfsConfig.set("hadoop.registry.zk.connection.timeout.ms", "100");
++    hdfsConfig.set("hadoop.registry.zk.retry.times", "1");
++    ApiServiceClient asc = new ApiServiceClient();
++    asc.serviceInit(hdfsConfig);
++    asc.actionCleanUp("testapp", "testuser");
++
++    try {
++      serviceManager.start();
++    } catch (Exception e) {
++      if (e.getMessage().contains("Filesystem closed")) {
++        fail("SystemServiceManagerImpl failed to handle " +
++            "FileSystem close");
++      } else {
++        fail("Should not get any exceptions");
++      }
++    } finally {
++      serviceManager.stop();
++      fs = hdfsCluster.getFileSystem();
++      if (fs.exists(path)) {
++        fs.delete(path, true);
++      }
++      if (hdfsCluster != null) {
++        hdfsCluster.shutdown();
++      }
++    }
++  }
+ }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/client/api/AppAdminClient.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/client/api/AppAdminClient.java
+index b0d737a64437..2fd59a863c87 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/client/api/AppAdminClient.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/client/api/AppAdminClient.java
+@@ -281,7 +281,7 @@ public abstract int actionUpgradeComponents(String appName,
+   @Public
+   @Unstable
+   public abstract int actionCleanUp(String appName, String userName) throws
+-      IOException, YarnException;
++      IOException, YarnException, InterruptedException;
+ 
+   @Public
+   @Unstable

@@ -1,0 +1,1 @@
+    allSinks.put(name, sink);

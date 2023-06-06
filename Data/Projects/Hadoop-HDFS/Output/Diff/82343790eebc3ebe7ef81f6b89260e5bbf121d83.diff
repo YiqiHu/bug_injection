@@ -1,0 +1,311 @@
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INode.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INode.java
+index 6b29b33f3fd0..a9f203586116 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INode.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INode.java
+@@ -17,27 +17,21 @@
+  */
+ package org.apache.hadoop.hdfs.server.namenode;
+ 
+-import java.io.PrintStream;
+-import java.io.PrintWriter;
+-import java.io.StringWriter;
+-import java.util.List;
+-import java.util.Map;
+-
++import com.google.common.annotations.VisibleForTesting;
++import com.google.common.base.Preconditions;
+ import com.google.common.collect.ImmutableMap;
+ import com.google.common.collect.Maps;
+-import org.slf4j.Logger;
+-import org.slf4j.LoggerFactory;
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.fs.ContentSummary;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.permission.FsPermission;
+ import org.apache.hadoop.fs.permission.PermissionStatus;
++import org.apache.hadoop.hdfs.DFSUtil;
+ import org.apache.hadoop.hdfs.DFSUtilClient;
+ import org.apache.hadoop.hdfs.protocol.HdfsConstants;
+ import org.apache.hadoop.hdfs.server.blockmanagement.BlockInfo;
+ import org.apache.hadoop.hdfs.server.blockmanagement.BlockStoragePolicySuite;
+ import org.apache.hadoop.hdfs.server.blockmanagement.BlockUnderConstructionFeature;
+-import org.apache.hadoop.hdfs.DFSUtil;
+ import org.apache.hadoop.hdfs.server.namenode.INodeReference.DstReference;
+ import org.apache.hadoop.hdfs.server.namenode.INodeReference.WithCount;
+ import org.apache.hadoop.hdfs.server.namenode.INodeReference.WithName;
+@@ -46,9 +40,14 @@
+ import org.apache.hadoop.security.AccessControlException;
+ import org.apache.hadoop.util.ChunkedArrayList;
+ import org.apache.hadoop.util.StringUtils;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
+ 
+-import com.google.common.annotations.VisibleForTesting;
+-import com.google.common.base.Preconditions;
++import java.io.PrintStream;
++import java.io.PrintWriter;
++import java.io.StringWriter;
++import java.util.List;
++import java.util.Map;
+ 
+ /**
+  * We keep an in-memory representation of the file/block hierarchy.
+@@ -225,6 +224,27 @@ public INodeAttributes getSnapshotINode(final int snapshotId) {
+     return this;
+   }
+ 
++  /** Is this inode in the current state? */
++  public boolean isInCurrentState() {
++    if (isRoot()) {
++      return true;
++    }
++    final INodeDirectory parentDir = getParent();
++    if (parentDir == null) {
++      return false; // this inode is only referenced in snapshots
++    }
++    if (!parentDir.isInCurrentState()) {
++      return false;
++    }
++    final INode child = parentDir.getChild(getLocalNameBytes(),
++            Snapshot.CURRENT_STATE_ID);
++    if (this == child) {
++      return true;
++    }
++    return child != null && child.isReference() &&
++        this.equals(child.asReference().getReferredINode());
++  }
++
+   /** Is this inode in the latest snapshot? */
+   public final boolean isInLatestSnapshot(final int latestSnapshotId) {
+     if (latestSnapshotId == Snapshot.CURRENT_STATE_ID ||
+@@ -234,6 +254,8 @@ public final boolean isInLatestSnapshot(final int latestSnapshotId) {
+     // if parent is a reference node, parent must be a renamed node. We can 
+     // stop the check at the reference node.
+     if (parent != null && parent.isReference()) {
++      // TODO: Is it a bug to return true?
++      //       Some ancestor nodes may not be in the latest snapshot.
+       return true;
+     }
+     final INodeDirectory parentDir = getParent();
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/DirectoryWithSnapshotFeature.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/DirectoryWithSnapshotFeature.java
+index 4e756c7268cc..f76738ffa292 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/DirectoryWithSnapshotFeature.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/DirectoryWithSnapshotFeature.java
+@@ -739,19 +739,22 @@ public void cleanDirectory(INode.ReclaimContext reclaimContext,
+           // were created before "prior" will be covered by the later 
+           // cleanSubtreeRecursively call.
+           if (priorCreated != null) {
+-            if (currentINode.isLastReference() &&
+-                    currentINode.getDiffs().getLastSnapshotId() == prior) {
+-              // If this is the last reference of the directory inode and it
+-              // can not be accessed in any of the subsequent snapshots i.e,
+-              // this is the latest snapshot diff and if this is the last
+-              // reference, the created list can be
+-              // destroyed.
+-              priorDiff.getChildrenDiff().destroyCreatedList(
+-                  reclaimContext, currentINode);
+-            } else {
+-              // we only check the node originally in prior's created list
+-              for (INode cNode : priorDiff.diff.getCreatedUnmodifiable()) {
+-                if (priorCreated.containsKey(cNode)) {
++            // The nodes in priorCreated must be destroyed if
++            //   (1) this is the last reference, and
++            //   (2) prior is the last snapshot, and
++            //   (3) currentINode is not in the current state.
++            final boolean destroy = currentINode.isLastReference()
++                && currentINode.getDiffs().getLastSnapshotId() == prior
++                && !currentINode.isInCurrentState();
++            // we only check the node originally in prior's created list
++            for (INode cNode : new ArrayList<>(priorDiff.
++                    diff.getCreatedUnmodifiable())) {
++              if (priorCreated.containsKey(cNode)) {
++                if (destroy) {
++                  cNode.destroyAndCollectBlocks(reclaimContext);
++                  currentINode.removeChild(cNode);
++                  priorDiff.diff.removeCreated(cNode);
++                } else {
+                   cNode.cleanSubtree(reclaimContext, snapshot, NO_SNAPSHOT_ID);
+                 }
+               }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/util/Diff.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/util/Diff.java
+index 188537b756f5..4323f2d4c563 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/util/Diff.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/util/Diff.java
+@@ -17,13 +17,13 @@
+  */
+ package org.apache.hadoop.hdfs.util;
+ 
++import com.google.common.base.Preconditions;
++
+ import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.Iterator;
+ import java.util.List;
+ 
+-import com.google.common.base.Preconditions;
+-
+ /**
+  * The difference between the current state and a previous state of a list.
+  * 
+@@ -166,6 +166,17 @@ public E setCreated(int index, E element) {
+     return old;
+   }
+ 
++  public boolean removeCreated(final E element) {
++    if (created != null) {
++      final int i = search(created, element.getKey());
++      if (i >= 0 && created.get(i) == element) {
++        created.remove(i);
++        return true;
++      }
++    }
++    return false;
++  }
++
+   public void clearCreated() {
+     if (created != null) {
+       created.clear();
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSImageWithSnapshot.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSImageWithSnapshot.java
+index 0769a7f96e29..f27c8f28bd44 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSImageWithSnapshot.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSImageWithSnapshot.java
+@@ -17,17 +17,6 @@
+  */
+ package org.apache.hadoop.hdfs.server.namenode;
+ 
+-import static org.junit.Assert.assertEquals;
+-import static org.junit.Assert.assertTrue;
+-
+-import java.io.File;
+-import java.io.IOException;
+-import java.io.PrintWriter;
+-import java.util.ArrayList;
+-import java.util.EnumSet;
+-import java.util.List;
+-import java.util.Random;
+-
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FSDataOutputStream;
+ import org.apache.hadoop.fs.FileStatus;
+@@ -48,12 +37,22 @@
+ import org.apache.hadoop.hdfs.server.namenode.snapshot.SnapshotTestHelper;
+ import org.apache.hadoop.hdfs.util.Canceler;
+ import org.apache.hadoop.test.GenericTestUtils;
+-import org.slf4j.event.Level;
+-
+ import org.junit.After;
+ import org.junit.Assert;
+ import org.junit.Before;
+ import org.junit.Test;
++import org.slf4j.event.Level;
++
++import java.io.File;
++import java.io.IOException;
++import java.io.PrintWriter;
++import java.util.ArrayList;
++import java.util.EnumSet;
++import java.util.List;
++import java.util.Random;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertTrue;
+ 
+ /**
+  * Test FSImage save/load when Snapshot is supported
+@@ -610,4 +609,44 @@ String printTree(String label) throws Exception {
+     output.println(b);
+     return b;
+   }
++
++  @Test (timeout=60000)
++  public void testFSImageWithDoubleRename() throws Exception {
++    final Path dir1 = new Path("/dir1");
++    final Path dir2 = new Path("/dir2");
++    hdfs.mkdirs(dir1);
++    hdfs.mkdirs(dir2);
++    Path dira = new Path(dir1, "dira");
++    Path dirx = new Path(dir1, "dirx");
++    Path dirb = new Path(dira, "dirb");
++    hdfs.mkdirs(dira);
++    hdfs.mkdirs(dirb);
++    hdfs.mkdirs(dirx);
++    hdfs.allowSnapshot(dir1);
++    hdfs.createSnapshot(dir1, "s0");
++    Path file1 = new Path(dirb, "file1");
++    DFSTestUtil.createFile(hdfs, file1, BLOCKSIZE, (short) 1, seed);
++    Path rennamePath = new Path(dirx, "dirb");
++    // mv /dir1/dira/dirb to /dir1/dirx/dirb
++    hdfs.rename(dirb, rennamePath);
++    hdfs.createSnapshot(dir1, "s1");
++    DFSTestUtil.appendFile(hdfs, new Path("/dir1/dirx/dirb/file1"),
++            "more data");
++    Path renamePath1 = new Path(dir2, "dira");
++    hdfs.mkdirs(renamePath1);
++    //mv dirx/dirb to /dir2/dira/dirb
++    hdfs.rename(rennamePath, renamePath1);
++    hdfs.delete(renamePath1, true);
++    hdfs.deleteSnapshot(dir1, "s1");
++    // save namespace and restart cluster
++    hdfs.setSafeMode(SafeModeAction.SAFEMODE_ENTER);
++    hdfs.saveNamespace();
++    hdfs.setSafeMode(SafeModeAction.SAFEMODE_LEAVE);
++    cluster.shutdown();
++    cluster = new MiniDFSCluster.Builder(conf).format(false)
++            .numDataNodes(NUM_DATANODES).build();
++    cluster.waitActive();
++    fsn = cluster.getNamesystem();
++    hdfs = cluster.getFileSystem();
++  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/snapshot/TestRenameWithSnapshots.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/snapshot/TestRenameWithSnapshots.java
+index fcc3c1b6990f..3bfe971aef97 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/snapshot/TestRenameWithSnapshots.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/snapshot/TestRenameWithSnapshots.java
+@@ -310,7 +310,46 @@ public void testRenameDirectoryInSnapshot() throws Exception {
+     assertTrue(existsInDiffReport(entries, DiffType.RENAME, sub2.getName(),
+         sub3.getName()));
+   }
+-  
++
++  @Test (timeout=60000)
++  public void testRenameDirectoryAndFileInSnapshot() throws Exception {
++    final Path sub2 = new Path(sub1, "sub2");
++    final Path sub3 = new Path(sub1, "sub3");
++    final Path sub2file1 = new Path(sub2, "file1");
++    final Path sub2file2 = new Path(sub2, "file2");
++    final Path sub3file2 = new Path(sub3, "file2");
++    final Path sub3file3 = new Path(sub3, "file3");
++    final String sub1snap1 = "sub1snap1";
++    final String sub1snap2 = "sub1snap2";
++    final String sub1snap3 = "sub1snap3";
++    final String sub1snap4 = "sub1snap4";
++    hdfs.mkdirs(sub1);
++    hdfs.mkdirs(sub2);
++    DFSTestUtil.createFile(hdfs, sub2file1, BLOCKSIZE, REPL, SEED);
++    SnapshotTestHelper.createSnapshot(hdfs, sub1, sub1snap1);
++    hdfs.rename(sub2file1, sub2file2);
++    SnapshotTestHelper.createSnapshot(hdfs, sub1, sub1snap2);
++
++    // First rename the sub-directory.
++    hdfs.rename(sub2, sub3);
++    SnapshotTestHelper.createSnapshot(hdfs, sub1, sub1snap3);
++    hdfs.rename(sub3file2, sub3file3);
++    SnapshotTestHelper.createSnapshot(hdfs, sub1, sub1snap4);
++    hdfs.deleteSnapshot(sub1, sub1snap1);
++    hdfs.deleteSnapshot(sub1, sub1snap2);
++    hdfs.deleteSnapshot(sub1, sub1snap3);
++    // check the internal details
++    INode sub3file3Inode = fsdir.getINode4Write(sub3file3.toString());
++    INodeReference ref = sub3file3Inode
++            .asReference();
++    INodeReference.WithCount withCount = (WithCount) ref
++            .getReferredINode();
++    Assert.assertEquals(withCount.getReferenceCount(), 1);
++    // Ensure name list is empty for the reference sub3file3Inode
++    Assert.assertNull(withCount.getLastWithName());
++    Assert.assertTrue(sub3file3Inode.isInCurrentState());
++  }
++
+   /**
+    * After the following steps:
+    * <pre>

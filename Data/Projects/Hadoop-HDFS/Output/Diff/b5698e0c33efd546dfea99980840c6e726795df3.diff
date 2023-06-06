@@ -1,0 +1,235 @@
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/GcTimeMonitor.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/GcTimeMonitor.java
+index 0640fc01e2ff..4247eb7050b5 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/GcTimeMonitor.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/GcTimeMonitor.java
+@@ -23,6 +23,7 @@
+ import java.lang.management.GarbageCollectorMXBean;
+ import java.lang.management.ManagementFactory;
+ import java.util.List;
++import java.util.concurrent.TimeUnit;
+ 
+ /**
+  * This class monitors the percentage of time the JVM is paused in GC within
+@@ -46,6 +47,52 @@ public class GcTimeMonitor extends Thread {
+   private final GcData curData = new GcData();
+   private volatile boolean shouldRun = true;
+ 
++  public static class Builder {
++
++    private long observationWindowMs = TimeUnit.MINUTES.toMillis(1);
++    private long sleepIntervalMs = TimeUnit.SECONDS.toMillis(5);
++    private int maxGcTimePercentage = 100;
++    private GcTimeAlertHandler handler = null;
++
++    /**
++     * Set observation window size in milliseconds.
++     */
++    public Builder observationWindowMs(long value) {
++      this.observationWindowMs = value;
++      return this;
++    }
++
++    /**
++     * Set sleep interval in milliseconds.
++     */
++    public Builder sleepIntervalMs(long value) {
++      this.sleepIntervalMs = value;
++      return this;
++    }
++
++    /**
++     * Set the max GC time percentage that triggers the alert handler.
++     */
++    public Builder maxGcTimePercentage(int value) {
++      this.maxGcTimePercentage = value;
++      return this;
++    }
++
++    /**
++     * Set the GC alert handler.
++     */
++    public Builder gcTimeAlertHandler(GcTimeAlertHandler value) {
++      this.handler = value;
++      return this;
++    }
++
++    public GcTimeMonitor build() {
++      return new GcTimeMonitor(observationWindowMs, sleepIntervalMs,
++          maxGcTimePercentage, handler);
++    }
++  }
++
++
+   /**
+    * Create an instance of GCTimeMonitor. Once it's started, it will stay alive
+    * and monitor GC time percentage until shutdown() is called. If you don't
+diff --git a/hadoop-common-project/hadoop-common/src/site/markdown/Metrics.md b/hadoop-common-project/hadoop-common/src/site/markdown/Metrics.md
+index 2d0f23293bfa..bafdfddf16b7 100644
+--- a/hadoop-common-project/hadoop-common/src/site/markdown/Metrics.md
++++ b/hadoop-common-project/hadoop-common/src/site/markdown/Metrics.md
+@@ -56,6 +56,7 @@ Each metrics record contains tags such as ProcessName, SessionID and Hostname as
+ | `GcNumWarnThresholdExceeded` | Number of times that the GC warn threshold is exceeded |
+ | `GcNumInfoThresholdExceeded` | Number of times that the GC info threshold is exceeded |
+ | `GcTotalExtraSleepTime` | Total GC extra sleep time in msec |
++| `GcTimePercentage` | The percentage (0..100) of time that the JVM spent in GC pauses within the observation window if `dfs.namenode.gc.time.monitor.enable` is set to true. Use `dfs.namenode.gc.time.monitor.sleep.interval.ms` to specify the sleep interval in msec. Use `dfs.namenode.gc.time.monitor.observation.window.ms` to specify the observation window in msec. |
+ 
+ rpc context
+ ===========
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+index 459b9f8e35bf..bb8039c2d935 100755
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+@@ -1069,6 +1069,21 @@ public class DFSConfigKeys extends CommonConfigurationKeys {
+   public static final String  DFS_NAMENODE_BLOCKPLACEMENTPOLICY_DEFAULT_PREFER_LOCAL_NODE_KEY =
+       "dfs.namenode.block-placement-policy.default.prefer-local-node";
+   public static final boolean  DFS_NAMENODE_BLOCKPLACEMENTPOLICY_DEFAULT_PREFER_LOCAL_NODE_DEFAULT = true;
++  public static final String DFS_NAMENODE_GC_TIME_MONITOR_ENABLE =
++      "dfs.namenode.gc.time.monitor.enable";
++  public static final boolean DFS_NAMENODE_GC_TIME_MONITOR_ENABLE_DEFAULT =
++      true;
++  public static final String
++      DFS_NAMENODE_GC_TIME_MONITOR_OBSERVATION_WINDOW_MS =
++      "dfs.namenode.gc.time.monitor.observation.window.ms";
++  public static final long
++      DFS_NAMENODE_GC_TIME_MONITOR_OBSERVATION_WINDOW_MS_DEFAULT =
++      TimeUnit.MINUTES.toMillis(1);
++  public static final String DFS_NAMENODE_GC_TIME_MONITOR_SLEEP_INTERVAL_MS =
++      "dfs.namenode.gc.time.monitor.sleep.interval.ms";
++  public static final long
++      DFS_NAMENODE_GC_TIME_MONITOR_SLEEP_INTERVAL_MS_DEFAULT =
++      TimeUnit.SECONDS.toMillis(5);
+ 
+   public static final String DFS_BLOCK_LOCAL_PATH_ACCESS_USER_KEY = "dfs.block.local-path-access.user";
+   public static final String DFS_DOMAIN_SOCKET_PATH_KEY =
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNode.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNode.java
+index 66c5de6c4871..2a74190995c1 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNode.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNode.java
+@@ -96,6 +96,8 @@
+ import org.apache.hadoop.util.ServicePlugin;
+ import org.apache.hadoop.util.StringUtils;
+ import org.apache.hadoop.util.Time;
++import org.apache.hadoop.util.GcTimeMonitor;
++import org.apache.hadoop.util.GcTimeMonitor.Builder;
+ import org.apache.htrace.core.Tracer;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+@@ -176,6 +178,12 @@
+ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_REPLICATION_STREAMS_HARD_LIMIT_DEFAULT;
+ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_REPLICATION_WORK_MULTIPLIER_PER_ITERATION;
+ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_REPLICATION_WORK_MULTIPLIER_PER_ITERATION_DEFAULT;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_GC_TIME_MONITOR_SLEEP_INTERVAL_MS;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_GC_TIME_MONITOR_SLEEP_INTERVAL_MS_DEFAULT;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_GC_TIME_MONITOR_OBSERVATION_WINDOW_MS;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_GC_TIME_MONITOR_OBSERVATION_WINDOW_MS_DEFAULT;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_GC_TIME_MONITOR_ENABLE;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_GC_TIME_MONITOR_ENABLE_DEFAULT;
+ 
+ import static org.apache.hadoop.util.ExitUtil.terminate;
+ import static org.apache.hadoop.util.ToolRunner.confirmPrompt;
+@@ -411,6 +419,7 @@ public long getProtocolVersion(String protocol,
+   private NameNodeRpcServer rpcServer;
+ 
+   private JvmPauseMonitor pauseMonitor;
++  private GcTimeMonitor gcTimeMonitor;
+   private ObjectName nameNodeStatusBeanName;
+   protected final Tracer tracer;
+   protected final TracerConfigurationManager tracerConfigurationManager;
+@@ -724,6 +733,22 @@ protected void initialize(Configuration conf) throws IOException {
+     pauseMonitor.start();
+     metrics.getJvmMetrics().setPauseMonitor(pauseMonitor);
+ 
++    if (conf.getBoolean(DFS_NAMENODE_GC_TIME_MONITOR_ENABLE,
++        DFS_NAMENODE_GC_TIME_MONITOR_ENABLE_DEFAULT)) {
++      long observationWindow = conf.getTimeDuration(
++          DFS_NAMENODE_GC_TIME_MONITOR_OBSERVATION_WINDOW_MS,
++          DFS_NAMENODE_GC_TIME_MONITOR_OBSERVATION_WINDOW_MS_DEFAULT,
++          TimeUnit.MILLISECONDS);
++      long sleepInterval = conf.getTimeDuration(
++          DFS_NAMENODE_GC_TIME_MONITOR_SLEEP_INTERVAL_MS,
++          DFS_NAMENODE_GC_TIME_MONITOR_SLEEP_INTERVAL_MS_DEFAULT,
++          TimeUnit.MILLISECONDS);
++      gcTimeMonitor = new Builder().observationWindowMs(observationWindow)
++          .sleepIntervalMs(sleepInterval).build();
++      gcTimeMonitor.start();
++      metrics.getJvmMetrics().setGcTimeMonitor(gcTimeMonitor);
++    }
++
+     if (NamenodeRole.NAMENODE == role) {
+       startHttpServer(conf);
+     }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml b/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+index abb8dec92577..ad556c60b6ee 100755
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+@@ -5761,4 +5761,34 @@
+       Determines the namenode automatic lease recovery interval in seconds.
+     </description>
+   </property>
++
++  <property>
++    <name>dfs.namenode.gc.time.monitor.enable</name>
++    <value>true</value>
++    <description>
++      Enable the GcTimePercentage metrics in NameNode's JvmMetrics. It will
++      start a thread(GcTimeMonitor) computing the metric.
++    </description>
++  </property>
++
++  <property>
++    <name>dfs.namenode.gc.time.monitor.observation.window.ms</name>
++    <value>1m</value>
++    <description>
++      Determines the windows size of GcTimeMonitor. A window is a period of time
++      starts at now-windowSize and ends at now. The GcTimePercentage is the gc
++      time proportion of the window.
++    </description>
++  </property>
++
++  <property>
++    <name>dfs.namenode.gc.time.monitor.sleep.interval.ms</name>
++    <value>5s</value>
++    <description>
++      Determines the sleep interval in the window. The GcTimeMonitor wakes up in
++      the sleep interval periodically to compute the gc time proportion. The
++      shorter the interval the preciser the GcTimePercentage. The sleep interval
++      must be shorter than the window size.
++    </description>
++  </property>
+ </configuration>
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/metrics/TestNameNodeMetrics.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/metrics/TestNameNodeMetrics.java
+index d9cd4cedf05f..1eab42a270ea 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/metrics/TestNameNodeMetrics.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/metrics/TestNameNodeMetrics.java
+@@ -31,6 +31,7 @@
+ 
+ import static org.apache.hadoop.fs.CommonConfigurationKeys.HA_HM_RPC_TIMEOUT_DEFAULT;
+ import static org.apache.hadoop.fs.CommonConfigurationKeys.HA_HM_RPC_TIMEOUT_KEY;
++import static org.apache.hadoop.metrics2.source.JvmMetricsInfo.GcTimePercentage;
+ import static org.apache.hadoop.test.MetricsAsserts.assertCounter;
+ import static org.apache.hadoop.test.MetricsAsserts.assertCounterGt;
+ import static org.apache.hadoop.test.MetricsAsserts.assertGauge;
+@@ -103,6 +104,7 @@ public class TestNameNodeMetrics {
+     new Path("/testNameNodeMetrics");
+   private static final String NN_METRICS = "NameNodeActivity";
+   private static final String NS_METRICS = "FSNamesystem";
++  private static final String JVM_METRICS = "JvmMetrics";
+   private static final int BLOCK_SIZE = 1024 * 1024;
+   private static final ErasureCodingPolicy EC_POLICY =
+       SystemErasureCodingPolicies.getByID(
+@@ -223,6 +225,15 @@ public void testCapacityMetrics() throws Exception {
+         capacityTotal);
+   }
+ 
++  /**
++   * Test the GcTimePercentage could be got successfully.
++   */
++  @Test
++  public void testGcTimePercentageMetrics() throws Exception {
++    MetricsRecordBuilder rb = getMetrics(JVM_METRICS);
++    MetricsAsserts.getIntGauge(GcTimePercentage.name(), rb);
++  }
++
+   /** Test metrics indicating the number of stale DataNodes */
+   @Test
+   public void testStaleNodes() throws Exception {

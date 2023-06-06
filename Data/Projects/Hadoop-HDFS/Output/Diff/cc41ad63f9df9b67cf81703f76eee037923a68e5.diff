@@ -1,0 +1,227 @@
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/LdapGroupsMapping.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/LdapGroupsMapping.java
+index 2c388107b626..f0ff5bd70087 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/LdapGroupsMapping.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/LdapGroupsMapping.java
+@@ -30,6 +30,7 @@
+ import java.security.GeneralSecurityException;
+ import java.security.KeyStore;
+ import java.util.ArrayList;
++import java.util.Arrays;
+ import java.util.Collections;
+ import java.util.Hashtable;
+ import java.util.Iterator;
+@@ -252,6 +253,10 @@
+   public static final String POSIX_GID_ATTR_KEY = LDAP_CONFIG_PREFIX + ".posix.attr.gid.name";
+   public static final String POSIX_GID_ATTR_DEFAULT = "gidNumber";
+ 
++  public static final String GROUP_SEARCH_FILTER_PATTERN =
++      LDAP_CONFIG_PREFIX + ".group.search.filter.pattern";
++  public static final String GROUP_SEARCH_FILTER_PATTERN_DEFAULT = "";
++
+   /*
+    * Posix attributes
+    */
+@@ -337,6 +342,7 @@
+   private int numAttempts;
+   private volatile int numAttemptsBeforeFailover;
+   private volatile String ldapCtxFactoryClassName;
++  private volatile String[] groupSearchFilterParams;
+ 
+   /**
+    * Returns list of groups for a user.
+@@ -437,8 +443,14 @@ Set<String> lookupGroup(SearchResult result, DirContext c,
+     Set<String> groupDNs = new HashSet<>();
+ 
+     NamingEnumeration<SearchResult> groupResults;
+-    // perform the second LDAP query
+-    if (isPosix) {
++
++    String[] resolved = resolveCustomGroupFilterArgs(result);
++    // If custom group filter argument is supplied, use that!!!
++    if (resolved != null) {
++      groupResults =
++          c.search(groupbaseDN, groupSearchFilter, resolved, SEARCH_CONTROLS);
++    } else if (isPosix) {
++      // perform the second LDAP query
+       groupResults = lookupPosixGroup(result, c);
+     } else {
+       String userDn = result.getNameInNamespace();
+@@ -462,6 +474,25 @@ Set<String> lookupGroup(SearchResult result, DirContext c,
+     return groups;
+   }
+ 
++  private String[] resolveCustomGroupFilterArgs(SearchResult result)
++      throws NamingException {
++    if (groupSearchFilterParams != null) {
++      String[] filterElems = new String[groupSearchFilterParams.length];
++      for (int i = 0; i < groupSearchFilterParams.length; i++) {
++        // Specific handling for userDN.
++        if (groupSearchFilterParams[i].equalsIgnoreCase("userDN")) {
++          filterElems[i] = result.getNameInNamespace();
++        } else {
++          filterElems[i] =
++              result.getAttributes().get(groupSearchFilterParams[i]).get()
++                  .toString();
++        }
++      }
++      return filterElems;
++    }
++    return null;
++  }
++
+   /**
+    * Perform LDAP queries to get group names of a user.
+    *
+@@ -781,6 +812,12 @@ public synchronized void setConf(Configuration conf) {
+         conf.get(POSIX_UID_ATTR_KEY, POSIX_UID_ATTR_DEFAULT);
+     posixGidAttr =
+         conf.get(POSIX_GID_ATTR_KEY, POSIX_GID_ATTR_DEFAULT);
++    String groupSearchFilterParamCSV = conf.get(GROUP_SEARCH_FILTER_PATTERN,
++        GROUP_SEARCH_FILTER_PATTERN_DEFAULT);
++    if(groupSearchFilterParamCSV!=null && !groupSearchFilterParamCSV.isEmpty()) {
++      LOG.debug("Using custom group search filters: {}", groupSearchFilterParamCSV);
++      groupSearchFilterParams = groupSearchFilterParamCSV.split(",");
++    }
+ 
+     int dirSearchTimeout = conf.getInt(DIRECTORY_SEARCH_TIMEOUT,
+         DIRECTORY_SEARCH_TIMEOUT_DEFAULT);
+@@ -795,7 +832,16 @@ public synchronized void setConf(Configuration conf) {
+       returningAttributes = new String[] {
+           groupNameAttr, posixUidAttr, posixGidAttr};
+     }
+-    SEARCH_CONTROLS.setReturningAttributes(returningAttributes);
++
++    // If custom group filter is being used, fetch attributes in the filter
++    // as well.
++    ArrayList<String> customAttributes = new ArrayList<>();
++    if (groupSearchFilterParams != null) {
++      customAttributes.addAll(Arrays.asList(groupSearchFilterParams));
++    }
++    customAttributes.addAll(Arrays.asList(returningAttributes));
++    SEARCH_CONTROLS
++        .setReturningAttributes(customAttributes.toArray(new String[0]));
+ 
+     // LDAP_CTX_FACTORY_CLASS_DEFAULT is not open to unnamed modules
+     // in Java 11+, so the default value is set to null to avoid
+diff --git a/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml b/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml
+index ec50c1e76847..17cd228dc1ba 100644
+--- a/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml
++++ b/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml
+@@ -585,6 +585,18 @@
+   </description>
+ </property>
+ 
++<property>
++  <name>hadoop.security.group.mapping.ldap.group.search.filter.pattern</name>
++  <value></value>
++  <description>
++    Comma separated values that needs to be substituted in the group search
++    filter during group lookup. The values are substituted in the order they
++    appear in the list, the first value will replace {0} the second {1} and
++    so on.
++  </description>
++</property>
++
++
+ <property>
+   <name>hadoop.security.group.mapping.providers</name>
+   <value></value>
+diff --git a/hadoop-common-project/hadoop-common/src/site/markdown/GroupsMapping.md b/hadoop-common-project/hadoop-common/src/site/markdown/GroupsMapping.md
+index 03759d80092c..cd6e6fecb138 100644
+--- a/hadoop-common-project/hadoop-common/src/site/markdown/GroupsMapping.md
++++ b/hadoop-common-project/hadoop-common/src/site/markdown/GroupsMapping.md
+@@ -85,6 +85,14 @@ This is the limit for each ldap query.  If `hadoop.security.group.mapping.ldap.s
+ `hadoop.security.group.mapping.ldap.base` configures how far to walk up the groups hierarchy when resolving groups.
+ By default, with a limit of 0, in order to be considered a member of a group, the user must be an explicit member in LDAP.  Otherwise, it will traverse the group hierarchy `hadoop.security.group.mapping.ldap.search.group.hierarchy.levels` levels up.
+ 
++It is possible to have custom group search filters with different arguments using
++the configuration `hadoop.security.group.mapping.ldap.group.search.filter.pattern`, we can configure comma separated values here and the values configured will be fetched from the LDAP attributes and will be replaced in the group
++search filter in the order they appear here, say if the first entry here is uid, so uid will be fetched from the attributes and the value fetched
++will be used in place of {0} in the group search filter, similarly the second value configured will replace {1} and so on.
++
++Note: If `hadoop.security.group.mapping.ldap.group.search.filter.pattern` is configured, the group search will always be done assuming this group
++search filter pattern irrespective of any other parameters.
++
+ ### Bind user(s) ###
+ If the LDAP server does not support anonymous binds,
+ set the distinguished name of the user to bind in `hadoop.security.group.mapping.ldap.bind.user`.
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/TestLdapGroupsMapping.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/TestLdapGroupsMapping.java
+index aba399718774..82e80fd9fa50 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/TestLdapGroupsMapping.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/TestLdapGroupsMapping.java
+@@ -18,6 +18,7 @@
+ package org.apache.hadoop.security;
+ 
+ import static org.apache.hadoop.security.LdapGroupsMapping.CONNECTION_TIMEOUT;
++import static org.apache.hadoop.security.LdapGroupsMapping.GROUP_SEARCH_FILTER_PATTERN;
+ import static org.apache.hadoop.security.LdapGroupsMapping.LDAP_NUM_ATTEMPTS_KEY;
+ import static org.apache.hadoop.security.LdapGroupsMapping.READ_TIMEOUT;
+ import static org.apache.hadoop.test.GenericTestUtils.assertExceptionContains;
+@@ -27,6 +28,8 @@
+ import static org.junit.Assert.fail;
+ import static org.mockito.ArgumentMatchers.any;
+ import static org.mockito.ArgumentMatchers.anyString;
++import static org.mockito.ArgumentMatchers.eq;
++import static org.mockito.Mockito.mock;
+ import static org.mockito.Mockito.times;
+ import static org.mockito.Mockito.verify;
+ import static org.mockito.Mockito.when;
+@@ -44,6 +47,8 @@
+ 
+ import javax.naming.CommunicationException;
+ import javax.naming.NamingException;
++import javax.naming.directory.Attribute;
++import javax.naming.directory.Attributes;
+ import javax.naming.directory.SearchControls;
+ 
+ import org.apache.hadoop.conf.Configuration;
+@@ -120,6 +125,49 @@ public void testGetGroupsWithDefaultBaseDN() throws Exception {
+     doTestGetGroupsWithBaseDN(conf, baseDN.trim(), baseDN.trim());
+   }
+ 
++  @Test
++  public void testGetGroupsWithDynamicGroupFilter() throws Exception {
++    // Set basic mock stuff.
++    Configuration conf = getBaseConf(TEST_LDAP_URL);
++    String baseDN = "dc=xxx,dc=com";
++    conf.set(LdapGroupsMapping.BASE_DN_KEY, baseDN);
++    Attributes attributes = getAttributes();
++
++    // Set the groupFilter conf to take the csv.
++    conf.set(GROUP_SEARCH_FILTER_PATTERN, "userDN,userName");
++
++    // Set the value for userName attribute that is to be used as part of the
++    // group filter at argument 1.
++    final String userName = "some_user";
++    Attribute userNameAttr = mock(Attribute.class);
++    when(userNameAttr.get()).thenReturn(userName);
++    when(attributes.get(eq("userName"))).thenReturn(userNameAttr);
++
++    // Set the dynamic group search filter.
++    final String groupSearchFilter =
++        "(|(memberUid={0})(uname={1}))" + "(objectClass=group)";
++    conf.set(LdapGroupsMapping.GROUP_SEARCH_FILTER_KEY, groupSearchFilter);
++
++    final LdapGroupsMapping groupsMapping = getGroupsMapping();
++    groupsMapping.setConf(conf);
++
++    // The group search filter should be resolved and should be passed as the
++    // below.
++    String groupFilter = "(|(memberUid={0})(uname={1}))(objectClass=group)";
++    String[] resolvedFilterArgs =
++        new String[] {"CN=some_user,DC=test,DC=com", "some_user"};
++
++    // Return groups only if the resolved filter is passed.
++    when(getContext()
++        .search(anyString(), eq(groupFilter), eq(resolvedFilterArgs),
++            any(SearchControls.class)))
++        .thenReturn(getUserNames(), getGroupNames());
++
++    // Check the group filter got resolved and get the desired values.
++    List<String> groups = groupsMapping.getGroups(userName);
++    Assert.assertEquals(Arrays.asList(getTestGroups()), groups);
++  }
++
+   /**
+    * Helper method to do the LDAP getGroups operation using given user base DN
+    * and group base DN.

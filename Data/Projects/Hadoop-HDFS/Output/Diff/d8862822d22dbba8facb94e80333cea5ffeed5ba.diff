@@ -1,0 +1,132 @@
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+index 2fbda6fa187f..67b709403fe5 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+@@ -778,6 +778,11 @@ public BlockPlacementPolicy getBlockPlacementPolicy() {
+     return placementPolicies.getPolicy(CONTIGUOUS);
+   }
+ 
++  @VisibleForTesting
++  public BlockPlacementPolicy getStriptedBlockPlacementPolicy() {
++    return placementPolicies.getPolicy(STRIPED);
++  }
++
+   public void refreshBlockPlacementPolicy(Configuration conf) {
+     BlockPlacementPolicies bpp =
+         new BlockPlacementPolicies(conf, datanodeManager.getFSClusterStats(),
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicy.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicy.java
+index 68b3bcd5ad6d..85468a57bde4 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicy.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicy.java
+@@ -196,8 +196,9 @@ public void adjustSetsWithChosenReplica(
+     if (moreThanOne.remove(cur)) {
+       if (storages.size() == 1) {
+         final DatanodeStorageInfo remaining = storages.get(0);
+-        moreThanOne.remove(remaining);
+-        exactlyOne.add(remaining);
++        if (moreThanOne.remove(remaining)) {
++          exactlyOne.add(remaining);
++        }
+       }
+     } else {
+       exactlyOne.remove(cur);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/BaseReplicationPolicyTest.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/BaseReplicationPolicyTest.java
+index ec86093ad54a..1e75452d3d86 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/BaseReplicationPolicyTest.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/BaseReplicationPolicyTest.java
+@@ -50,6 +50,7 @@ abstract public class BaseReplicationPolicyTest {
+   protected NameNode namenode;
+   protected DatanodeManager dnManager;
+   protected BlockPlacementPolicy replicator;
++  private BlockPlacementPolicy striptedPolicy;
+   protected final String filename = "/dummyfile.txt";
+   protected DatanodeStorageInfo[] storages;
+   protected String blockPlacementPolicy;
+@@ -90,6 +91,7 @@ public void setupCluster() throws Exception {
+ 
+     final BlockManager bm = namenode.getNamesystem().getBlockManager();
+     replicator = bm.getBlockPlacementPolicy();
++    striptedPolicy = bm.getStriptedBlockPlacementPolicy();
+     cluster = bm.getDatanodeManager().getNetworkTopology();
+     dnManager = bm.getDatanodeManager();
+     // construct network topology
+@@ -111,6 +113,10 @@ void updateHeartbeatWithUsage() {
+     }
+   }
+ 
++  public BlockPlacementPolicy getStriptedPolicy() {
++    return striptedPolicy;
++  }
++
+   @After
+   public void tearDown() throws Exception {
+     namenode.stop();
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestReplicationPolicy.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestReplicationPolicy.java
+index 57f61b41fef2..20163cc5fa53 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestReplicationPolicy.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestReplicationPolicy.java
+@@ -1018,6 +1018,64 @@ public void testChooseReplicaToDelete() throws Exception {
+     assertEquals(chosen, storages[1]);
+   }
+ 
++  /**
++   * Test for the chooseReplicaToDelete are processed based on
++   * EC and STRIPED Policy.
++   */
++  @Test
++  public void testStripedChooseReplicaToDelete() throws Exception {
++    List<DatanodeStorageInfo> replicaList = new ArrayList<>();
++    List<DatanodeStorageInfo> candidate = new ArrayList<>();
++    final Map<String, List<DatanodeStorageInfo>> rackMap
++        = new HashMap<String, List<DatanodeStorageInfo>>();
++
++    replicaList.add(storages[0]);
++    replicaList.add(storages[1]);
++    replicaList.add(storages[2]);
++    replicaList.add(storages[4]);
++
++    candidate.add(storages[0]);
++    candidate.add(storages[2]);
++    candidate.add(storages[4]);
++
++    // Refresh the last update time for all the datanodes
++    for (int i = 0; i < dataNodes.length; i++) {
++      DFSTestUtil.resetLastUpdatesWithOffset(dataNodes[i], 0);
++    }
++
++    List<DatanodeStorageInfo> first = new ArrayList<>();
++    List<DatanodeStorageInfo> second = new ArrayList<>();
++    BlockPlacementPolicy policy = getStriptedPolicy();
++    policy.splitNodesWithRack(replicaList, candidate, rackMap, first,
++        second);
++    // storages[0] is in first set as its rack has two replica nodes,
++    // while storages[2] and dataNodes[4] are in second set.
++    assertEquals(1, first.size());
++    assertEquals(2, second.size());
++    List<StorageType> excessTypes = new ArrayList<>();
++    excessTypes.add(StorageType.DEFAULT);
++    DatanodeStorageInfo chosen = ((BlockPlacementPolicyDefault) policy)
++        .chooseReplicaToDelete(first, second, excessTypes, rackMap);
++    // Within all storages, storages[0] is in the rack that has two replica blocks
++    assertEquals(chosen, storages[0]);
++    policy.adjustSetsWithChosenReplica(rackMap, first, second, chosen);
++    assertEquals(0, first.size());
++    assertEquals(2, second.size());
++
++    // Within second set, storages[2] should be next to be deleted in order.
++    excessTypes.add(StorageType.DEFAULT);
++    chosen = ((BlockPlacementPolicyDefault) policy).chooseReplicaToDelete(
++        first, second, excessTypes, rackMap);
++    assertEquals(chosen, storages[2]);
++    policy.adjustSetsWithChosenReplica(rackMap, first, second, chosen);
++    assertEquals(0, first.size());
++    assertEquals(1, second.size());
++
++    chosen = ((BlockPlacementPolicyDefault) policy).chooseReplicaToDelete(
++        first, second, excessTypes, rackMap);
++    assertEquals(chosen, null);
++  }
++
+   private long calculateRemaining(DatanodeDescriptor dataNode) {
+     long sum = 0;
+     for (DatanodeStorageInfo storageInfo: dataNode.getStorageInfos()){

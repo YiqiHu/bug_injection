@@ -1,0 +1,155 @@
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirAttrOp.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirAttrOp.java
+index cfadbeb5eb4a..164368d28d6c 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirAttrOp.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirAttrOp.java
+@@ -56,15 +56,18 @@ static FileStatus setPermission(
+       throw new InvalidPathException(src);
+     }
+     INodesInPath iip;
++    boolean changed;
+     fsd.writeLock();
+     try {
+       iip = fsd.resolvePath(pc, src, DirOp.WRITE);
+       fsd.checkOwner(pc, iip);
+-      unprotectedSetPermission(fsd, iip, permission);
++      changed = unprotectedSetPermission(fsd, iip, permission);
+     } finally {
+       fsd.writeUnlock();
+     }
+-    fsd.getEditLog().logSetPermissions(iip.getPath(), permission);
++    if (changed) {
++      fsd.getEditLog().logSetPermissions(iip.getPath(), permission);
++    }
+     return fsd.getAuditFileInfo(iip);
+   }
+ 
+@@ -75,6 +78,7 @@ static FileStatus setOwner(
+       throw new InvalidPathException(src);
+     }
+     INodesInPath iip;
++    boolean changed;
+     fsd.writeLock();
+     try {
+       iip = fsd.resolvePath(pc, src, DirOp.WRITE);
+@@ -89,11 +93,13 @@ static FileStatus setOwner(
+               "User " + pc.getUser() + " does not belong to " + group);
+         }
+       }
+-      unprotectedSetOwner(fsd, iip, username, group);
++      changed = unprotectedSetOwner(fsd, iip, username, group);
+     } finally {
+       fsd.writeUnlock();
+     }
+-    fsd.getEditLog().logSetOwner(iip.getPath(), username, group);
++    if (changed) {
++      fsd.getEditLog().logSetOwner(iip.getPath(), username, group);
++    }
+     return fsd.getAuditFileInfo(iip);
+   }
+ 
+@@ -257,28 +263,32 @@ static void setQuota(FSDirectory fsd, FSPermissionChecker pc, String src,
+     }
+   }
+ 
+-  static void unprotectedSetPermission(
++  static boolean unprotectedSetPermission(
+       FSDirectory fsd, INodesInPath iip, FsPermission permissions)
+       throws FileNotFoundException, UnresolvedLinkException,
+              QuotaExceededException, SnapshotAccessControlException {
+     assert fsd.hasWriteLock();
+     final INode inode = FSDirectory.resolveLastINode(iip);
+     int snapshotId = iip.getLatestSnapshotId();
++    long oldPerm = inode.getPermissionLong();
+     inode.setPermission(permissions, snapshotId);
++    return oldPerm != inode.getPermissionLong();
+   }
+ 
+-  static void unprotectedSetOwner(
++  static boolean unprotectedSetOwner(
+       FSDirectory fsd, INodesInPath iip, String username, String groupname)
+       throws FileNotFoundException, UnresolvedLinkException,
+       QuotaExceededException, SnapshotAccessControlException {
+     assert fsd.hasWriteLock();
+     final INode inode = FSDirectory.resolveLastINode(iip);
++    long oldPerm = inode.getPermissionLong();
+     if (username != null) {
+       inode.setUser(username, iip.getLatestSnapshotId());
+     }
+     if (groupname != null) {
+       inode.setGroup(groupname, iip.getLatestSnapshotId());
+     }
++    return oldPerm != inode.getPermissionLong();
+   }
+ 
+   static boolean setTimes(
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSDirAttrOp.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSDirAttrOp.java
+index 45a785be75e0..3d391b046876 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSDirAttrOp.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSDirAttrOp.java
+@@ -20,8 +20,10 @@
+ 
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
++import org.apache.hadoop.fs.permission.FsPermission;
++import org.apache.hadoop.fs.permission.PermissionStatus;
++import org.apache.hadoop.hdfs.DFSUtil;
+ import org.apache.hadoop.hdfs.protocol.QuotaExceededException;
+-import org.apache.hadoop.hdfs.server.namenode.FSNamesystem;
+ import org.apache.hadoop.hdfs.server.namenode.snapshot.SnapshotManager;
+ import org.junit.Test;
+ import org.mockito.Mockito;
+@@ -57,6 +59,54 @@ private boolean unprotectedSetTimes(long atime, long atime0, long precision,
+     return FSDirAttrOp.unprotectedSetTimes(fsd, iip, mtime, atime, force);
+   }
+ 
++  private boolean unprotectedSetAttributes(short currPerm, short newPerm)
++      throws Exception {
++    return unprotectedSetAttributes(currPerm, newPerm, "user1", "user1",
++        false);
++  }
++
++  private boolean unprotectedSetAttributes(short currPerm, short newPerm,
++      String currUser, String newUser, boolean testChangeOwner)
++      throws Exception {
++    String groupName = "testGroup";
++    FsPermission originalPerm = new FsPermission(currPerm);
++    FsPermission updatedPerm = new FsPermission(newPerm);
++    FSNamesystem fsn = Mockito.mock(FSNamesystem.class);
++    SnapshotManager ssMgr = Mockito.mock(SnapshotManager.class);
++    FSDirectory fsd = Mockito.mock(FSDirectory.class);
++    INodesInPath iip = Mockito.mock(INodesInPath.class);
++    when(fsd.getFSNamesystem()).thenReturn(fsn);
++    when(fsn.getSnapshotManager()).thenReturn(ssMgr);
++    when(ssMgr.getSkipCaptureAccessTimeOnlyChange()).thenReturn(false);
++    when(fsd.getAccessTimePrecision()).thenReturn(1000L);
++    when(fsd.hasWriteLock()).thenReturn(Boolean.TRUE);
++    when(iip.getLatestSnapshotId()).thenReturn(0);
++    INode inode = new INodeDirectory(1000, DFSUtil.string2Bytes(""),
++        new PermissionStatus(currUser, "testGroup", originalPerm), 0L);
++    when(iip.getLastINode()).thenReturn(inode);
++    return testChangeOwner ? FSDirAttrOp.unprotectedSetOwner(fsd, iip, newUser,
++        groupName) : FSDirAttrOp.unprotectedSetPermission(fsd, iip,
++        updatedPerm);
++  }
++
++  @Test
++  public void testUnprotectedSetPermissions() throws Exception {
++    assertTrue("setPermissions return true for updated permissions",
++        unprotectedSetAttributes((short) 0777, (short) 0));
++    assertFalse("setPermissions should return false for same permissions",
++        unprotectedSetAttributes((short) 0777, (short) 0777));
++  }
++
++  @Test
++  public void testUnprotectedSetOwner() throws Exception {
++    assertTrue("SetOwner should return true for a new user",
++        unprotectedSetAttributes((short) 0777, (short) 0777, "user1",
++            "user2", true));
++    assertFalse("SetOwner should return false for same user",
++        unprotectedSetAttributes((short) 0777, (short) 0777, "user1",
++            "user1", true));
++  }
++
+   @Test
+   public void testUnprotectedSetTimes() throws Exception {
+     // atime < access time + precision

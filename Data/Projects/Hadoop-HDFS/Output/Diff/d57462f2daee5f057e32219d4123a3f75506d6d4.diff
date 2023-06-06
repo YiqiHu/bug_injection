@@ -1,0 +1,254 @@
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+index 9de33ff60a62..dd2478568827 100755
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+@@ -500,8 +500,13 @@ public class DFSConfigKeys extends CommonConfigurationKeys {
+ 
+   public static final String DFS_NAMENODE_SNAPSHOT_MAX_LIMIT =
+       "dfs.namenode.snapshot.max.limit";
+-
+   public static final int DFS_NAMENODE_SNAPSHOT_MAX_LIMIT_DEFAULT = 65536;
++
++  public static final String DFS_NAMENODE_SNAPSHOT_DELETION_ORDERED =
++      "dfs.namenode.snapshot.deletion.ordered";
++  public static final boolean DFS_NAMENODE_SNAPSHOT_DELETION_ORDERED_DEFAULT
++      = false;
++
+   public static final String DFS_NAMENODE_SNAPSHOT_SKIPLIST_SKIP_INTERVAL =
+       "dfs.namenode.snapshot.skiplist.interval";
+   public static final int DFS_NAMENODE_SNAPSHOT_SKIPLIST_SKIP_INTERVAL_DEFAULT =
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirSnapshotOp.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirSnapshotOp.java
+index c854f83142e5..c2eb401c5fbb 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirSnapshotOp.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirSnapshotOp.java
+@@ -21,6 +21,7 @@
+ import org.apache.hadoop.fs.InvalidPathException;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.permission.FsAction;
++import org.apache.hadoop.hdfs.DFSConfigKeys;
+ import org.apache.hadoop.hdfs.DFSUtil;
+ import org.apache.hadoop.hdfs.protocol.FSLimitException;
+ import org.apache.hadoop.hdfs.protocol.HdfsFileStatus;
+@@ -249,12 +250,41 @@ static INode.BlocksMapUpdateInfo deleteSnapshot(
+       fsd.checkOwner(pc, iip);
+     }
+ 
++    // time of snapshot deletion
++    final long now = Time.now();
++    if (fsd.isSnapshotDeletionOrdered()) {
++      final INodeDirectory srcRoot = snapshotManager.getSnapshottableRoot(iip);
++      final DirectorySnapshottableFeature snapshottable
++          = srcRoot.getDirectorySnapshottableFeature();
++      final Snapshot snapshot = snapshottable.getSnapshotByName(
++          srcRoot, snapshotName);
++
++      // Diffs must be not empty since a snapshot exists in the list
++      final int earliest = snapshottable.getDiffs().iterator().next()
++          .getSnapshotId();
++      if (snapshot.getId() != earliest) {
++        throw new SnapshotException("Failed to delete snapshot " + snapshotName
++            + " from directory " + srcRoot.getFullPathName()
++            + ": " + snapshot + " is not the earliest snapshot id=" + earliest
++            + " (" + DFSConfigKeys.DFS_NAMENODE_SNAPSHOT_DELETION_ORDERED
++            + " is " + fsd.isSnapshotDeletionOrdered() + ")");
++      }
++    }
++
++    final INode.BlocksMapUpdateInfo collectedBlocks = deleteSnapshot(
++        fsd, snapshotManager, iip, snapshotName, now);
++    fsd.getEditLog().logDeleteSnapshot(snapshotRoot, snapshotName,
++        logRetryCache, now);
++    return collectedBlocks;
++  }
++
++  static INode.BlocksMapUpdateInfo deleteSnapshot(
++      FSDirectory fsd, SnapshotManager snapshotManager, INodesInPath iip,
++      String snapshotName, long now) throws IOException {
+     INode.BlocksMapUpdateInfo collectedBlocks = new INode.BlocksMapUpdateInfo();
+     ChunkedArrayList<INode> removedINodes = new ChunkedArrayList<>();
+     INode.ReclaimContext context = new INode.ReclaimContext(
+         fsd.getBlockStoragePolicySuite(), collectedBlocks, removedINodes, null);
+-    // time of snapshot deletion
+-    final long now = Time.now();
+     fsd.writeLock();
+     try {
+       snapshotManager.deleteSnapshot(iip, snapshotName, context, now);
+@@ -266,9 +296,6 @@ static INode.BlocksMapUpdateInfo deleteSnapshot(
+       fsd.writeUnlock();
+     }
+     removedINodes.clear();
+-    fsd.getEditLog().logDeleteSnapshot(snapshotRoot, snapshotName,
+-        logRetryCache, now);
+-
+     return collectedBlocks;
+   }
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
+index fb5c9df8debd..6df255e86574 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
+@@ -187,6 +187,7 @@ private static INodeDirectory createRoot(FSNamesystem namesystem) {
+   private boolean posixAclInheritanceEnabled;
+   private final boolean xattrsEnabled;
+   private final int xattrMaxSize;
++  private final boolean snapshotDeletionOrdered;
+ 
+   // precision of access times.
+   private final long accessTimePrecision;
+@@ -353,6 +354,20 @@ public enum DirOp {
+         + " hard limit " + DFSConfigKeys.DFS_NAMENODE_MAX_XATTR_SIZE_HARD_LIMIT
+         + ": (%s).", DFSConfigKeys.DFS_NAMENODE_MAX_XATTR_SIZE_KEY);
+ 
++    this.snapshotDeletionOrdered =
++        conf.getBoolean(DFSConfigKeys.DFS_NAMENODE_SNAPSHOT_DELETION_ORDERED,
++            DFSConfigKeys.DFS_NAMENODE_SNAPSHOT_DELETION_ORDERED_DEFAULT);
++    LOG.info("{} = {}", DFSConfigKeys.DFS_NAMENODE_SNAPSHOT_DELETION_ORDERED,
++        snapshotDeletionOrdered);
++    if (snapshotDeletionOrdered && !xattrsEnabled) {
++      throw new HadoopIllegalArgumentException("" +
++          "XAttrs is required by snapshotDeletionOrdered:"
++          + DFSConfigKeys.DFS_NAMENODE_SNAPSHOT_DELETION_ORDERED
++          + " is true but "
++          + DFSConfigKeys.DFS_NAMENODE_MAX_XATTR_SIZE_KEY
++          + " is false.");
++    }
++
+     this.accessTimePrecision = conf.getLong(
+         DFS_NAMENODE_ACCESSTIME_PRECISION_KEY,
+         DFS_NAMENODE_ACCESSTIME_PRECISION_DEFAULT);
+@@ -610,6 +625,11 @@ boolean isXattrsEnabled() {
+     return xattrsEnabled;
+   }
+   int getXattrMaxSize() { return xattrMaxSize; }
++
++  boolean isSnapshotDeletionOrdered() {
++    return snapshotDeletionOrdered;
++  }
++
+   boolean isAccessTimeSupported() {
+     return accessTimePrecision > 0;
+   }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/DirectorySnapshottableFeature.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/DirectorySnapshottableFeature.java
+index b38d8bfe8ce0..fe97cf87015e 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/DirectorySnapshottableFeature.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/DirectorySnapshottableFeature.java
+@@ -358,7 +358,7 @@ SnapshotDiffListingInfo computeDiff(final INodeDirectory snapshotRootDir,
+    * @throws SnapshotException If snapshotName is not null or empty, but there
+    *           is no snapshot matching the name.
+    */
+-  private Snapshot getSnapshotByName(INodeDirectory snapshotRoot,
++  public Snapshot getSnapshotByName(INodeDirectory snapshotRoot,
+       String snapshotName) throws SnapshotException {
+     Snapshot s = null;
+     if (snapshotName != null && !snapshotName.isEmpty()) {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestOrderedSnapshotDeletion.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestOrderedSnapshotDeletion.java
+new file mode 100644
+index 000000000000..c8df780465ba
+--- /dev/null
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestOrderedSnapshotDeletion.java
+@@ -0,0 +1,105 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hdfs.server.namenode;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hdfs.DistributedFileSystem;
++import org.apache.hadoop.hdfs.MiniDFSCluster;
++import org.apache.hadoop.hdfs.protocol.SnapshotException;
++import org.apache.hadoop.hdfs.server.namenode.snapshot.SnapshotTestHelper;
++import org.apache.hadoop.test.GenericTestUtils;
++import org.junit.After;
++import org.junit.Assert;
++import org.junit.Before;
++import org.junit.Test;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.slf4j.event.Level;
++
++import java.io.IOException;
++
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_SNAPSHOT_DELETION_ORDERED;
++
++/** Test ordered snapshot deletion. */
++public class TestOrderedSnapshotDeletion {
++  static final Logger LOG = LoggerFactory.getLogger(FSDirectory.class);
++
++  {
++    SnapshotTestHelper.disableLogs();
++    GenericTestUtils.setLogLevel(INode.LOG, Level.TRACE);
++  }
++
++  private final Path snapshottableDir
++      = new Path("/" + getClass().getSimpleName());
++
++  private MiniDFSCluster cluster;
++
++  @Before
++  public void setUp() throws Exception {
++    final Configuration conf = new Configuration();
++    conf.setBoolean(DFS_NAMENODE_SNAPSHOT_DELETION_ORDERED, true);
++
++    cluster = new MiniDFSCluster.Builder(conf).numDataNodes(0).build();
++    cluster.waitActive();
++  }
++
++  @After
++  public void tearDown() throws Exception {
++    if (cluster != null) {
++      cluster.shutdown();
++      cluster = null;
++    }
++  }
++
++  @Test (timeout=60000)
++  public void testConf() throws Exception {
++    DistributedFileSystem hdfs = cluster.getFileSystem();
++    hdfs.mkdirs(snapshottableDir);
++    hdfs.allowSnapshot(snapshottableDir);
++
++    final Path sub0 = new Path(snapshottableDir, "sub0");
++    hdfs.mkdirs(sub0);
++    hdfs.createSnapshot(snapshottableDir, "s0");
++
++    final Path sub1 = new Path(snapshottableDir, "sub1");
++    hdfs.mkdirs(sub1);
++    hdfs.createSnapshot(snapshottableDir, "s1");
++
++    final Path sub2 = new Path(snapshottableDir, "sub2");
++    hdfs.mkdirs(sub2);
++    hdfs.createSnapshot(snapshottableDir, "s2");
++
++    assertDeletionDenied(snapshottableDir, "s1", hdfs);
++    assertDeletionDenied(snapshottableDir, "s2", hdfs);
++    hdfs.deleteSnapshot(snapshottableDir, "s0");
++    assertDeletionDenied(snapshottableDir, "s2", hdfs);
++    hdfs.deleteSnapshot(snapshottableDir, "s1");
++    hdfs.deleteSnapshot(snapshottableDir, "s2");
++  }
++
++  static void assertDeletionDenied(Path snapshottableDir, String snapshot,
++      DistributedFileSystem hdfs) throws IOException {
++    try {
++      hdfs.deleteSnapshot(snapshottableDir, snapshot);
++      Assert.fail("deleting " +snapshot + " should fail");
++    } catch (SnapshotException se) {
++      LOG.info("Good, it is expected to have " + se);
++    }
++  }
++}

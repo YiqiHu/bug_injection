@@ -1,0 +1,135 @@
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/DataNodeUGIProvider.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/DataNodeUGIProvider.java
+index 366f47f29631..d7e5f9f15513 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/DataNodeUGIProvider.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/DataNodeUGIProvider.java
+@@ -72,9 +72,12 @@ UserGroupInformation ugi() throws IOException {
+     UserGroupInformation ugi;
+ 
+     try {
+-      if (UserGroupInformation.isSecurityEnabled()) {
+-        final Token<DelegationTokenIdentifier> token = params.delegationToken();
++      final Token<DelegationTokenIdentifier> token = params.delegationToken();
+ 
++      // Create nonTokenUGI when token is null regardless of security.
++      // This makes it possible to access the data stored in secure DataNode
++      // through insecure Namenode.
++      if (UserGroupInformation.isSecurityEnabled() && token != null) {
+         ugi = ugiCache.get(buildTokenCacheKey(token),
+             new Callable<UserGroupInformation>() {
+               @Override
+@@ -134,7 +137,8 @@ private String buildNonTokenCacheKey(String doAsUserFromQuery,
+     return key;
+   }
+ 
+-  private UserGroupInformation nonTokenUGI(String usernameFromQuery,
++  @VisibleForTesting
++  UserGroupInformation nonTokenUGI(String usernameFromQuery,
+       String doAsUserFromQuery, String remoteUser) throws IOException {
+ 
+     UserGroupInformation ugi = UserGroupInformation
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/ParameterParser.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/ParameterParser.java
+index 2b3a39358de6..c4588fc65744 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/ParameterParser.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/ParameterParser.java
+@@ -123,6 +123,9 @@ boolean noredirect() {
+ 
+   Token<DelegationTokenIdentifier> delegationToken() throws IOException {
+     String delegation = param(DelegationParam.NAME);
++    if (delegation == null) {
++      return null;
++    }
+     final Token<DelegationTokenIdentifier> token = new
+       Token<DelegationTokenIdentifier>();
+     token.decodeFromUrlString(delegation);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/WebHdfsHandler.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/WebHdfsHandler.java
+index ff68a7ee7e4d..834d9d5e1dae 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/WebHdfsHandler.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/WebHdfsHandler.java
+@@ -335,8 +335,8 @@ private static void writeContinueHeader(ChannelHandlerContext ctx) {
+   }
+ 
+   private void injectToken() throws IOException {
+-    if (UserGroupInformation.isSecurityEnabled()) {
+-      Token<DelegationTokenIdentifier> token = params.delegationToken();
++    Token<DelegationTokenIdentifier> token = params.delegationToken();
++    if (UserGroupInformation.isSecurityEnabled() && token != null) {
+       token.setKind(HDFS_DELEGATION_KIND);
+       ugi.addToken(token);
+     }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/TestDataNodeUGIProvider.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/TestDataNodeUGIProvider.java
+index de88c51ed2fd..102418517f64 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/TestDataNodeUGIProvider.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/TestDataNodeUGIProvider.java
+@@ -20,6 +20,8 @@
+ 
+ import static org.apache.hadoop.security.UserGroupInformation.AuthenticationMethod.KERBEROS;
+ import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.spy;
++import static org.mockito.Mockito.verify;
+ import io.netty.handler.codec.http.QueryStringDecoder;
+ 
+ import java.io.IOException;
+@@ -31,6 +33,7 @@
+ import org.apache.hadoop.hdfs.DFSConfigKeys;
+ import org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenIdentifier;
+ import org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenSecretManager;
++import org.apache.hadoop.hdfs.server.common.JspHelper;
+ import org.apache.hadoop.hdfs.server.namenode.FSNamesystem;
+ import org.apache.hadoop.hdfs.web.WebHdfsConstants;
+ import org.apache.hadoop.hdfs.web.WebHdfsFileSystem;
+@@ -186,6 +189,35 @@ public void testUGICacheInSecure() throws Exception {
+         ugi11, url22);
+   }
+ 
++  @Test
++  public void testUGINullTokenSecure() throws IOException {
++    SecurityUtil.setAuthenticationMethod(KERBEROS, conf);
++    UserGroupInformation.setConfiguration(conf);
++
++    String uri1 = WebHdfsFileSystem.PATH_PREFIX
++            + PATH
++            + "?op=OPEN"
++            + Param.toSortedString("&", new OffsetParam((long) OFFSET),
++            new LengthParam((long) LENGTH), new UserParam("root"));
++
++    ParameterParser params = new ParameterParser(
++            new QueryStringDecoder(URI.create(uri1)), conf);
++
++    DataNodeUGIProvider ugiProvider = new DataNodeUGIProvider(params);
++
++    String usernameFromQuery = params.userName();
++    String doAsUserFromQuery = params.doAsUser();
++    String remoteUser = usernameFromQuery == null ? JspHelper
++            .getDefaultWebUserName(params.conf())
++            : usernameFromQuery;
++
++    DataNodeUGIProvider spiedUGIProvider = spy(ugiProvider);
++    spiedUGIProvider.ugi();
++
++    verify(spiedUGIProvider).nonTokenUGI(usernameFromQuery, doAsUserFromQuery,
++            remoteUser);
++  }
++
+   /**
+    * Wait for expiration of entries from the UGI cache.  We need to be careful
+    * not to touch the entries in the cache while we're waiting for expiration.
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/TestParameterParser.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/TestParameterParser.java
+index 235d051400be..40409985c3f0 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/TestParameterParser.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/TestParameterParser.java
+@@ -55,6 +55,15 @@ public void testDeserializeHAToken() throws IOException {
+     Assert.assertTrue(HAUtilClient.isTokenForLogicalUri(tok2));
+   }
+ 
++  @Test
++  public void testNullToken() throws IOException {
++    Configuration conf = new Configuration();
++    QueryStringDecoder decoder = new QueryStringDecoder(
++            WebHdfsHandler.WEBHDFS_PREFIX + "/test");
++    ParameterParser testParser = new ParameterParser(decoder, conf);
++    Assert.assertNull(testParser.delegationToken());
++  }
++
+   @Test
+   public void testDecodePath() {
+     final String ESCAPED_PATH = "/test%25+1%26%3Dtest?op=OPEN&foo=bar";

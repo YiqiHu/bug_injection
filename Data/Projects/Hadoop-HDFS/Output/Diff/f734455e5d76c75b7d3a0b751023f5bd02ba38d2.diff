@@ -1,0 +1,133 @@
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ImageServlet.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ImageServlet.java
+index a9c2a09ed48a..e045afbb64f4 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ImageServlet.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ImageServlet.java
+@@ -112,12 +112,25 @@ static void setRecentImageCheckTimePrecision(double ratio) {
+     recentImageCheckTimePrecision = ratio;
+   }
+ 
++  private FSImage getAndValidateFSImage(ServletContext context,
++      final HttpServletResponse response)
++      throws IOException {
++    final FSImage nnImage = NameNodeHttpServer.getFsImageFromContext(context);
++    if (nnImage == null) {
++      String errorMsg = "NameNode initialization not yet complete. "
++          + "FSImage has not been set in the NameNode.";
++      response.sendError(HttpServletResponse.SC_FORBIDDEN, errorMsg);
++      throw new IOException(errorMsg);
++    }
++    return nnImage;
++  }
++
+   @Override
+   public void doGet(final HttpServletRequest request,
+       final HttpServletResponse response) throws ServletException, IOException {
+     try {
+       final ServletContext context = getServletContext();
+-      final FSImage nnImage = NameNodeHttpServer.getFsImageFromContext(context);
++      final FSImage nnImage = getAndValidateFSImage(context, response);
+       final GetImageParams parsedParams = new GetImageParams(request, response);
+       final Configuration conf = (Configuration) context
+           .getAttribute(JspHelper.CURRENT_CONF);
+@@ -524,7 +537,7 @@ protected void doPut(final HttpServletRequest request,
+       final HttpServletResponse response) throws ServletException, IOException {
+     try {
+       ServletContext context = getServletContext();
+-      final FSImage nnImage = NameNodeHttpServer.getFsImageFromContext(context);
++      final FSImage nnImage = getAndValidateFSImage(context, response);
+       final Configuration conf = (Configuration) getServletContext()
+           .getAttribute(JspHelper.CURRENT_CONF);
+       final PutImageParams parsedParams = new PutImageParams(request, response,
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/NameNodeAdapter.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/NameNodeAdapter.java
+index 324f4fbe952f..a584da1109f1 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/NameNodeAdapter.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/NameNodeAdapter.java
+@@ -56,6 +56,7 @@
+ import org.apache.hadoop.security.AccessControlException;
+ import org.apache.hadoop.test.Whitebox;
+ import org.mockito.Mockito;
++import static org.apache.hadoop.hdfs.server.namenode.NameNodeHttpServer.FSIMAGE_ATTRIBUTE_KEY;
+ 
+ /**
+  * This is a utility class to expose NameNode functionality for unit tests.
+@@ -129,6 +130,17 @@ public static Server getRpcServer(NameNode namenode) {
+     return ((NameNodeRpcServer)namenode.getRpcServer()).clientRpcServer;
+   }
+ 
++  /**
++   * Sets the FSImage used in the NameNodeHttpServer and returns the old value.
++   */
++  public static FSImage getAndSetFSImageInHttpServer(NameNode namenode,
++      FSImage fsImage) {
++    FSImage previous = (FSImage) namenode.httpServer.getHttpServer()
++        .getAttribute(FSIMAGE_ATTRIBUTE_KEY);
++    namenode.httpServer.setFSImage(fsImage);
++    return  previous;
++  }
++
+   public static DelegationTokenSecretManager getDtSecretManager(
+       final FSNamesystem ns) {
+     return ns.getDelegationTokenSecretManager();
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestStandbyCheckpoints.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestStandbyCheckpoints.java
+index f96e8045d860..1afd88d2235b 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestStandbyCheckpoints.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestStandbyCheckpoints.java
+@@ -21,6 +21,8 @@
+ import com.google.common.collect.ImmutableList;
+ import com.google.common.collect.ImmutableSet;
+ import com.google.common.collect.Lists;
++import org.apache.hadoop.hdfs.LogVerificationAppender;
++import org.apache.log4j.spi.LoggingEvent;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ import org.apache.hadoop.conf.Configuration;
+@@ -287,6 +289,49 @@ public void testStandbyAndObserverState() throws Exception {
+     cluster.transitionToStandby(2);
+   }
+ 
++  /**
++   * Tests that a null FSImage is handled gracefully by the ImageServlet.
++   * If putImage is called while a NameNode is still starting up, the FSImage
++   * may not have been initialized yet. See HDFS-15290.
++   */
++  @Test(timeout = 30000)
++  public void testCheckpointBeforeNameNodeInitializationIsComplete()
++      throws Exception {
++    final LogVerificationAppender appender = new LogVerificationAppender();
++    final org.apache.log4j.Logger logger = org.apache.log4j.Logger
++        .getRootLogger();
++    logger.addAppender(appender);
++
++    // Transition 2 to observer
++    cluster.transitionToObserver(2);
++    doEdits(0, 10);
++    // After a rollEditLog, Standby(nn1)'s next checkpoint would be
++    // ahead of observer(nn2).
++    nns[0].getRpcServer().rollEditLog();
++
++    NameNode nn2 = nns[2];
++    FSImage nnFSImage = NameNodeAdapter.getAndSetFSImageInHttpServer(nn2, null);
++
++    // After standby creating a checkpoint, it will try to push the image to
++    // active and all observer, updating it's own txid to the most recent.
++    HATestUtil.waitForCheckpoint(cluster, 1, ImmutableList.of(12));
++    HATestUtil.waitForCheckpoint(cluster, 0, ImmutableList.of(12));
++
++    NameNodeAdapter.getAndSetFSImageInHttpServer(nn2, nnFSImage);
++    cluster.transitionToStandby(2);
++    logger.removeAppender(appender);
++
++    for (LoggingEvent event : appender.getLog()) {
++      String message = event.getRenderedMessage();
++      if (message.contains("PutImage failed") &&
++          message.contains("FSImage has not been set in the NameNode.")) {
++        //Logs have the expected exception.
++        return;
++      }
++    }
++    fail("Expected exception not present in logs.");
++  }
++
+   /**
+    * Test for the case when the SBN is configured to checkpoint based
+    * on a time period, but no transactions are happening on the

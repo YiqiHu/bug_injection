@@ -1,0 +1,198 @@
+diff --git a/hadoop-tools/hadoop-azure/src/main/java/org/apache/hadoop/fs/azurebfs/AzureBlobFileSystem.java b/hadoop-tools/hadoop-azure/src/main/java/org/apache/hadoop/fs/azurebfs/AzureBlobFileSystem.java
+index 75522462bb0e..4d285534b064 100644
+--- a/hadoop-tools/hadoop-azure/src/main/java/org/apache/hadoop/fs/azurebfs/AzureBlobFileSystem.java
++++ b/hadoop-tools/hadoop-azure/src/main/java/org/apache/hadoop/fs/azurebfs/AzureBlobFileSystem.java
+@@ -26,6 +26,7 @@
+ import java.net.HttpURLConnection;
+ import java.net.URI;
+ import java.net.URISyntaxException;
++import java.nio.file.AccessDeniedException;
+ import java.util.Hashtable;
+ import java.util.List;
+ import java.util.ArrayList;
+@@ -1116,7 +1117,8 @@ private void checkCheckAccessException(final Path path,
+    * @param allowedErrorCodesList varargs list of error codes.
+    * @throws IOException if the exception error code is not on the allowed list.
+    */
+-  private void checkException(final Path path,
++  @VisibleForTesting
++  static void checkException(final Path path,
+                               final AzureBlobFileSystemException exception,
+                               final AzureServiceErrorCode... allowedErrorCodesList) throws IOException {
+     if (exception instanceof AbfsRestOperationException) {
+@@ -1125,16 +1127,21 @@ private void checkException(final Path path,
+       if (ArrayUtils.contains(allowedErrorCodesList, ere.getErrorCode())) {
+         return;
+       }
+-      int statusCode = ere.getStatusCode();
+-
+       //AbfsRestOperationException.getMessage() contains full error info including path/uri.
+-      if (statusCode == HttpURLConnection.HTTP_NOT_FOUND) {
+-        throw (IOException) new FileNotFoundException(ere.getMessage())
++      String message = ere.getMessage();
++
++      switch (ere.getStatusCode()) {
++      case HttpURLConnection.HTTP_NOT_FOUND:
++        throw (IOException) new FileNotFoundException(message)
++            .initCause(exception);
++      case HttpURLConnection.HTTP_CONFLICT:
++        throw (IOException) new FileAlreadyExistsException(message)
+             .initCause(exception);
+-      } else if (statusCode == HttpURLConnection.HTTP_CONFLICT) {
+-        throw (IOException) new FileAlreadyExistsException(ere.getMessage())
++      case HttpURLConnection.HTTP_FORBIDDEN:
++      case HttpURLConnection.HTTP_UNAUTHORIZED:
++        throw (IOException) new AccessDeniedException(message)
+             .initCause(exception);
+-      } else {
++      default:
+         throw ere;
+       }
+     } else if (exception instanceof SASTokenProviderException) {
+diff --git a/hadoop-tools/hadoop-azure/src/test/java/org/apache/hadoop/fs/azurebfs/ITestAzureBlobFileSystemDelegationSAS.java b/hadoop-tools/hadoop-azure/src/test/java/org/apache/hadoop/fs/azurebfs/ITestAzureBlobFileSystemDelegationSAS.java
+index 0cff518524ee..50ce257b4a84 100644
+--- a/hadoop-tools/hadoop-azure/src/test/java/org/apache/hadoop/fs/azurebfs/ITestAzureBlobFileSystemDelegationSAS.java
++++ b/hadoop-tools/hadoop-azure/src/test/java/org/apache/hadoop/fs/azurebfs/ITestAzureBlobFileSystemDelegationSAS.java
+@@ -20,13 +20,12 @@
+ 
+ import java.io.IOException;
+ import java.nio.charset.StandardCharsets;
++import java.nio.file.AccessDeniedException;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.List;
+ import java.util.UUID;
+ 
+-import org.apache.hadoop.fs.azurebfs.contracts.exceptions.AbfsRestOperationException;
+-import org.apache.hadoop.fs.azurebfs.contracts.services.AzureServiceErrorCode;
+ import org.assertj.core.api.Assertions;
+ import org.junit.Assume;
+ import org.junit.Test;
+@@ -52,6 +51,7 @@
+ import org.apache.hadoop.security.AccessControlException;
+ 
+ import static org.apache.hadoop.fs.azurebfs.constants.ConfigurationKeys.FS_AZURE_SAS_TOKEN_PROVIDER_TYPE;
++import static org.apache.hadoop.fs.azurebfs.contracts.services.AzureServiceErrorCode.AUTHORIZATION_PERMISSION_MISS_MATCH;
+ import static org.apache.hadoop.fs.azurebfs.utils.AclTestHelpers.aclEntry;
+ import static org.apache.hadoop.fs.permission.AclEntryScope.ACCESS;
+ import static org.apache.hadoop.fs.permission.AclEntryScope.DEFAULT;
+@@ -432,15 +432,12 @@ public void testSetPermissionForNonOwner() throws Exception {
+         rootStatus.getOwner());
+ 
+     // Attempt to set permission without being the owner.
+-    try {
+-      fs.setPermission(rootPath, new FsPermission(FsAction.ALL,
+-          FsAction.READ_EXECUTE, FsAction.EXECUTE));
+-      assertTrue("Set permission should fail because saoid is not the owner.", false);
+-    } catch (AbfsRestOperationException ex) {
+-      // Should fail with permission mismatch
+-      assertEquals(AzureServiceErrorCode.AUTHORIZATION_PERMISSION_MISS_MATCH,
+-          ex.getErrorCode());
+-    }
++    intercept(AccessDeniedException.class,
++        AUTHORIZATION_PERMISSION_MISS_MATCH.getErrorCode(), () -> {
++          fs.setPermission(rootPath, new FsPermission(FsAction.ALL,
++              FsAction.READ_EXECUTE, FsAction.EXECUTE));
++          return "Set permission should fail because saoid is not the owner.";
++        });
+ 
+     // Attempt to set permission as the owner.
+     fs.setOwner(rootPath, MockDelegationSASTokenProvider.TEST_OWNER, null);
+diff --git a/hadoop-tools/hadoop-azure/src/test/java/org/apache/hadoop/fs/azurebfs/TestAbfsErrorTranslation.java b/hadoop-tools/hadoop-azure/src/test/java/org/apache/hadoop/fs/azurebfs/TestAbfsErrorTranslation.java
+new file mode 100644
+index 000000000000..2c14b7af2821
+--- /dev/null
++++ b/hadoop-tools/hadoop-azure/src/test/java/org/apache/hadoop/fs/azurebfs/TestAbfsErrorTranslation.java
+@@ -0,0 +1,92 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.fs.azurebfs;
++
++import java.io.FileNotFoundException;
++import java.net.HttpURLConnection;
++import java.nio.file.AccessDeniedException;
++
++import org.junit.Test;
++
++import org.apache.hadoop.fs.FileAlreadyExistsException;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.fs.azurebfs.contracts.exceptions.AbfsRestOperationException;
++import org.apache.hadoop.fs.azurebfs.contracts.services.AzureServiceErrorCode;
++import org.apache.hadoop.test.AbstractHadoopTestBase;
++
++import static org.apache.hadoop.fs.azurebfs.AzureBlobFileSystem.checkException;
++import static org.apache.hadoop.fs.azurebfs.contracts.services.AzureServiceErrorCode.AUTHORIZATION_PERMISSION_MISS_MATCH;
++import static org.apache.hadoop.fs.azurebfs.contracts.services.AzureServiceErrorCode.PATH_ALREADY_EXISTS;
++import static org.apache.hadoop.fs.azurebfs.contracts.services.AzureServiceErrorCode.PATH_NOT_FOUND;
++import static org.apache.hadoop.test.LambdaTestUtils.intercept;
++
++/**
++ * Test suite to verify exception conversion, filtering etc.
++ */
++public class TestAbfsErrorTranslation extends AbstractHadoopTestBase {
++
++  public static final Path PATH = new Path("abfs//store/path");
++
++  @Test
++  public void testConvert403ToAccessDenied() throws Throwable {
++    assertTranslated(HttpURLConnection.HTTP_FORBIDDEN,
++        AUTHORIZATION_PERMISSION_MISS_MATCH,
++        AccessDeniedException.class,
++        AUTHORIZATION_PERMISSION_MISS_MATCH.getErrorCode());
++  }
++
++  @Test
++  public void testConvert404ToFNFE() throws Throwable {
++    assertTranslated(HttpURLConnection.HTTP_NOT_FOUND,
++        PATH_NOT_FOUND,
++        FileNotFoundException.class,
++        PATH_NOT_FOUND.getErrorCode());
++  }
++
++  @Test
++  public void testConvert409ToFileAlreadyExistsException() throws Throwable {
++    assertTranslated(HttpURLConnection.HTTP_CONFLICT,
++        PATH_ALREADY_EXISTS,
++        FileAlreadyExistsException.class,
++        PATH_ALREADY_EXISTS.getErrorCode());
++  }
++
++  /**
++   * Assert that for a given status code and AzureServiceErrorCode, a specific
++   * exception class is raised.
++   * @param <E> type of exception
++   * @param httpStatus http status code
++   * @param exitCode AzureServiceErrorCode
++   * @param clazz class of raised exception
++   * @param expectedText text to expect in the exception
++   * @throws Exception any other exception than the one expected
++   */
++  private <E extends Throwable> void assertTranslated(
++      int httpStatus, AzureServiceErrorCode exitCode,
++      Class<E> clazz, String expectedText) throws Exception {
++    AbfsRestOperationException ex =
++        new AbfsRestOperationException(httpStatus, exitCode.getErrorCode(),
++            "", null);
++    intercept(clazz, expectedText, () -> {
++      checkException(PATH, ex);
++      return "expected exception translation from " + ex;
++    });
++  }
++
++}

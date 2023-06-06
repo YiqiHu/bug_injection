@@ -1,0 +1,318 @@
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-rbf/src/main/java/org/apache/hadoop/hdfs/server/federation/store/impl/MountTableStoreImpl.java b/hadoop-hdfs-project/hadoop-hdfs-rbf/src/main/java/org/apache/hadoop/hdfs/server/federation/store/impl/MountTableStoreImpl.java
+index 55ab38ee0733..680752b8efe3 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-rbf/src/main/java/org/apache/hadoop/hdfs/server/federation/store/impl/MountTableStoreImpl.java
++++ b/hadoop-hdfs-project/hadoop-hdfs-rbf/src/main/java/org/apache/hadoop/hdfs/server/federation/store/impl/MountTableStoreImpl.java
+@@ -26,6 +26,7 @@
+ 
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.classification.InterfaceStability;
++import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.permission.FsAction;
+ import org.apache.hadoop.hdfs.server.federation.router.RouterAdminServer;
+ import org.apache.hadoop.hdfs.server.federation.router.RouterPermissionChecker;
+@@ -61,24 +62,69 @@ public MountTableStoreImpl(StateStoreDriver driver) {
+     super(driver);
+   }
+ 
++  /**
++   * Whether a mount table entry can be accessed by the current context.
++   *
++   * @param src mount entry being accessed
++   * @param action type of action being performed on the mount entry
++   * @throws AccessControlException if mount table cannot be accessed
++   */
++  private void checkMountTableEntryPermission(String src, FsAction action)
++      throws IOException {
++    final MountTable partial = MountTable.newInstance();
++    partial.setSourcePath(src);
++    final Query<MountTable> query = new Query<>(partial);
++    final MountTable entry = getDriver().get(getRecordClass(), query);
++    if (entry != null) {
++      RouterPermissionChecker pc = RouterAdminServer.getPermissionChecker();
++      if (pc != null) {
++        pc.checkPermission(entry, action);
++      }
++    }
++  }
++
++  /**
++   * Check parent path permission recursively. It needs WRITE permission
++   * of the nearest parent entry and other EXECUTE permission.
++   * @param src mount entry being checked
++   * @throws AccessControlException if mount table cannot be accessed
++   */
++  private void checkMountTablePermission(final String src) throws IOException {
++    String parent = src.substring(0, src.lastIndexOf(Path.SEPARATOR));
++    checkMountTableEntryPermission(parent, FsAction.WRITE);
++    while (!parent.isEmpty()) {
++      parent = parent.substring(0, parent.lastIndexOf(Path.SEPARATOR));
++      checkMountTableEntryPermission(parent, FsAction.EXECUTE);
++    }
++  }
++
++  /**
++   * When add mount table entry, it needs WRITE permission of the nearest parent
++   * entry if exist, and EXECUTE permission of other ancestor entries.
++   * @param request add mount table entry request
++   * @return add mount table entry response
++   * @throws IOException if mount table cannot be accessed
++   */
+   @Override
+   public AddMountTableEntryResponse addMountTableEntry(
+       AddMountTableEntryRequest request) throws IOException {
+     MountTable mountTable = request.getEntry();
+     if (mountTable != null) {
+-      RouterPermissionChecker pc = RouterAdminServer.getPermissionChecker();
+-      if (pc != null) {
+-        pc.checkPermission(mountTable, FsAction.WRITE);
+-      }
+       mountTable.validate();
++      final String src = mountTable.getSourcePath();
++      checkMountTablePermission(src);
++      boolean status = getDriver().put(mountTable, false, true);
++      AddMountTableEntryResponse response =
++          AddMountTableEntryResponse.newInstance();
++      response.setStatus(status);
++      updateCacheAllRouters();
++      return response;
++    } else {
++      AddMountTableEntryResponse response =
++          AddMountTableEntryResponse.newInstance();
++      response.setStatus(false);
++      return response;
+     }
+-
+-    boolean status = getDriver().put(mountTable, false, true);
+-    AddMountTableEntryResponse response =
+-        AddMountTableEntryResponse.newInstance();
+-    response.setStatus(status);
+-    updateCacheAllRouters();
+-    return response;
+   }
+ 
+   @Override
+@@ -86,19 +132,21 @@ public UpdateMountTableEntryResponse updateMountTableEntry(
+       UpdateMountTableEntryRequest request) throws IOException {
+     MountTable mountTable = request.getEntry();
+     if (mountTable != null) {
+-      RouterPermissionChecker pc = RouterAdminServer.getPermissionChecker();
+-      if (pc != null) {
+-        pc.checkPermission(mountTable, FsAction.WRITE);
+-      }
+       mountTable.validate();
++      final String srcPath = mountTable.getSourcePath();
++      checkMountTableEntryPermission(srcPath, FsAction.WRITE);
++      boolean status = getDriver().put(mountTable, true, true);
++      UpdateMountTableEntryResponse response =
++          UpdateMountTableEntryResponse.newInstance();
++      response.setStatus(status);
++      updateCacheAllRouters();
++      return response;
++    } else {
++      UpdateMountTableEntryResponse response =
++          UpdateMountTableEntryResponse.newInstance();
++      response.setStatus(false);
++      return response;
+     }
+-
+-    boolean status = getDriver().put(mountTable, true, true);
+-    UpdateMountTableEntryResponse response =
+-        UpdateMountTableEntryResponse.newInstance();
+-    response.setStatus(status);
+-    updateCacheAllRouters();
+-    return response;
+   }
+ 
+   @Override
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-rbf/src/test/java/org/apache/hadoop/hdfs/server/federation/router/TestRouterAdminCLI.java b/hadoop-hdfs-project/hadoop-hdfs-rbf/src/test/java/org/apache/hadoop/hdfs/server/federation/router/TestRouterAdminCLI.java
+index 303b3f6433a6..c6e6672adc58 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-rbf/src/test/java/org/apache/hadoop/hdfs/server/federation/router/TestRouterAdminCLI.java
++++ b/hadoop-hdfs-project/hadoop-hdfs-rbf/src/test/java/org/apache/hadoop/hdfs/server/federation/router/TestRouterAdminCLI.java
+@@ -519,6 +519,187 @@ public void testMountTableDefaultACL() throws Exception {
+     assertEquals((short) 0755, mountTable.getMode().toShort());
+   }
+ 
++  @Test
++  public void testUpdateMountTableWithoutPermission() throws Exception {
++    UserGroupInformation superUser = UserGroupInformation.getCurrentUser();
++    String superUserName = superUser.getShortUserName();
++    // re-set system out for testing
++    System.setOut(new PrintStream(out));
++
++    try {
++      stateStore.loadCache(MountTableStoreImpl.class, true);
++      // add mount table using super user.
++      String[] argv = new String[]{"-add", "/testpath3-1", "ns0", "/testdir3-1",
++          "-owner", superUserName, "-group", superUserName, "-mode", "755"};
++      assertEquals(0, ToolRunner.run(admin, argv));
++
++      UserGroupInformation remoteUser = UserGroupInformation
++          .createRemoteUser(TEST_USER);
++      UserGroupInformation.setLoginUser(remoteUser);
++
++      stateStore.loadCache(MountTableStoreImpl.class, true);
++      // update mount table using normal user
++      argv = new String[]{"-update", "/testpath3-1", "ns0", "/testdir3-2",
++          "-owner", TEST_USER, "-group", TEST_USER, "-mode", "777"};
++      assertEquals("Normal user update mount table which created by " +
++          "superuser unexpected.", -1, ToolRunner.run(admin, argv));
++    } finally {
++      // set back login user
++      UserGroupInformation.setLoginUser(superUser);
++    }
++  }
++
++  @Test
++  public void testOperateMountTableWithGroupPermission() throws Exception {
++    UserGroupInformation superUser = UserGroupInformation.getCurrentUser();
++    // re-set system out for testing
++    System.setOut(new PrintStream(out));
++
++    try {
++      String testUserA = "test-user-a";
++      String testUserB = "test-user-b";
++      String testUserC = "test-user-c";
++      String testUserD = "test-user-d";
++      String testGroup = "test-group";
++
++      stateStore.loadCache(MountTableStoreImpl.class, true);
++      // add mount point with usera.
++      UserGroupInformation userA = UserGroupInformation.createUserForTesting(
++          testUserA, new String[] {testGroup});
++      UserGroupInformation.setLoginUser(userA);
++
++      String[] argv = new String[]{"-add", "/testpath4-1", "ns0", "/testdir4-1",
++          "-owner", testUserA, "-group", testGroup, "-mode", "775"};
++      assertEquals("Normal user can't add mount table unexpected.", 0,
++          ToolRunner.run(admin, argv));
++
++      stateStore.loadCache(MountTableStoreImpl.class, true);
++      // update mount point with userb which is same group with owner.
++      UserGroupInformation userB = UserGroupInformation.createUserForTesting(
++          testUserB, new String[] {testGroup});
++      UserGroupInformation.setLoginUser(userB);
++      argv = new String[]{"-update", "/testpath4-1", "ns0", "/testdir4-2",
++          "-owner", testUserA, "-group", testGroup, "-mode", "775"};
++      assertEquals("Another user in same group can't update mount table " +
++          "unexpected.", 0, ToolRunner.run(admin, argv));
++
++      stateStore.loadCache(MountTableStoreImpl.class, true);
++      // update mount point with userc which is not same group with owner.
++      UserGroupInformation userC = UserGroupInformation.createUserForTesting(
++          testUserC, new String[] {});
++      UserGroupInformation.setLoginUser(userC);
++      argv = new String[]{"-update", "/testpath4-1", "ns0", "/testdir4-3",
++          "-owner", testUserA, "-group", testGroup, "-mode", "775"};
++      assertEquals("Another user not in same group have no permission but " +
++              "update mount table successful unexpected.", -1,
++          ToolRunner.run(admin, argv));
++
++      stateStore.loadCache(MountTableStoreImpl.class, true);
++      // add mount point with userd but immediate parent of mount point
++      // does not exist.
++      UserGroupInformation userD = UserGroupInformation.createUserForTesting(
++          testUserD, new String[] {testGroup});
++      UserGroupInformation.setLoginUser(userD);
++      argv = new String[]{"-add", "/testpath4-1/foo/bar", "ns0",
++          "/testdir4-1/foo/bar", "-owner", testUserD, "-group", testGroup,
++          "-mode", "775"};
++      assertEquals("Normal user can't add mount table unexpected.", 0,
++          ToolRunner.run(admin, argv));
++
++      // test remove mount point with userc.
++      UserGroupInformation.setLoginUser(userC);
++      argv = new String[]{"-rm", "/testpath4-1"};
++      assertEquals(-1, ToolRunner.run(admin, argv));
++
++      // test remove mount point with userb.
++      UserGroupInformation.setLoginUser(userB);
++      assertEquals("Another user in same group can't remove mount table " +
++          "unexpected.", 0, ToolRunner.run(admin, argv));
++    } finally {
++      // set back login user
++      UserGroupInformation.setLoginUser(superUser);
++    }
++  }
++
++  @Test
++  public void testOperateMountTableWithSuperUserPermission() throws Exception {
++    UserGroupInformation superUser = UserGroupInformation.getCurrentUser();
++    // re-set system out for testing
++    System.setOut(new PrintStream(out));
++
++    try {
++      String testUserA = "test-user-a";
++      String testGroup = "test-group";
++
++      stateStore.loadCache(MountTableStoreImpl.class, true);
++      // add mount point with usera.
++      UserGroupInformation userA = UserGroupInformation.createUserForTesting(
++          testUserA, new String[] {testGroup});
++      UserGroupInformation.setLoginUser(userA);
++      String[] argv = new String[]{"-add", "/testpath5-1", "ns0", "/testdir5-1",
++          "-owner", testUserA, "-group", testGroup, "-mode", "755"};
++      assertEquals(0, ToolRunner.run(admin, argv));
++
++      // test update mount point with super user.
++      stateStore.loadCache(MountTableStoreImpl.class, true);
++      UserGroupInformation.setLoginUser(superUser);
++      argv = new String[]{"-update", "/testpath5-1", "ns0", "/testdir5-2",
++          "-owner", testUserA, "-group", testGroup, "-mode", "755"};
++      assertEquals("Super user can't update mount table unexpected.", 0,
++          ToolRunner.run(admin, argv));
++
++      // test remove mount point with super user.
++      argv = new String[]{"-rm", "/testpath5-1"};
++      assertEquals("Super user can't remove mount table unexpected.", 0,
++          ToolRunner.run(admin, argv));
++    } finally {
++      // set back login user
++      UserGroupInformation.setLoginUser(superUser);
++    }
++  }
++
++  @Test
++  public void testAddMountTableIfParentExist() throws Exception {
++    UserGroupInformation superUser = UserGroupInformation.getCurrentUser();
++    // re-set system out for testing
++    System.setOut(new PrintStream(out));
++
++    try {
++      String testUserA = "test-user-a";
++      String testUserB = "test-user-b";
++      String testGroup = "test-group";
++
++      stateStore.loadCache(MountTableStoreImpl.class, true);
++      // add mount point with usera.
++      UserGroupInformation userA = UserGroupInformation.createUserForTesting(
++          testUserA, new String[] {testGroup});
++      UserGroupInformation.setLoginUser(userA);
++      String[] argv = new String[]{"-add", "/testpath6-1", "ns0", "/testdir6-1",
++          "-owner", testUserA, "-group", testGroup, "-mode", "755"};
++      assertEquals(0, ToolRunner.run(admin, argv));
++
++      // add mount point with userb will be success since the nearest parent
++      // does not exist but have other EXECUTE permission.
++      UserGroupInformation userB = UserGroupInformation.createUserForTesting(
++          testUserB, new String[] {testGroup});
++      UserGroupInformation.setLoginUser(userB);
++      argv = new String[]{"-add", "/testpath6-1/parent/foo", "ns0",
++          "/testdir6-1/parent/foo", "-owner", testUserA, "-group", testGroup,
++          "-mode", "755"};
++      assertEquals(0, ToolRunner.run(admin, argv));
++
++      // add mount point with userb will be failure since the nearest parent
++      // does exist but no WRITE permission.
++      argv = new String[]{"-add", "/testpath6-1/foo", "ns0",
++          "/testdir6-1/foo", "-owner", testUserA, "-group", testGroup,
++          "-mode", "755"};
++      assertEquals(-1, ToolRunner.run(admin, argv));
++    } finally {
++      // set back login user
++      UserGroupInformation.setLoginUser(superUser);
++    }
++  }
++
+   @Test
+   public void testMountTablePermissions() throws Exception {
+     // re-set system out for testing

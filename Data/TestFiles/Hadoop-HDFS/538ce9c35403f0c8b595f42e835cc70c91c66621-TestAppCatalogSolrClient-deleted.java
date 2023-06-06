@@ -1,0 +1,1 @@
+    String solrHome = targetLocation + "/solr";

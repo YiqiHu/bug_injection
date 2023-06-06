@@ -1,0 +1,145 @@
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirAttrOp.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirAttrOp.java
+index a2c9f6bd76bd..04913d1a7cee 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirAttrOp.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirAttrOp.java
+@@ -48,11 +48,6 @@
+ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_QUOTA_BY_STORAGETYPE_ENABLED_KEY;
+ 
+ public class FSDirAttrOp {
+-
+-  protected enum SetRepStatus {
+-    UNCHANGED, INVALID, SUCCESS
+-  }
+-
+   static FileStatus setPermission(
+       FSDirectory fsd, FSPermissionChecker pc, final String src,
+       FsPermission permission) throws IOException {
+@@ -139,11 +134,11 @@ static FileStatus setTimes(
+     return fsd.getAuditFileInfo(iip);
+   }
+ 
+-  static SetRepStatus setReplication(
++  static boolean setReplication(
+       FSDirectory fsd, FSPermissionChecker pc, BlockManager bm, String src,
+       final short replication) throws IOException {
+     bm.verifyReplication(src, replication, null);
+-    final SetRepStatus status;
++    final boolean isFile;
+     fsd.writeLock();
+     try {
+       final INodesInPath iip = fsd.resolvePath(pc, src, DirOp.WRITE);
+@@ -151,14 +146,16 @@ static SetRepStatus setReplication(
+         fsd.checkPathAccess(pc, iip, FsAction.WRITE);
+       }
+ 
+-      status = unprotectedSetReplication(fsd, iip, replication);
+-      if (status == SetRepStatus.SUCCESS) {
++      final BlockInfo[] blocks = unprotectedSetReplication(fsd, iip,
++                                                           replication);
++      isFile = blocks != null;
++      if (isFile) {
+         fsd.getEditLog().logSetReplication(iip.getPath(), replication);
+       }
+     } finally {
+       fsd.writeUnlock();
+     }
+-    return status;
++    return isFile;
+   }
+ 
+   static FileStatus unsetStoragePolicy(FSDirectory fsd, FSPermissionChecker pc,
+@@ -384,7 +381,7 @@ static INodeDirectory unprotectedSetQuota(
+     return dirNode;
+   }
+ 
+-  static SetRepStatus unprotectedSetReplication(
++  static BlockInfo[] unprotectedSetReplication(
+       FSDirectory fsd, INodesInPath iip, short replication)
+       throws QuotaExceededException, UnresolvedLinkException,
+       SnapshotAccessControlException, UnsupportedActionException {
+@@ -394,20 +391,12 @@ static SetRepStatus unprotectedSetReplication(
+     final INode inode = iip.getLastINode();
+     if (inode == null || !inode.isFile() || inode.asFile().isStriped()) {
+       // TODO we do not support replication on stripe layout files yet
+-      // We return invalid here, so we skip writing an edit, but also write an
+-      // unsuccessful audit message.
+-      return SetRepStatus.INVALID;
++      return null;
+     }
+ 
+     INodeFile file = inode.asFile();
+     // Make sure the directory has sufficient quotas
+     short oldBR = file.getPreferredBlockReplication();
+-    if (oldBR == replication) {
+-      // No need to do anything as the requested rep factor is the same as
+-      // existing. Returning UNCHANGED to we can skip writing edits, but still
+-      // log a successful audit message.
+-      return SetRepStatus.UNCHANGED;
+-    }
+ 
+     long size = file.computeFileSize(true, true);
+     // Ensure the quota does not exceed
+@@ -438,7 +427,7 @@ static SetRepStatus unprotectedSetReplication(
+                              oldBR, iip.getPath());
+       }
+     }
+-    return SetRepStatus.SUCCESS;
++    return file.getBlocks();
+   }
+ 
+   static void unprotectedSetStoragePolicy(FSDirectory fsd, BlockManager bm,
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+index 6ab57ed880a4..0a00aa65c0bc 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+@@ -2448,7 +2448,7 @@ void createSymlink(String target, String link,
+   boolean setReplication(final String src, final short replication)
+       throws IOException {
+     final String operationName = "setReplication";
+-    FSDirAttrOp.SetRepStatus status;
++    boolean success = false;
+     checkOperation(OperationCategory.WRITE);
+     final FSPermissionChecker pc = getPermissionChecker();
+     FSPermissionChecker.setOperationType(operationName);
+@@ -2457,7 +2457,7 @@ boolean setReplication(final String src, final short replication)
+       try {
+         checkOperation(OperationCategory.WRITE);
+         checkNameNodeSafeMode("Cannot set replication for " + src);
+-        status = FSDirAttrOp.setReplication(dir, pc, blockManager, src,
++        success = FSDirAttrOp.setReplication(dir, pc, blockManager, src,
+             replication);
+       } finally {
+         writeUnlock(operationName, getLockReportInfoSupplier(src));
+@@ -2466,12 +2466,11 @@ boolean setReplication(final String src, final short replication)
+       logAuditEvent(false, operationName, src);
+       throw e;
+     }
+-    if (status == FSDirAttrOp.SetRepStatus.SUCCESS) {
++    if (success) {
+       getEditLog().logSync();
++      logAuditEvent(true, operationName, src);
+     }
+-    logAuditEvent(status != FSDirAttrOp.SetRepStatus.INVALID,
+-        operationName, src);
+-    return status != FSDirAttrOp.SetRepStatus.INVALID;
++    return success;
+   }
+ 
+   /**
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestSetrepIncreasing.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestSetrepIncreasing.java
+index d89b0777633b..497d450de250 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestSetrepIncreasing.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestSetrepIncreasing.java
+@@ -82,12 +82,6 @@ static void setrep(int fromREP, int toREP, boolean simulatedStorage) throws IOEx
+   public void testSetrepIncreasing() throws IOException {
+     setrep(3, 7, false);
+   }
+-
+-  @Test(timeout=120000)
+-  public void testSetrepSameRepValue() throws IOException {
+-    setrep(3, 3, false);
+-  }
+-
+   @Test(timeout=120000)
+   public void testSetrepIncreasingSimulatedStorage() throws IOException {
+     setrep(3, 7, true);

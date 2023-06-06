@@ -1,0 +1,230 @@
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
+index d7b576af8bfd..17318631c8e5 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
+@@ -2980,55 +2980,31 @@ S3AFileStatus innerGetFileStatus(final Path f,
+         // a file has been found in a non-auth path and the caller has not said
+         // they only care about directories
+         LOG.debug("Metadata for {} found in the non-auth metastore.", path);
+-        // If the timestamp of the pm is close to "now", we don't need to
+-        // bother with a check of S3. that means:
+-        // one of : status modtime is close to now,
+-        //  or pm.getLastUpdated() == now
+-
+-        // get the time in which a status modtime is considered valid
+-        // in a non-auth metastore
+-        long validTime =
+-            ttlTimeProvider.getNow() - ttlTimeProvider.getMetadataTtl();
+-        final long msModTime = msStatus.getModificationTime();
+-
+-        if (msModTime < validTime) {
+-          LOG.debug("Metastore entry of {} is out of date, probing S3", path);
+-          try {
+-            S3AFileStatus s3AFileStatus = s3GetFileStatus(path,
+-                key,
+-                probes,
+-                tombstones,
+-                needEmptyDirectoryFlag);
+-            // if the new status is more current than that in the metastore,
+-            // it means S3 has changed and the store needs updating
+-            final long s3ModTime = s3AFileStatus.getModificationTime();
+-
+-            if (s3ModTime > msModTime) {
+-              // there's new data in S3
+-              LOG.debug("S3Guard metadata for {} is outdated;"
+-                      + " s3modtime={}; msModTime={} updating metastore",
+-                  path, s3ModTime, msModTime);
+-              // add to S3Guard
+-              S3Guard.putAndReturn(metadataStore, s3AFileStatus,
+-                  ttlTimeProvider);
+-            } else {
+-              // the modtime of the data is the same as/older than the s3guard
+-              // value either an old object has been found, or the existing one
+-              // was retrieved in both cases -refresh the S3Guard entry so the
+-              // record's TTL is updated.
+-              S3Guard.refreshEntry(metadataStore, pm, s3AFileStatus,
+-                  ttlTimeProvider);
+-            }
+-            // return the value
+-            // note that the checks for empty dir status below can be skipped
+-            // because the call to s3GetFileStatus include the checks there
+-            return s3AFileStatus;
+-          } catch (FileNotFoundException fne) {
+-            // the attempt to refresh the record failed because there was
+-            // no entry. Either it is a new file not visible, or it
+-            // has been deleted (and therefore S3Guard is out of sync with S3)
+-            LOG.warn("Failed to find file {}. Either it is not yet visible, or "
+-                + "it has been deleted.", path);
++        final long msModTime = pm.getFileStatus().getModificationTime();
++
++        S3AFileStatus s3AFileStatus;
++        try {
++          s3AFileStatus = s3GetFileStatus(path,
++              key,
++              probes,
++              tombstones,
++              needEmptyDirectoryFlag);
++        } catch (FileNotFoundException fne) {
++          LOG.trace("File Not Found from probes for {}", key, fne);
++          s3AFileStatus = null;
++        }
++        if (s3AFileStatus == null) {
++          LOG.warn("Failed to find file {}. Either it is not yet visible, or "
++              + "it has been deleted.", path);
++        } else {
++          final long s3ModTime = s3AFileStatus.getModificationTime();
++
++          if(s3ModTime > msModTime) {
++            LOG.debug("S3Guard metadata for {} is outdated;"
++                + " s3modtime={}; msModTime={} updating metastore",
++                path, s3ModTime, msModTime);
++            return S3Guard.putAndReturn(metadataStore, s3AFileStatus,
++                ttlTimeProvider);
+           }
+         }
+       }
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3AEncryptionSSEC.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3AEncryptionSSEC.java
+index 1c395b2adcfc..852b49ac1e1f 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3AEncryptionSSEC.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3AEncryptionSSEC.java
+@@ -314,7 +314,7 @@ public void testListStatusEncryptedFile() throws Exception {
+     fsKeyB = createNewFileSystemWithSSECKey(KEY_4);
+ 
+     //Until this point, no exception is thrown about access
+-    if (!fsKeyB.hasMetadataStore()) {
++    if (statusProbesCheckS3(fsKeyB, fileToStat)) {
+       intercept(AccessDeniedException.class,
+           SERVICE_AMAZON_S3_STATUS_CODE_403,
+           () -> fsKeyB.listStatus(fileToStat));
+@@ -323,6 +323,16 @@ public void testListStatusEncryptedFile() throws Exception {
+     }
+   }
+ 
++  /**
++   * Do file status probes check S3?
++   * @param fs filesystem
++   * @param path file path
++   * @return true if check for a path being a file will issue a HEAD request.
++   */
++  private boolean statusProbesCheckS3(S3AFileSystem fs, Path path) {
++    return !fs.hasMetadataStore() || !fs.allowAuthoritative(path);
++  }
++
+   /**
+    * It is possible to delete directories without the proper encryption key and
+    * the hierarchy above it.
+@@ -340,7 +350,7 @@ public void testDeleteEncryptedObjectWithDifferentKey() throws Exception {
+     Path fileToDelete = new Path(pathABC, "filetobedeleted.txt");
+     writeThenReadFile(fileToDelete, TEST_FILE_LEN);
+     fsKeyB = createNewFileSystemWithSSECKey(KEY_4);
+-    if (!fsKeyB.hasMetadataStore()) {
++    if (statusProbesCheckS3(fsKeyB, fileToDelete)) {
+       intercept(AccessDeniedException.class,
+           SERVICE_AMAZON_S3_STATUS_CODE_403,
+           () -> fsKeyB.delete(fileToDelete, false));
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3AFileOperationCost.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3AFileOperationCost.java
+index 941e701333b0..6461ecda36a8 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3AFileOperationCost.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3AFileOperationCost.java
+@@ -92,7 +92,8 @@ public void testCostOfLocatedFileStatusOnFile() throws Throwable {
+         whenRaw(FILE_STATUS_FILE_PROBE
+             .plus(LIST_LOCATED_STATUS_LIST_OP)),
+         whenAuthoritative(LIST_LOCATED_STATUS_LIST_OP),
+-        whenNonauth(LIST_LOCATED_STATUS_LIST_OP));
++        whenNonauth(LIST_LOCATED_STATUS_LIST_OP
++            .plus(S3GUARD_NONAUTH_FILE_STATUS_PROBE)));
+   }
+ 
+   @Test
+@@ -187,7 +188,8 @@ public void testCostOfListStatusOnFile() throws Throwable {
+             whenRaw(LIST_STATUS_LIST_OP
+                     .plus(GET_FILE_STATUS_ON_FILE)),
+             whenAuthoritative(LIST_STATUS_LIST_OP),
+-            whenNonauth(LIST_STATUS_LIST_OP));
++            whenNonauth(LIST_STATUS_LIST_OP
++                .plus(S3GUARD_NONAUTH_FILE_STATUS_PROBE)));
+   }
+ 
+   @Test
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3ARemoteFileChanged.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3ARemoteFileChanged.java
+index 01a14ef8e930..3fd70be93199 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3ARemoteFileChanged.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3ARemoteFileChanged.java
+@@ -326,7 +326,7 @@ protected Path path() throws IOException {
+    * @return a number >= 0.
+    */
+   private int getFileStatusHeadCount() {
+-    return authMode ? 0 : 0;
++    return authMode ? 0 : 1;
+   }
+ 
+   /**
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/auth/ITestRestrictedReadAccess.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/auth/ITestRestrictedReadAccess.java
+index 2848fb70b6d6..155521784214 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/auth/ITestRestrictedReadAccess.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/auth/ITestRestrictedReadAccess.java
+@@ -422,7 +422,7 @@ public void checkBasicFileOperations() throws Throwable {
+ 
+     readonlyFS.getFileStatus(emptyDir);
+     // now look at a file; the outcome depends on the mode.
+-    accessDeniedIf(!s3guard, () ->
++    accessDeniedIf(!guardedInAuthMode, () ->
+         readonlyFS.getFileStatus(subdirFile));
+ 
+     // irrespective of mode, the attempt to read the data will fail.
+@@ -437,7 +437,7 @@ public void checkBasicFileOperations() throws Throwable {
+     // This means that permissions on the file do not get checked.
+     // See: HADOOP-16464.
+     Optional<FSDataInputStream> optIn = accessDeniedIf(
+-        !s3guard, () -> readonlyFS.open(emptyFile));
++        !guardedInAuthMode, () -> readonlyFS.open(emptyFile));
+     if (optIn.isPresent()) {
+       try (FSDataInputStream is = optIn.get()) {
+         Assertions.assertThat(is.read())
+@@ -455,8 +455,8 @@ public void checkGlobOperations() throws Throwable {
+     describe("Glob Status operations");
+     // baseline: the real filesystem on a subdir
+     globFS(getFileSystem(), subdirFile, null, false, 1);
+-    // a file fails if not guarded
+-    globFS(readonlyFS, subdirFile, null, !s3guard, 1);
++    // a file fails if not in auth mode
++    globFS(readonlyFS, subdirFile, null, !guardedInAuthMode, 1);
+     // empty directories don't fail.
+     FileStatus[] st = globFS(readonlyFS, emptyDir, null, false, 1);
+     if (s3guard) {
+@@ -554,7 +554,7 @@ public void checkLocatedFileStatusScanFile() throws Throwable {
+         true,
+         TEXT_FILE,
+         true);
+-    accessDeniedIf(!s3guard,
++    accessDeniedIf(!guardedInAuthMode,
+         () -> fetcher.getFileStatuses())
+         .ifPresent(stats -> {
+           Assertions.assertThat(stats)
+@@ -619,7 +619,7 @@ public void checkLocatedFileStatusNonexistentPath() throws Throwable {
+   public void checkDeleteOperations() throws Throwable {
+     describe("Testing delete operations");
+     readonlyFS.delete(emptyDir, true);
+-    if (!s3guard) {
++    if (!authMode) {
+       // to fail on HEAD
+       accessDenied(() -> readonlyFS.delete(emptyFile, true));
+     } else {
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/performance/OperationCost.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/performance/OperationCost.java
+index 54b68663fe9b..0a1438d586e4 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/performance/OperationCost.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/performance/OperationCost.java
+@@ -154,6 +154,13 @@ public final class OperationCost {
+   public static final OperationCost CREATE_FILE_NO_OVERWRITE =
+       FILE_STATUS_ALL_PROBES;
+ 
++  /**
++   * S3Guard in non-auth mode always attempts a single file
++   * status call.
++   */
++  public static final OperationCost S3GUARD_NONAUTH_FILE_STATUS_PROBE =
++      FILE_STATUS_FILE_PROBE;
++
+   /** Expected HEAD count. */
+   private final int head;
+ 

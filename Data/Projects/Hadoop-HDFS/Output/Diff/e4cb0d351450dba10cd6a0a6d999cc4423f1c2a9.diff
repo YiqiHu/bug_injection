@@ -1,0 +1,508 @@
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/InodeTree.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/InodeTree.java
+index fceb73a56a4f..2a38693d09d3 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/InodeTree.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/InodeTree.java
+@@ -706,19 +706,27 @@ private LinkEntry buildLinkRegexEntry(
+     final T targetFileSystem;
+     final String resolvedPath;
+     final Path remainingPath;   // to resolve in the target FileSystem
++    private final boolean isLastInternalDirLink;
+ 
+     ResolveResult(final ResultKind k, final T targetFs, final String resolveP,
+-        final Path remainingP) {
++        final Path remainingP, boolean isLastIntenalDirLink) {
+       kind = k;
+       targetFileSystem = targetFs;
+       resolvedPath = resolveP;
+       remainingPath = remainingP;
++      this.isLastInternalDirLink = isLastIntenalDirLink;
+     }
+ 
+     // Internal dir path resolution completed within the mount table
+     boolean isInternalDir() {
+       return (kind == ResultKind.INTERNAL_DIR);
+     }
++
++    // Indicates whether the internal dir path resolution completed at the link
++    // or resolved due to fallback.
++    boolean isLastInternalDirLink() {
++      return this.isLastInternalDirLink;
++    }
+   }
+ 
+   /**
+@@ -737,7 +745,7 @@ ResolveResult<T> resolve(final String p, final boolean resolveLastComponent)
+           getRootDir().getInternalDirFs()
+           : getRootLink().getTargetFileSystem();
+       resolveResult = new ResolveResult<T>(ResultKind.INTERNAL_DIR,
+-          targetFs, root.fullPath, SlashPath);
++          targetFs, root.fullPath, SlashPath, false);
+       return resolveResult;
+     }
+ 
+@@ -755,7 +763,8 @@ ResolveResult<T> resolve(final String p, final boolean resolveLastComponent)
+       }
+       remainingPath = new Path(remainingPathStr.toString());
+       resolveResult = new ResolveResult<T>(ResultKind.EXTERNAL_DIR,
+-          getRootLink().getTargetFileSystem(), root.fullPath, remainingPath);
++          getRootLink().getTargetFileSystem(), root.fullPath, remainingPath,
++          true);
+       return resolveResult;
+     }
+     Preconditions.checkState(root.isInternalDir());
+@@ -775,7 +784,7 @@ ResolveResult<T> resolve(final String p, final boolean resolveLastComponent)
+         if (hasFallbackLink()) {
+           resolveResult = new ResolveResult<T>(ResultKind.EXTERNAL_DIR,
+               getRootFallbackLink().getTargetFileSystem(), root.fullPath,
+-              new Path(p));
++              new Path(p), false);
+           return resolveResult;
+         } else {
+           StringBuilder failedAt = new StringBuilder(path[0]);
+@@ -801,7 +810,8 @@ ResolveResult<T> resolve(final String p, final boolean resolveLastComponent)
+           remainingPath = new Path(remainingPathStr.toString());
+         }
+         resolveResult = new ResolveResult<T>(ResultKind.EXTERNAL_DIR,
+-            link.getTargetFileSystem(), nextInode.fullPath, remainingPath);
++            link.getTargetFileSystem(), nextInode.fullPath, remainingPath,
++            true);
+         return resolveResult;
+       } else if (nextInode.isInternalDir()) {
+         curInode = (INodeDir<T>) nextInode;
+@@ -824,7 +834,7 @@ ResolveResult<T> resolve(final String p, final boolean resolveLastComponent)
+       remainingPath = new Path(remainingPathStr.toString());
+     }
+     resolveResult = new ResolveResult<T>(ResultKind.INTERNAL_DIR,
+-        curInode.getInternalDirFs(), curInode.fullPath, remainingPath);
++        curInode.getInternalDirFs(), curInode.fullPath, remainingPath, false);
+     return resolveResult;
+   }
+ 
+@@ -874,7 +884,7 @@ protected ResolveResult<T> buildResolveResultForRegexMountPoint(
+       T targetFs = getTargetFileSystem(
+           new URI(targetOfResolvedPathStr));
+       return new ResolveResult<T>(resultKind, targetFs, resolvedPathStr,
+-          remainingPath);
++          remainingPath, true);
+     } catch (IOException ex) {
+       LOGGER.error(String.format(
+           "Got Exception while build resolve result."
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFileSystem.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFileSystem.java
+index b90699675c63..0b4e68b1e5cd 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFileSystem.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFileSystem.java
+@@ -670,18 +670,52 @@ public FSDataInputStream open(final Path f, final int bufferSize)
+   @Override
+   public boolean rename(final Path src, final Path dst) throws IOException {
+     // passing resolveLastComponet as false to catch renaming a mount point to 
+-    // itself. We need to catch this as an internal operation and fail.
+-    InodeTree.ResolveResult<FileSystem> resSrc = 
+-      fsState.resolve(getUriPath(src), false); 
+-  
++    // itself. We need to catch this as an internal operation and fail if no
++    // fallback.
++    InodeTree.ResolveResult<FileSystem> resSrc =
++        fsState.resolve(getUriPath(src), false);
++
+     if (resSrc.isInternalDir()) {
+-      throw readOnlyMountTable("rename", src);
++      if (fsState.getRootFallbackLink() == null) {
++        // If fallback is null, we can't rename from src.
++        throw readOnlyMountTable("rename", src);
++      }
++      InodeTree.ResolveResult<FileSystem> resSrcWithLastComp =
++          fsState.resolve(getUriPath(src), true);
++      if (resSrcWithLastComp.isInternalDir() || resSrcWithLastComp
++          .isLastInternalDirLink()) {
++        throw readOnlyMountTable("rename", src);
++      } else {
++        // This is fallback and let's set the src fs with this fallback
++        resSrc = resSrcWithLastComp;
++      }
+     }
+-      
+-    InodeTree.ResolveResult<FileSystem> resDst = 
+-      fsState.resolve(getUriPath(dst), false);
++
++    InodeTree.ResolveResult<FileSystem> resDst =
++        fsState.resolve(getUriPath(dst), false);
++
+     if (resDst.isInternalDir()) {
+-          throw readOnlyMountTable("rename", dst);
++      if (fsState.getRootFallbackLink() == null) {
++        // If fallback is null, we can't rename to dst.
++        throw readOnlyMountTable("rename", dst);
++      }
++      // if the fallback exist, we may have chance to rename to fallback path
++      // where dst parent is matching to internalDir.
++      InodeTree.ResolveResult<FileSystem> resDstWithLastComp =
++          fsState.resolve(getUriPath(dst), true);
++      if (resDstWithLastComp.isInternalDir()) {
++        // We need to get fallback here. If matching fallback path not exist, it
++        // will fail later. This is a very special case: Even though we are on
++        // internal directory, we should allow to rename, so that src files will
++        // moved under matching fallback dir.
++        resDst = new InodeTree.ResolveResult<FileSystem>(
++            InodeTree.ResultKind.INTERNAL_DIR,
++            fsState.getRootFallbackLink().getTargetFileSystem(), "/",
++            new Path(resDstWithLastComp.resolvedPath), false);
++      } else {
++        // The link resolved to some target fs or fallback fs.
++        resDst = resDstWithLastComp;
++      }
+     }
+ 
+     URI srcUri = resSrc.targetFileSystem.getUri();
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFs.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFs.java
+index a6ce33a04331..e74c409478eb 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFs.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFs.java
+@@ -548,23 +548,60 @@ public boolean truncate(final Path f, final long newLength)
+   public void renameInternal(final Path src, final Path dst,
+       final boolean overwrite) throws IOException, UnresolvedLinkException {
+     // passing resolveLastComponet as false to catch renaming a mount point 
+-    // itself we need to catch this as an internal operation and fail.
+-    InodeTree.ResolveResult<AbstractFileSystem> resSrc = 
+-      fsState.resolve(getUriPath(src), false); 
+-  
++    // itself we need to catch this as an internal operation and fail if no
++    // fallback.
++    InodeTree.ResolveResult<AbstractFileSystem> resSrc =
++        fsState.resolve(getUriPath(src), false);
++
+     if (resSrc.isInternalDir()) {
+-      throw new AccessControlException(
+-          "Cannot Rename within internal dirs of mount table: src=" + src
+-              + " is readOnly");
++      if (fsState.getRootFallbackLink() == null) {
++        // If fallback is null, we can't rename from src.
++        throw new AccessControlException(
++            "Cannot Rename within internal dirs of mount table: src=" + src
++                + " is readOnly");
++      }
++      InodeTree.ResolveResult<AbstractFileSystem> resSrcWithLastComp =
++          fsState.resolve(getUriPath(src), true);
++      if (resSrcWithLastComp.isInternalDir() || resSrcWithLastComp
++          .isLastInternalDirLink()) {
++        throw new AccessControlException(
++            "Cannot Rename within internal dirs of mount table: src=" + src
++                + " is readOnly");
++      } else {
++        // This is fallback and let's set the src fs with this fallback
++        resSrc = resSrcWithLastComp;
++      }
+     }
+ 
+     InodeTree.ResolveResult<AbstractFileSystem> resDst =
+-                                fsState.resolve(getUriPath(dst), false);
++        fsState.resolve(getUriPath(dst), false);
++
+     if (resDst.isInternalDir()) {
+-      throw new AccessControlException(
+-          "Cannot Rename within internal dirs of mount table: dest=" + dst
+-              + " is readOnly");
++      if (fsState.getRootFallbackLink() == null) {
++        // If fallback is null, we can't rename to dst.
++        throw new AccessControlException(
++            "Cannot Rename within internal dirs of mount table: dest=" + dst
++                + " is readOnly");
++      }
++      // if the fallback exist, we may have chance to rename to fallback path
++      // where dst parent is matching to internalDir.
++      InodeTree.ResolveResult<AbstractFileSystem> resDstWithLastComp =
++          fsState.resolve(getUriPath(dst), true);
++      if (resDstWithLastComp.isInternalDir()) {
++        // We need to get fallback here. If matching fallback path not exist, it
++        // will fail later. This is a very special case: Even though we are on
++        // internal directory, we should allow to rename, so that src files will
++        // moved under matching fallback dir.
++        resDst = new InodeTree.ResolveResult<AbstractFileSystem>(
++            InodeTree.ResultKind.INTERNAL_DIR,
++            fsState.getRootFallbackLink().getTargetFileSystem(), "/",
++            new Path(resDstWithLastComp.resolvedPath), false);
++      } else {
++        // The link resolved to some target fs or fallback fs.
++        resDst = resDstWithLastComp;
++      }
+     }
++
+     //Alternate 1: renames within same file system
+     URI srcUri = resSrc.targetFileSystem.getUri();
+     URI dstUri = resDst.targetFileSystem.getUri();
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/viewfs/TestViewfsFileStatus.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/viewfs/TestViewfsFileStatus.java
+index 75557456edc3..8ac447eb02e9 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/viewfs/TestViewfsFileStatus.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/viewfs/TestViewfsFileStatus.java
+@@ -165,8 +165,8 @@ public void testGetFileChecksum() throws IOException {
+     final Path path = new Path("/tmp/someFile");
+     FileSystem mockFS = Mockito.mock(FileSystem.class);
+     InodeTree.ResolveResult<FileSystem> res =
+-      new InodeTree.ResolveResult<FileSystem>(null, mockFS , null,
+-        new Path("someFile"));
++        new InodeTree.ResolveResult<FileSystem>(null, mockFS, null,
++            new Path("someFile"), true);
+     @SuppressWarnings("unchecked")
+     InodeTree<FileSystem> fsState = Mockito.mock(InodeTree.class);
+     Mockito.when(fsState.resolve(path.toString(), true)).thenReturn(res);
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/viewfs/ViewFsBaseTest.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/viewfs/ViewFsBaseTest.java
+index 21b0c159e2aa..73f6265eee72 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/viewfs/ViewFsBaseTest.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/viewfs/ViewFsBaseTest.java
+@@ -547,8 +547,8 @@ public void testGetFileChecksum() throws AccessControlException,
+       UnresolvedLinkException, IOException, URISyntaxException {
+     AbstractFileSystem mockAFS = mock(AbstractFileSystem.class);
+     InodeTree.ResolveResult<AbstractFileSystem> res =
+-      new InodeTree.ResolveResult<AbstractFileSystem>(null, mockAFS , null,
+-        new Path("someFile"));
++        new InodeTree.ResolveResult<AbstractFileSystem>(null, mockAFS, null,
++            new Path("someFile"), true);
+     @SuppressWarnings("unchecked")
+     InodeTree<AbstractFileSystem> fsState = mock(InodeTree.class);
+     when(fsState.resolve(anyString(), anyBoolean())).thenReturn(res);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/fs/viewfs/TestViewFsLinkFallback.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/fs/viewfs/TestViewFsLinkFallback.java
+index dc2eb0e35009..09e02be640e5 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/fs/viewfs/TestViewFsLinkFallback.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/fs/viewfs/TestViewFsLinkFallback.java
+@@ -23,6 +23,7 @@
+ import static org.junit.Assert.assertNotNull;
+ import static org.junit.Assert.assertTrue;
+ 
++import java.io.FileNotFoundException;
+ import java.io.IOException;
+ import java.net.URI;
+ import java.net.URISyntaxException;
+@@ -41,8 +42,10 @@
+ import org.apache.hadoop.fs.RemoteIterator;
+ import org.apache.hadoop.fs.permission.FsPermission;
+ import org.apache.hadoop.hdfs.DFSConfigKeys;
++import org.apache.hadoop.hdfs.DistributedFileSystem;
+ import org.apache.hadoop.hdfs.MiniDFSCluster;
+ import org.apache.hadoop.hdfs.MiniDFSNNTopology;
++import org.apache.hadoop.test.LambdaTestUtils;
+ import org.junit.AfterClass;
+ import org.junit.Assert;
+ import org.junit.Before;
+@@ -472,4 +475,102 @@ public void testListFiles() throws Exception {
+     assertEquals(fileInFallBackRoot.getName(),
+         iterator.next().getPath().getName());
+   }
++
++  @Test
++  public void testRenameOnInternalDirWithFallback() throws Exception {
++    Configuration conf = new Configuration();
++    Path fallbackTarget = new Path(targetTestRoot, "fallbackDir");
++    fsTarget.mkdirs(fallbackTarget);
++    ConfigUtil.addLink(conf, "/user1",
++        new Path(targetTestRoot.toString() + "/user1").toUri());
++    ConfigUtil.addLink(conf, "/NewHDFSUser/next",
++        new Path(targetTestRoot.toString() + "/newUser1").toUri());
++    ConfigUtil.addLinkFallback(conf, fallbackTarget.toUri());
++
++    //Make sure target fs has parent dir structures
++    try (DistributedFileSystem dfs = new DistributedFileSystem()) {
++      dfs.initialize(fsDefault.getUri(), conf);
++      dfs.mkdirs(new Path(targetTestRoot.toString() + "/user1"));
++      dfs.mkdirs(new Path(fallbackTarget.toString() + "/newUser1"));
++    }
++
++    final AbstractFileSystem fs =
++        AbstractFileSystem.get(viewFsDefaultClusterUri, conf);
++
++    Path src = new Path("/newFileOnRoot");
++    Path dst = new Path("/newFileOnRoot1");
++    fs.create(src, EnumSet.of(CREATE),
++        Options.CreateOpts.perms(FsPermission.getDefault())).close();
++    verifyRename(fs, src, dst);
++
++    src = new Path("/newFileOnRoot1");
++    dst = new Path("/newUser1/newFileOnRoot");
++    fs.mkdir(dst.getParent(), FsPermission.getDefault(), true);
++    verifyRename(fs, src, dst);
++
++    src = new Path("/newUser1/newFileOnRoot");
++    dst = new Path("/newUser1/newFileOnRoot1");
++    verifyRename(fs, src, dst);
++
++    src = new Path("/newUser1/newFileOnRoot1");
++    dst = new Path("/newFileOnRoot");
++    verifyRename(fs, src, dst);
++
++    src = new Path("/user1/newFileOnRoot1");
++    dst = new Path("/user1/newFileOnRoot");
++    fs.create(src, EnumSet.of(CREATE),
++        Options.CreateOpts.perms(FsPermission.getDefault())).close();
++    verifyRename(fs, src, dst);
++  }
++
++  @Test
++  public void testRenameWhenDstOnInternalDirWithFallback() throws Exception {
++    Configuration conf = new Configuration();
++    Path fallbackTarget = new Path(targetTestRoot, "fallbackDir");
++    fsTarget.mkdirs(fallbackTarget);
++    ConfigUtil.addLink(conf, "/InternalDirDoesNotExistInFallback/test",
++        new Path(targetTestRoot.toString() + "/user1").toUri());
++    ConfigUtil.addLink(conf, "/NewHDFSUser/next/next1",
++        new Path(targetTestRoot.toString() + "/newUser1").toUri());
++    ConfigUtil.addLinkFallback(conf, fallbackTarget.toUri());
++
++    try (DistributedFileSystem dfs = new DistributedFileSystem()) {
++      dfs.initialize(fsDefault.getUri(), conf);
++      dfs.mkdirs(new Path(targetTestRoot.toString() + "/newUser1"));
++      dfs.mkdirs(
++          new Path(fallbackTarget.toString() + "/NewHDFSUser/next/next1"));
++    }
++
++    final AbstractFileSystem fs =
++        AbstractFileSystem.get(viewFsDefaultClusterUri, conf);
++    final Path src = new Path("/newFileOnRoot");
++    final Path dst = new Path("/NewHDFSUser/next");
++    fs.mkdir(src, FsPermission.getDefault(), true);
++    // src and dst types are must be either  same dir or files
++    LambdaTestUtils.intercept(IOException.class,
++        () -> fs.rename(src, dst, Options.Rename.OVERWRITE));
++
++    final Path src1 = new Path("/newFileOnRoot1");
++    final Path dst1 = new Path("/NewHDFSUser/next/file");
++    fs.create(src1, EnumSet.of(CREATE),
++        Options.CreateOpts.perms(FsPermission.getDefault())).close();
++    verifyRename(fs, src1, dst1);
++
++    final Path src2 = new Path("/newFileOnRoot2");
++    final Path dst2 = new Path("/InternalDirDoesNotExistInFallback/file");
++    fs.create(src2, EnumSet.of(CREATE),
++        Options.CreateOpts.perms(FsPermission.getDefault())).close();
++    // If fallback does not have same structure as internal, rename will fail.
++    LambdaTestUtils.intercept(FileNotFoundException.class,
++        () -> fs.rename(src2, dst2, Options.Rename.OVERWRITE));
++  }
++
++  private void verifyRename(AbstractFileSystem fs, Path src, Path dst)
++      throws Exception {
++    fs.rename(src, dst, Options.Rename.OVERWRITE);
++    LambdaTestUtils
++        .intercept(FileNotFoundException.class, () -> fs.getFileStatus(src));
++    Assert.assertNotNull(fs.getFileStatus(dst));
++  }
++
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestViewDistributedFileSystemWithMountLinks.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestViewDistributedFileSystemWithMountLinks.java
+index 23b5793eee67..1e66252d5171 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestViewDistributedFileSystemWithMountLinks.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestViewDistributedFileSystemWithMountLinks.java
+@@ -20,9 +20,12 @@
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.CommonConfigurationKeys;
+ import org.apache.hadoop.fs.CommonConfigurationKeysPublic;
++import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.viewfs.ConfigUtil;
+ import org.apache.hadoop.fs.viewfs.TestViewFileSystemOverloadSchemeWithHdfsScheme;
++import org.apache.hadoop.fs.viewfs.ViewFsTestSetup;
++import org.junit.Assert;
+ import org.junit.Test;
+ 
+ import java.io.IOException;
+@@ -48,7 +51,7 @@ public void setUp() throws IOException {
+     URI defaultFSURI =
+         URI.create(conf.get(CommonConfigurationKeys.FS_DEFAULT_NAME_KEY));
+     ConfigUtil.addLinkFallback(conf, defaultFSURI.getAuthority(),
+-        new Path(defaultFSURI.toString()).toUri());
++        new Path(defaultFSURI.toString() + "/").toUri());
+     setConf(conf);
+   }
+ 
+@@ -61,4 +64,94 @@ public void testCreateOnRoot() throws Exception {
+   public void testMountLinkWithNonExistentLink() throws Exception {
+     testMountLinkWithNonExistentLink(false);
+   }
++
++  @Test
++  public void testRenameOnInternalDirWithFallback() throws Exception {
++    Configuration conf = getConf();
++    URI defaultFSURI =
++        URI.create(conf.get(CommonConfigurationKeys.FS_DEFAULT_NAME_KEY));
++    final Path hdfsTargetPath1 = new Path(defaultFSURI + "/HDFSUser");
++    final Path hdfsTargetPath2 = new Path(defaultFSURI + "/NewHDFSUser/next");
++    ViewFsTestSetup.addMountLinksToConf(defaultFSURI.getAuthority(),
++        new String[] {"/HDFSUser", "/NewHDFSUser/next"},
++        new String[] {hdfsTargetPath1.toUri().toString(),
++            hdfsTargetPath2.toUri().toString()}, conf);
++    //Making sure parent dir structure as mount points available in fallback.
++    try (DistributedFileSystem dfs = new DistributedFileSystem()) {
++      dfs.initialize(defaultFSURI, conf);
++      dfs.mkdirs(hdfsTargetPath1);
++      dfs.mkdirs(hdfsTargetPath2);
++    }
++
++    try (FileSystem fs = FileSystem.get(conf)) {
++      Path src = new Path("/newFileOnRoot");
++      Path dst = new Path("/newFileOnRoot1");
++      fs.create(src).close();
++      verifyRename(fs, src, dst);
++
++      src = new Path("/newFileOnRoot1");
++      dst = new Path("/NewHDFSUser/newFileOnRoot");
++      fs.mkdirs(dst.getParent());
++      verifyRename(fs, src, dst);
++
++      src = new Path("/NewHDFSUser/newFileOnRoot");
++      dst = new Path("/NewHDFSUser/newFileOnRoot1");
++      verifyRename(fs, src, dst);
++
++      src = new Path("/NewHDFSUser/newFileOnRoot1");
++      dst = new Path("/newFileOnRoot");
++      verifyRename(fs, src, dst);
++
++      src = new Path("/HDFSUser/newFileOnRoot1");
++      dst = new Path("/HDFSUser/newFileOnRoot");
++      fs.create(src).close();
++      verifyRename(fs, src, dst);
++    }
++  }
++
++  @Test
++  public void testRenameWhenDstOnInternalDirWithFallback() throws Exception {
++    Configuration conf = getConf();
++    URI defaultFSURI =
++        URI.create(conf.get(CommonConfigurationKeys.FS_DEFAULT_NAME_KEY));
++    final Path hdfsTargetPath1 = new Path(defaultFSURI + "/HDFSUser");
++    final Path hdfsTargetPath2 =
++        new Path(defaultFSURI + "/dstNewHDFSUser" + "/next");
++    ViewFsTestSetup.addMountLinksToConf(defaultFSURI.getAuthority(),
++        new String[] {"/InternalDirDoesNotExistInFallback/test",
++            "/NewHDFSUser/next/next1"},
++        new String[] {hdfsTargetPath1.toUri().toString(),
++            hdfsTargetPath2.toUri().toString()}, conf);
++    try (DistributedFileSystem dfs = new DistributedFileSystem()) {
++      dfs.initialize(defaultFSURI, conf);
++      dfs.mkdirs(hdfsTargetPath1);
++      dfs.mkdirs(hdfsTargetPath2);
++      dfs.mkdirs(new Path("/NewHDFSUser/next/next1"));
++    }
++
++    try (FileSystem fs = FileSystem.get(conf)) {
++      Path src = new Path("/newFileOnRoot");
++      Path dst = new Path("/NewHDFSUser/next");
++      fs.create(src).close();
++      verifyRename(fs, src, dst);
++
++      src = new Path("/newFileOnRoot");
++      dst = new Path("/NewHDFSUser/next/file");
++      fs.create(src).close();
++      verifyRename(fs, src, dst);
++
++      src = new Path("/newFileOnRoot");
++      dst = new Path("/InternalDirDoesNotExistInFallback/file");
++      fs.create(src).close();
++      // If fallback does not have same structure as internal, rename will fail.
++      Assert.assertFalse(fs.rename(src, dst));
++    }
++  }
++
++  private void verifyRename(FileSystem fs, Path src, Path dst)
++      throws IOException {
++    fs.rename(src, dst);
++    Assert.assertFalse(fs.exists(src));
++    Assert.assertTrue(fs.exists(dst));
++  }
+ }

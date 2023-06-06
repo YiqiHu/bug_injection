@@ -1,0 +1,128 @@
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFileSystem.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFileSystem.java
+index c7ed15bba9c0..b90699675c63 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFileSystem.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFileSystem.java
+@@ -1283,6 +1283,23 @@ public boolean delete(final Path f)
+     public BlockLocation[] getFileBlockLocations(final FileStatus fs,
+         final long start, final long len) throws
+         FileNotFoundException, IOException {
++
++      // When application calls listFiles on internalDir, it would return
++      // RemoteIterator from InternalDirOfViewFs. If there is a fallBack, there
++      // is a chance of files exists under that internalDir in fallback.
++      // Iterator#next will call getFileBlockLocations with that files. So, we
++      // should return getFileBlockLocations on fallback. See HDFS-15532.
++      if (!InodeTree.SlashPath.equals(fs.getPath()) && this.fsState
++          .getRootFallbackLink() != null) {
++        FileSystem linkedFallbackFs =
++            this.fsState.getRootFallbackLink().getTargetFileSystem();
++        Path parent = Path.getPathWithoutSchemeAndAuthority(
++            new Path(theInternalDir.fullPath));
++        Path pathToFallbackFs = new Path(parent, fs.getPath().getName());
++        return linkedFallbackFs
++            .getFileBlockLocations(pathToFallbackFs, start, len);
++      }
++
+       checkPathIsSlash(fs.getPath());
+       throw new FileNotFoundException("Path points to dir not a file");
+     }
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFs.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFs.java
+index 95b596bde367..a6ce33a04331 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFs.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFs.java
+@@ -981,6 +981,21 @@ public boolean delete(final Path f, final boolean recursive)
+     @Override
+     public BlockLocation[] getFileBlockLocations(final Path f, final long start,
+         final long len) throws FileNotFoundException, IOException {
++      // When application calls listFiles on internalDir, it would return
++      // RemoteIterator from InternalDirOfViewFs. If there is a fallBack, there
++      // is a chance of files exists under that internalDir in fallback.
++      // Iterator#next will call getFileBlockLocations with that files. So, we
++      // should return getFileBlockLocations on fallback. See HDFS-15532.
++      if (!InodeTree.SlashPath.equals(f) && this.fsState
++          .getRootFallbackLink() != null) {
++        AbstractFileSystem linkedFallbackFs =
++            this.fsState.getRootFallbackLink().getTargetFileSystem();
++        Path parent = Path.getPathWithoutSchemeAndAuthority(
++            new Path(theInternalDir.fullPath));
++        Path pathToFallbackFs = new Path(parent, f.getName());
++        return linkedFallbackFs
++            .getFileBlockLocations(pathToFallbackFs, start, len);
++      }
+       checkPathIsSlash(f);
+       throw new FileNotFoundException("Path points to dir not a file");
+     }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/fs/viewfs/TestViewFsLinkFallback.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/fs/viewfs/TestViewFsLinkFallback.java
+index 04d26b983ed6..dc2eb0e35009 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/fs/viewfs/TestViewFsLinkFallback.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/fs/viewfs/TestViewFsLinkFallback.java
+@@ -18,6 +18,7 @@
+ package org.apache.hadoop.fs.viewfs;
+ 
+ import static org.apache.hadoop.fs.CreateFlag.CREATE;
++import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertFalse;
+ import static org.junit.Assert.assertNotNull;
+ import static org.junit.Assert.assertTrue;
+@@ -30,11 +31,14 @@
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.AbstractFileSystem;
+ import org.apache.hadoop.fs.FileAlreadyExistsException;
++import org.apache.hadoop.fs.FileContext;
+ import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.FsConstants;
++import org.apache.hadoop.fs.LocatedFileStatus;
+ import org.apache.hadoop.fs.Options;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.fs.RemoteIterator;
+ import org.apache.hadoop.fs.permission.FsPermission;
+ import org.apache.hadoop.hdfs.DFSConfigKeys;
+ import org.apache.hadoop.hdfs.MiniDFSCluster;
+@@ -448,4 +452,24 @@ public void testCreateFileSameAsInternalDirPath()
+     vfs.create(vfsTestDir, EnumSet.of(CREATE),
+         Options.CreateOpts.perms(FsPermission.getDefault())).close();
+   }
++
++  /**
++   * Tests that, when fallBack has files under matching internal dir, listFiles
++   * should work.
++   */
++  @Test
++  public void testListFiles() throws Exception {
++    Configuration conf = new Configuration();
++    Path fallbackTarget = new Path(targetTestRoot, "fallbackDir");
++    fsTarget.mkdirs(fallbackTarget);
++    Path fileInFallBackRoot = new Path(fallbackTarget, "GetFileBlockLocations");
++    fsTarget.create(fileInFallBackRoot).close();
++    ConfigUtil.addLinkFallback(conf, fallbackTarget.toUri());
++    FileContext fc = FileContext.getFileContext(viewFsDefaultClusterUri, conf);
++    RemoteIterator<LocatedFileStatus> iterator =
++        fc.util().listFiles(new Path("/"), false);
++    assertTrue(iterator.hasNext());
++    assertEquals(fileInFallBackRoot.getName(),
++        iterator.next().getPath().getName());
++  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestViewDistributedFileSystemContract.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestViewDistributedFileSystemContract.java
+index 418c814c8863..810c4cb61ffc 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestViewDistributedFileSystemContract.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestViewDistributedFileSystemContract.java
+@@ -29,7 +29,6 @@
+ import org.junit.AfterClass;
+ import org.junit.Before;
+ import org.junit.BeforeClass;
+-import org.junit.Ignore;
+ import org.junit.Test;
+ 
+ import java.io.File;
+@@ -86,9 +85,4 @@ public void testRenameRootDirForbidden() throws Exception {
+           super.testRenameRootDirForbidden();
+         });
+   }
+-
+-  @Ignore("Ignore this test until HDFS-15532")
+-  @Override
+-  public void testLSRootDir() throws Throwable {
+-  }
+ }

@@ -1,0 +1,574 @@
+
+package org.apache.hadoop.tools;
+
+import org.apache.hadoop.classification.VisibleForTesting;
+import org.apache.hadoop.HadoopIllegalArgumentException;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileStatus;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.hdfs.DFSUtilClient;
+import org.apache.hadoop.hdfs.DistributedFileSystem;
+import org.apache.hadoop.hdfs.protocol.HdfsConstants;
+import org.apache.hadoop.hdfs.protocol.SnapshotDiffReport;
+import org.apache.hadoop.hdfs.web.WebHdfsFileSystem;
+import org.apache.hadoop.tools.CopyListing.InvalidInputException;
+
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Random;
+import java.util.EnumMap;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.Collections;
+
+
+class DistCpSync {
+  private DistCpContext context;
+  private Configuration conf;
+  
+  
+  
+  
+  
+  private EnumMap<SnapshotDiffReport.DiffType, List<DiffInfo>> diffMap;
+  private DiffInfo[] renameDiffs;
+  
+  
+  private List<DiffInfo> deletedByExclusionDiffs;
+  private CopyFilter copyFilter;
+
+  DistCpSync(DistCpContext context, Configuration conf) {
+    this.context = context;
+    this.conf = conf;
+    this.copyFilter = CopyFilter.getCopyFilter(conf);
+    this.copyFilter.initialize();
+  }
+
+  @VisibleForTesting
+  public void setCopyFilter(CopyFilter copyFilter) {
+    this.copyFilter = copyFilter;
+  }
+
+  private boolean isRdiff() {
+    return context.shouldUseRdiff();
+  }
+
+  
+  private boolean preSyncCheck() throws IOException {
+    List<Path> sourcePaths = context.getSourcePaths();
+    if (sourcePaths.size() != 1) {
+      
+      throw new IllegalArgumentException(sourcePaths.size()
+          + " source paths are provided");
+    }
+    final Path sourceDir = sourcePaths.get(0);
+    final Path targetDir = context.getTargetPath();
+
+    final FileSystem srcFs = sourceDir.getFileSystem(conf);
+    final FileSystem tgtFs = targetDir.getFileSystem(conf);
+    final FileSystem snapshotDiffFs = isRdiff() ? tgtFs : srcFs;
+    final Path snapshotDiffDir = isRdiff() ? targetDir : sourceDir;
+
+    
+    
+    if (!(srcFs instanceof DistributedFileSystem
+            || srcFs instanceof WebHdfsFileSystem)) {
+      throw new IllegalArgumentException("Unsupported source file system: "
+          + srcFs.getScheme() + "://. " +
+          "Supported file systems: hdfs://, webhdfs:// and swebhdfs://.");
+    }
+    if (!(tgtFs instanceof DistributedFileSystem
+        || tgtFs instanceof WebHdfsFileSystem)) {
+      throw new IllegalArgumentException("Unsupported target file system: "
+          + tgtFs.getScheme() + "://. " +
+          "Supported file systems: hdfs://, webhdfs:// and swebhdfs://.");
+    }
+
+    
+    if (!checkNoChange(tgtFs, targetDir)) {
+      
+      context.setSourcePaths(Arrays.asList(getSnapshotPath(sourceDir,
+          context.getToSnapshot())));
+      return false;
+    }
+
+    final String from = getSnapshotName(
+        context.getFromSnapshot());
+    final String to = getSnapshotName(
+        context.getToSnapshot());
+
+    try {
+      final FileStatus fromSnapshotStat =
+          snapshotDiffFs.getFileStatus(getSnapshotPath(snapshotDiffDir, from));
+
+      final FileStatus toSnapshotStat =
+          snapshotDiffFs.getFileStatus(getSnapshotPath(snapshotDiffDir, to));
+
+      if (isRdiff()) {
+        
+        if (!from.equals("")
+            && fromSnapshotStat.getModificationTime() < toSnapshotStat
+            .getModificationTime()) {
+          throw new HadoopIllegalArgumentException("Snapshot " + from
+              + " should be newer than " + to);
+        }
+      } else {
+        
+        if(!to.equals("")
+            && fromSnapshotStat.getModificationTime() > toSnapshotStat
+            .getModificationTime()) {
+          throw new HadoopIllegalArgumentException("Snapshot " + to
+              + " should be newer than " + from);
+        }
+      }
+    } catch (FileNotFoundException nfe) {
+      throw new InvalidInputException("Input snapshot is not found", nfe);
+    }
+
+    return true;
+  }
+
+  public boolean sync() throws IOException {
+    if (!preSyncCheck()) {
+      return false;
+    }
+
+    if (!getAllDiffs()) {
+      return false;
+    }
+
+    List<Path> sourcePaths = context.getSourcePaths();
+    final Path sourceDir = sourcePaths.get(0);
+    final Path targetDir = context.getTargetPath();
+    final FileSystem tfs = targetDir.getFileSystem(conf);
+
+    Path tmpDir = null;
+    try {
+      tmpDir = createTargetTmpDir(tfs, targetDir);
+      DiffInfo[] renameAndDeleteDiffs =
+          getRenameAndDeleteDiffsForSync(targetDir);
+      if (renameAndDeleteDiffs.length > 0) {
+        
+        syncDiff(renameAndDeleteDiffs, tfs, tmpDir);
+      }
+      return true;
+    } catch (Exception e) {
+      DistCp.LOG.warn("Failed to use snapshot diff for distcp", e);
+      return false;
+    } finally {
+      deleteTargetTmpDir(tfs, tmpDir);
+      
+      
+      context.setSourcePaths(Arrays.asList(getSnapshotPath(sourceDir,
+          context.getToSnapshot())));
+    }
+  }
+
+  
+  private boolean getAllDiffs() throws IOException {
+    Path ssDir = isRdiff()?
+        context.getTargetPath() : context.getSourcePaths().get(0);
+
+    try {
+      SnapshotDiffReport report = null;
+      FileSystem fs = ssDir.getFileSystem(conf);
+      final String from = getSnapshotName(context.getFromSnapshot());
+      final String to = getSnapshotName(context.getToSnapshot());
+      if (fs instanceof DistributedFileSystem) {
+        DistributedFileSystem dfs = (DistributedFileSystem)fs;
+        report = dfs.getSnapshotDiffReport(ssDir, from, to);
+      } else if (fs instanceof WebHdfsFileSystem) {
+        WebHdfsFileSystem webHdfs = (WebHdfsFileSystem)fs;
+        report = webHdfs.getSnapshotDiffReport(ssDir, from, to);
+      } else {
+        throw new IllegalArgumentException("Unsupported file system: " +
+            fs.getScheme() + "://. " +
+            "Supported file systems: hdfs://, webhdfs:// and swebhdfs://.");
+      }
+
+      this.diffMap = new EnumMap<>(SnapshotDiffReport.DiffType.class);
+      for (SnapshotDiffReport.DiffType type :
+          SnapshotDiffReport.DiffType.values()) {
+        diffMap.put(type, new ArrayList<DiffInfo>());
+      }
+      deletedByExclusionDiffs = null;
+      for (SnapshotDiffReport.DiffReportEntry entry : report.getDiffList()) {
+        
+        
+        
+        if (entry.getSourcePath().length <= 0) {
+          continue;
+        }
+        SnapshotDiffReport.DiffType dt = entry.getType();
+        List<DiffInfo> list = diffMap.get(dt);
+        final Path source =
+                new Path(DFSUtilClient.bytes2String(entry.getSourcePath()));
+        final Path relativeSource = new Path(Path.SEPARATOR + source);
+        if (dt == SnapshotDiffReport.DiffType.MODIFY ||
+            dt == SnapshotDiffReport.DiffType.CREATE ||
+            dt == SnapshotDiffReport.DiffType.DELETE) {
+          if (copyFilter.shouldCopy(relativeSource)) {
+            list.add(new DiffInfo(source, null, dt));
+          }
+        } else if (dt == SnapshotDiffReport.DiffType.RENAME) {
+          final Path target =
+                  new Path(DFSUtilClient.bytes2String(entry.getTargetPath()));
+          final Path relativeTarget = new Path(Path.SEPARATOR + target);
+          if (copyFilter.shouldCopy(relativeSource)) {
+            if (copyFilter.shouldCopy(relativeTarget)) {
+              list.add(new DiffInfo(source, target, dt));
+            } else {
+              list = diffMap.get(SnapshotDiffReport.DiffType.DELETE);
+              DiffInfo info = new DiffInfo(source, null,
+                  SnapshotDiffReport.DiffType.DELETE);
+              list.add(info);
+              if (deletedByExclusionDiffs == null) {
+                deletedByExclusionDiffs = new ArrayList<>();
+              }
+              deletedByExclusionDiffs.add(info);
+            }
+          } else if (copyFilter.shouldCopy(relativeTarget)) {
+            list = diffMap.get(SnapshotDiffReport.DiffType.CREATE);
+            list.add(new DiffInfo(target, null,
+                    SnapshotDiffReport.DiffType.CREATE));
+          }
+        }
+      }
+      if (deletedByExclusionDiffs != null) {
+        Collections.sort(deletedByExclusionDiffs, DiffInfo.sourceComparator);
+      }
+      return true;
+    } catch (IOException e) {
+      DistCp.LOG.warn("Failed to compute snapshot diff on " + ssDir, e);
+    }
+    this.diffMap = null;
+    return false;
+  }
+
+  private String getSnapshotName(String name) {
+    return Path.CUR_DIR.equals(name) ? "" : name;
+  }
+
+  private Path getSnapshotPath(Path inputDir, String snapshotName) {
+    if (Path.CUR_DIR.equals(snapshotName)) {
+      return inputDir;
+    } else {
+      return new Path(inputDir,
+          HdfsConstants.DOT_SNAPSHOT_DIR + Path.SEPARATOR + snapshotName);
+    }
+  }
+
+  private Path createTargetTmpDir(FileSystem targetFs,
+                                  Path targetDir) throws IOException {
+    final Path tmp = new Path(targetDir,
+        DistCpConstants.HDFS_DISTCP_DIFF_DIRECTORY_NAME + DistCp.rand.nextInt());
+    if (!targetFs.mkdirs(tmp)) {
+      throw new IOException("The tmp directory " + tmp + " already exists");
+    }
+    return tmp;
+  }
+
+  private void deleteTargetTmpDir(FileSystem targetFs,
+                                  Path tmpDir) {
+    try {
+      if (tmpDir != null) {
+        targetFs.delete(tmpDir, true);
+      }
+    } catch (IOException e) {
+      DistCp.LOG.error("Unable to cleanup tmp dir: " + tmpDir, e);
+    }
+  }
+
+  
+  private boolean checkNoChange(FileSystem fs, Path path) {
+    try {
+      final String from = getSnapshotName(context.getFromSnapshot());
+      SnapshotDiffReport targetDiff = null;
+      if (fs instanceof DistributedFileSystem) {
+        DistributedFileSystem dfs = (DistributedFileSystem)fs;
+        targetDiff = dfs.getSnapshotDiffReport(path, from, "");
+      } else {
+        WebHdfsFileSystem webHdfs = (WebHdfsFileSystem)fs;
+        targetDiff = webHdfs.getSnapshotDiffReport(path, from, "");
+      }
+      if (!targetDiff.getDiffList().isEmpty()) {
+        DistCp.LOG.warn("The target has been modified since snapshot "
+            + context.getFromSnapshot());
+        return false;
+      } else {
+        return true;
+      }
+    } catch (IOException e) {
+      DistCp.LOG.warn("Failed to compute snapshot diff on " + path
+          + " at snapshot " + context.getFromSnapshot(), e);
+    }
+    return false;
+  }
+
+  private void syncDiff(DiffInfo[] diffs,
+      FileSystem targetFs, Path tmpDir) throws IOException {
+    moveToTmpDir(diffs, targetFs, tmpDir);
+    moveToTarget(diffs, targetFs);
+  }
+
+  
+  private void moveToTmpDir(DiffInfo[] diffs,
+      FileSystem targetFs, Path tmpDir) throws IOException {
+    
+    
+    Arrays.sort(diffs, DiffInfo.sourceComparator);
+    Random random = new Random();
+    for (DiffInfo diff : diffs) {
+      Path tmpTarget = new Path(tmpDir, diff.getSource().getName());
+      while (targetFs.exists(tmpTarget)) {
+        tmpTarget = new Path(tmpDir,
+            diff.getSource().getName() + random.nextInt());
+      }
+      diff.setTmp(tmpTarget);
+      targetFs.rename(diff.getSource(), tmpTarget);
+    }
+  }
+
+  
+  private void moveToTarget(DiffInfo[] diffs,
+      FileSystem targetFs) throws IOException {
+    
+    
+    Arrays.sort(diffs, DiffInfo.targetComparator);
+    for (DiffInfo diff : diffs) {
+      if (diff.getTarget() != null) {
+        targetFs.mkdirs(diff.getTarget().getParent());
+        targetFs.rename(diff.getTmp(), diff.getTarget());
+      }
+    }
+  }
+
+  
+  private DiffInfo[] getRenameAndDeleteDiffsForSync(Path targetDir) {
+    
+    
+    
+    
+    
+    if (isRdiff()) {
+      return getRenameAndDeleteDiffsRdiff(targetDir);
+    } else {
+      return getRenameAndDeleteDiffsFdiff(targetDir);
+    }
+  }
+
+  
+  private DiffInfo[] getRenameAndDeleteDiffsRdiff(Path targetDir) {
+    List<DiffInfo> renameDiffsList =
+        diffMap.get(SnapshotDiffReport.DiffType.RENAME);
+
+    
+    
+    List<DiffInfo> renameDiffsListReversed =
+        new ArrayList<DiffInfo>(renameDiffsList.size());
+    for (DiffInfo diff : renameDiffsList) {
+      renameDiffsListReversed.add(new DiffInfo(diff.getTarget(),
+          diff.getSource(), diff.getType()));
+    }
+    DiffInfo[] renameDiffArray =
+        renameDiffsListReversed.toArray(new DiffInfo[renameDiffsList.size()]);
+
+    Arrays.sort(renameDiffArray, DiffInfo.sourceComparator);
+
+    List<DiffInfo> renameAndDeleteDiff = new ArrayList<>();
+    
+    
+    for (DiffInfo diff : diffMap.get(SnapshotDiffReport.DiffType.DELETE)) {
+      DiffInfo renameItem = getRenameItem(diff, renameDiffArray);
+      Path source;
+      if (renameItem != null) {
+        source = new Path(targetDir,
+            translateRenamedPath(diff.getSource(), renameItem));
+      } else {
+        source = new Path(targetDir, diff.getSource());
+      }
+      renameAndDeleteDiff.add(new DiffInfo(source, null,
+          SnapshotDiffReport.DiffType.DELETE));
+    }
+    for (DiffInfo diff : diffMap.get(SnapshotDiffReport.DiffType.RENAME)) {
+      
+      Path source = new Path(targetDir, diff.getSource());
+      Path target = new Path(targetDir, diff.getTarget());
+      renameAndDeleteDiff.add(new DiffInfo(source, target, diff.getType()));
+    }
+    return renameAndDeleteDiff.toArray(
+        new DiffInfo[renameAndDeleteDiff.size()]);
+  }
+
+    
+  private DiffInfo[] getRenameAndDeleteDiffsFdiff(Path targetDir) {
+    List<DiffInfo> renameAndDeleteDiff = new ArrayList<>();
+    for (DiffInfo diff : diffMap.get(SnapshotDiffReport.DiffType.DELETE)) {
+      Path source = new Path(targetDir, diff.getSource());
+      renameAndDeleteDiff.add(new DiffInfo(source, diff.getTarget(),
+          diff.getType()));
+    }
+
+    for (DiffInfo diff : diffMap.get(SnapshotDiffReport.DiffType.RENAME)) {
+      Path source = new Path(targetDir, diff.getSource());
+      Path target = new Path(targetDir, diff.getTarget());
+      renameAndDeleteDiff.add(new DiffInfo(source, target, diff.getType()));
+    }
+
+    return renameAndDeleteDiff.toArray(
+        new DiffInfo[renameAndDeleteDiff.size()]);
+  }
+
+  private DiffInfo[] getCreateAndModifyDiffs() {
+    List<DiffInfo> createDiff =
+        diffMap.get(SnapshotDiffReport.DiffType.CREATE);
+    List<DiffInfo> modifyDiff =
+        diffMap.get(SnapshotDiffReport.DiffType.MODIFY);
+    List<DiffInfo> diffs =
+        new ArrayList<>(createDiff.size() + modifyDiff.size());
+    diffs.addAll(createDiff);
+    diffs.addAll(modifyDiff);
+    return diffs.toArray(new DiffInfo[diffs.size()]);
+  }
+
+  
+  private boolean isParentOf(Path parent, Path child) {
+    String parentPath = parent.toString();
+    String childPath = child.toString();
+    if (!parentPath.endsWith(Path.SEPARATOR)) {
+      parentPath += Path.SEPARATOR;
+    }
+
+    return childPath.length() > parentPath.length() &&
+        childPath.startsWith(parentPath);
+  }
+
+  
+  private DiffInfo getRenameItem(DiffInfo diff, DiffInfo[] renameDiffArray) {
+    for (DiffInfo renameItem : renameDiffArray) {
+      if (diff.getSource().equals(renameItem.getSource())) {
+        
+        
+        
+        
+        
+        
+        if (diff.getType() == SnapshotDiffReport.DiffType.MODIFY) {
+          return renameItem;
+        }
+      } else if (isParentOf(renameItem.getSource(), diff.getSource())) {
+        
+        
+        return renameItem;
+      }
+    }
+    return null;
+  }
+
+  
+  private boolean isParentOrSelfMarkedDeleted(DiffInfo diff,
+      List<DiffInfo> deletedDirDiffArray) {
+    for (DiffInfo item : deletedDirDiffArray) {
+      if (item.getSource().equals(diff.getSource())) {
+        
+        
+        
+        
+        
+        
+        if (diff.getType() == SnapshotDiffReport.DiffType.MODIFY) {
+          return true;
+        }
+      } else if (isParentOf(item.getSource(), diff.getSource())) {
+        
+        
+        return true;
+      }
+    }
+    return false;
+  }
+
+  
+  private Path translateRenamedPath(Path sourcePath,
+      DiffInfo renameItem) {
+    if (sourcePath.equals(renameItem.getSource())) {
+      return renameItem.getTarget();
+    }
+    StringBuffer sb = new StringBuffer(sourcePath.toString());
+    String remain =
+        sb.substring(renameItem.getSource().toString().length() + 1);
+    return new Path(renameItem.getTarget(), remain);
+  }
+
+  
+  public ArrayList<DiffInfo> prepareDiffListForCopyListing() {
+    DiffInfo[] modifyAndCreateDiffs = getCreateAndModifyDiffs();
+    ArrayList<DiffInfo> finalListWithTarget = new ArrayList<>();
+    if (isRdiff()) {
+      for (DiffInfo diff : modifyAndCreateDiffs) {
+        diff.setTarget(diff.getSource());
+        finalListWithTarget.add(diff);
+      }
+    } else {
+      List<DiffInfo> renameDiffsList =
+          diffMap.get(SnapshotDiffReport.DiffType.RENAME);
+      DiffInfo[] renameDiffArray =
+          renameDiffsList.toArray(new DiffInfo[renameDiffsList.size()]);
+      Arrays.sort(renameDiffArray, DiffInfo.sourceComparator);
+      for (DiffInfo diff : modifyAndCreateDiffs) {
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        if (deletedByExclusionDiffs != null && isParentOrSelfMarkedDeleted(diff,
+            deletedByExclusionDiffs)) {
+          continue;
+        }
+        DiffInfo renameItem = getRenameItem(diff, renameDiffArray);
+        if (renameItem == null) {
+          diff.setTarget(diff.getSource());
+        } else {
+          diff.setTarget(translateRenamedPath(diff.getSource(), renameItem));
+        }
+        finalListWithTarget.add(diff);
+      }
+    }
+    return finalListWithTarget;
+  }
+
+  
+  public HashSet<String> getTraverseExcludeList(Path newDir, Path prefix) {
+    if (renameDiffs == null) {
+      List<DiffInfo> renameList =
+          diffMap.get(SnapshotDiffReport.DiffType.RENAME);
+      renameDiffs = renameList.toArray(new DiffInfo[renameList.size()]);
+      Arrays.sort(renameDiffs, DiffInfo.targetComparator);
+    }
+
+    if (renameDiffs.length <= 0) {
+      return null;
+    }
+
+    boolean foundChild = false;
+    HashSet<String> excludeList = new HashSet<>();
+    for (DiffInfo diff : renameDiffs) {
+      if (isParentOf(newDir, diff.getTarget())) {
+        foundChild = true;
+        excludeList.add(new Path(prefix, diff.getTarget()).toUri().getPath());
+      } else if (foundChild) {
+        
+        
+        break;
+      }
+    }
+    return excludeList;
+  }
+}

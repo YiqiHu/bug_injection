@@ -1,0 +1,153 @@
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
+index c06b59f625a7..15389d614de8 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
+@@ -69,6 +69,7 @@
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
++import javax.annotation.Nullable;
+ import java.io.Closeable;
+ import java.io.FileNotFoundException;
+ import java.io.IOException;
+@@ -203,8 +204,37 @@ private static INodeDirectory createRoot(FSNamesystem namesystem) {
+   // will be bypassed
+   private HashSet<String> usersToBypassExtAttrProvider = null;
+ 
+-  public void setINodeAttributeProvider(INodeAttributeProvider provider) {
++  // If external inode attribute provider is configured, use the new
++  // authorizeWithContext() API or not.
++  private boolean useAuthorizationWithContextAPI = false;
++
++  public void setINodeAttributeProvider(
++      @Nullable INodeAttributeProvider provider) {
+     attributeProvider = provider;
++
++    if (attributeProvider == null) {
++      // attributeProvider is set to null during NN shutdown.
++      return;
++    }
++
++    // if the runtime external authorization provider doesn't support
++    // checkPermissionWithContext(), fall back to the old API
++    // checkPermission().
++    // This check is done only once during NameNode initialization to reduce
++    // runtime overhead.
++    Class[] cArg = new Class[1];
++    cArg[0] = INodeAttributeProvider.AuthorizationContext.class;
++
++    try {
++      Class<?> clazz = attributeProvider.getClass();
++      clazz.getDeclaredMethod("checkPermissionWithContext", cArg);
++      useAuthorizationWithContextAPI = true;
++      LOG.info("Use the new authorization provider API");
++    } catch (NoSuchMethodException e) {
++      useAuthorizationWithContextAPI = false;
++      LOG.info("Fallback to the old authorization provider API because " +
++          "the expected method is not found.");
++    }
+   }
+ 
+   /**
+@@ -1784,7 +1814,8 @@ FSPermissionChecker getPermissionChecker()
+   FSPermissionChecker getPermissionChecker(String fsOwner, String superGroup,
+       UserGroupInformation ugi) throws AccessControlException {
+     return new FSPermissionChecker(
+-        fsOwner, superGroup, ugi, getUserFilteredAttributeProvider(ugi));
++        fsOwner, superGroup, ugi, getUserFilteredAttributeProvider(ugi),
++        useAuthorizationWithContextAPI);
+   }
+ 
+   void checkOwner(FSPermissionChecker pc, INodesInPath iip)
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSPermissionChecker.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSPermissionChecker.java
+index c4fd6a6d3a49..c697ead7000d 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSPermissionChecker.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSPermissionChecker.java
+@@ -89,11 +89,16 @@ private String toAccessControlString(INodeAttributes inodeAttrib,
+ 
+   private static ThreadLocal<String> operationType = new ThreadLocal<>();
+ 
+-
+   protected FSPermissionChecker(String fsOwner, String supergroup,
+       UserGroupInformation callerUgi,
+       INodeAttributeProvider attributeProvider) {
+-    boolean useNewAuthorizationWithContextAPI;
++    this(fsOwner, supergroup, callerUgi, attributeProvider, false);
++  }
++
++  protected FSPermissionChecker(String fsOwner, String supergroup,
++      UserGroupInformation callerUgi,
++      INodeAttributeProvider attributeProvider,
++      boolean useAuthorizationWithContextAPI) {
+     this.fsOwner = fsOwner;
+     this.supergroup = supergroup;
+     this.callerUgi = callerUgi;
+@@ -102,36 +107,15 @@ protected FSPermissionChecker(String fsOwner, String supergroup,
+     isSuper = user.equals(fsOwner) || groups.contains(supergroup);
+     this.attributeProvider = attributeProvider;
+ 
+-    // If the AccessControlEnforcer supports context enrichment, call
+-    // the new API. Otherwise choose the old API.
+-    Class[] cArg = new Class[1];
+-    cArg[0] = INodeAttributeProvider.AuthorizationContext.class;
+-
+-    AccessControlEnforcer ace;
+     if (attributeProvider == null) {
+       // If attribute provider is null, use FSPermissionChecker default
+       // implementation to authorize, which supports authorization with context.
+-      useNewAuthorizationWithContextAPI = true;
+-      LOG.info("Default authorization provider supports the new authorization" +
++      authorizeWithContext = true;
++      LOG.debug("Default authorization provider supports the new authorization" +
+           " provider API");
+     } else {
+-      ace = attributeProvider.getExternalAccessControlEnforcer(this);
+-      // if the runtime external authorization provider doesn't support
+-      // checkPermissionWithContext(), fall back to the old API
+-      // checkPermission().
+-      try {
+-        Class<?> clazz = ace.getClass();
+-        clazz.getDeclaredMethod("checkPermissionWithContext", cArg);
+-        useNewAuthorizationWithContextAPI = true;
+-        LOG.info("Use the new authorization provider API");
+-      } catch (NoSuchMethodException e) {
+-        useNewAuthorizationWithContextAPI = false;
+-        LOG.info("Fallback to the old authorization provider API because " +
+-            "the expected method is not found.");
+-      }
++      authorizeWithContext = useAuthorizationWithContextAPI;
+     }
+-
+-    authorizeWithContext = useNewAuthorizationWithContextAPI;
+   }
+ 
+   public static void setOperationType(String opType) {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestAuthorizationContext.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestAuthorizationContext.java
+index eeeea760df14..1f52cf33ba15 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestAuthorizationContext.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestAuthorizationContext.java
+@@ -103,10 +103,7 @@ public void testLegacyAPI() throws IOException {
+         thenReturn(mockEnforcer);
+ 
+     FSPermissionChecker checker = new FSPermissionChecker(
+-        fsOwner, superGroup, ugi, mockINodeAttributeProvider);
+-
+-    // set operation type to null to force using the legacy API.
+-    FSPermissionChecker.setOperationType(null);
++        fsOwner, superGroup, ugi, mockINodeAttributeProvider, false);
+ 
+     when(iip.getPathSnapshotId()).thenReturn(snapshotId);
+     when(iip.getINodesArray()).thenReturn(inodes);
+@@ -129,10 +126,10 @@ public void testCheckPermissionWithContextAPI() throws IOException {
+     when(mockINodeAttributeProvider.getExternalAccessControlEnforcer(any())).
+         thenReturn(mockEnforcer);
+ 
++    // force it to use the new, checkPermissionWithContext API.
+     FSPermissionChecker checker = new FSPermissionChecker(
+-        fsOwner, superGroup, ugi, mockINodeAttributeProvider);
++        fsOwner, superGroup, ugi, mockINodeAttributeProvider, true);
+ 
+-    // force it to use the new, checkPermissionWithContext API.
+     String operationName = "abc";
+     FSPermissionChecker.setOperationType(operationName);
+ 

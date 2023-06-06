@@ -1,0 +1,1 @@
+    if (!fullyDeleteContents(dir, tryGrantPermissions)) {

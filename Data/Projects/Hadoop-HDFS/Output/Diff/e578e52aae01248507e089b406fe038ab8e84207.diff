@@ -1,0 +1,460 @@
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/AbstractCSQueue.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/AbstractCSQueue.java
+index 3ae22ad0ebd7..4345cbd5a3fd 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/AbstractCSQueue.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/AbstractCSQueue.java
+@@ -47,6 +47,7 @@
+ import org.apache.hadoop.yarn.api.records.ResourceInformation;
+ import org.apache.hadoop.yarn.conf.YarnConfiguration;
+ import org.apache.hadoop.yarn.exceptions.YarnException;
++import org.apache.hadoop.yarn.exceptions.YarnRuntimeException;
+ import org.apache.hadoop.yarn.factories.RecordFactory;
+ import org.apache.hadoop.yarn.factory.providers.RecordFactoryProvider;
+ import org.apache.hadoop.yarn.security.AccessRequest;
+@@ -116,6 +117,15 @@ public abstract class AbstractCSQueue implements CSQueue {
+ 
+   QueueResourceQuotas queueResourceQuotas;
+ 
++  // -1 indicates lifetime is disabled
++  private volatile long maxApplicationLifetime = -1;
++
++  private volatile long defaultApplicationLifetime = -1;
++
++  // Indicates if this queue's default lifetime was set by a config property,
++  // either at this level or anywhere in the queue's hierarchy.
++  private volatile boolean defaultAppLifetimeWasSpecifiedInConfig = false;
++
+   protected enum CapacityConfigType {
+     NONE, PERCENTAGE, ABSOLUTE_RESOURCE
+   };
+@@ -425,6 +435,19 @@ protected void setupQueueConfigs(Resource clusterResource,
+           configuration.getMultiNodesSortingAlgorithmPolicy(getQueuePath()));
+ 
+       this.userWeights = getUserWeightsFromHierarchy(configuration);
++
++      maxApplicationLifetime = getInheritedMaxAppLifetime(this, configuration);
++      defaultApplicationLifetime =
++          getInheritedDefaultAppLifetime(this, configuration,
++              maxApplicationLifetime);
++      if (maxApplicationLifetime > 0 &&
++          defaultApplicationLifetime > maxApplicationLifetime) {
++        throw new YarnRuntimeException(
++            "Default lifetime " + defaultApplicationLifetime
++                + " can't exceed maximum lifetime " + maxApplicationLifetime);
++      }
++      defaultApplicationLifetime = defaultApplicationLifetime > 0
++          ? defaultApplicationLifetime : maxApplicationLifetime;
+     } finally {
+       writeLock.unlock();
+     }
+@@ -860,6 +883,68 @@ private boolean isQueueHierarchyPreemptionDisabled(CSQueue q,
+                                         parentQ.getPreemptionDisabled());
+   }
+ 
++  private long getInheritedMaxAppLifetime(CSQueue q,
++      CapacitySchedulerConfiguration conf) {
++    CSQueue parentQ = q.getParent();
++    long maxAppLifetime = conf.getMaximumLifetimePerQueue(q.getQueuePath());
++
++    // If q is the root queue, then get max app lifetime from conf.
++    if (parentQ == null) {
++      return maxAppLifetime;
++    }
++
++    // If this is not the root queue, get this queue's max app lifetime
++    // from the conf. The parent's max app lifetime will be used if it's
++    // not set for this queue.
++    // A value of 0 will override the parent's value and means no max lifetime.
++    // A negative value means that the parent's max should be used.
++    long parentsMaxAppLifetime = getParent().getMaximumApplicationLifetime();
++    return (maxAppLifetime >= 0) ? maxAppLifetime : parentsMaxAppLifetime;
++  }
++
++  private long getInheritedDefaultAppLifetime(CSQueue q,
++      CapacitySchedulerConfiguration conf, long myMaxAppLifetime) {
++    CSQueue parentQ = q.getParent();
++    long defaultAppLifetime = conf.getDefaultLifetimePerQueue(getQueuePath());
++    defaultAppLifetimeWasSpecifiedInConfig =
++        (defaultAppLifetime >= 0
++        || (parentQ != null &&
++            parentQ.getDefaultAppLifetimeWasSpecifiedInConfig()));
++
++    // If q is the root queue, then get default app lifetime from conf.
++    if (parentQ == null) {
++      return defaultAppLifetime;
++    }
++
++    // If this is not the root queue, get the parent's default app lifetime. The
++    // parent's default app lifetime will be used if not set for this queue.
++    long parentsDefaultAppLifetime =
++        getParent().getDefaultApplicationLifetime();
++
++    // Negative value indicates default lifetime was not set at this level.
++    // If default lifetime was not set at this level, calculate it based on
++    // parent's default lifetime or current queue's max lifetime.
++    if (defaultAppLifetime < 0) {
++      // If default lifetime was not set at this level but was set somewhere in
++      // the parent's hierarchy, set default lifetime to parent queue's default
++      // only if parent queue's lifetime is less than current queueu's max
++      // lifetime. Otherwise, use current queue's max lifetime value for its
++      // default lifetime.
++      if (defaultAppLifetimeWasSpecifiedInConfig) {
++        if (parentsDefaultAppLifetime <= myMaxAppLifetime) {
++          defaultAppLifetime = parentsDefaultAppLifetime;
++        } else {
++          defaultAppLifetime = myMaxAppLifetime;
++        }
++      } else {
++        // Default app lifetime value was not set anywhere in this queue's
++        // hierarchy. Use current queue's max lifetime as its default.
++        defaultAppLifetime = myMaxAppLifetime;
++      }
++    } // else if >= 0, default lifetime was set at this level. Just use it.
++    return defaultAppLifetime;
++  }
++
+   /**
+    * The specified queue is intra-queue preemptable if
+    * 1) system-wide intra-queue preemption is turned on
+@@ -1317,4 +1402,16 @@ public String getMultiNodeSortingPolicyName() {
+   public void setMultiNodeSortingPolicyName(String policyName) {
+     this.multiNodeSortingPolicyName = policyName;
+   }
++
++  public long getMaximumApplicationLifetime() {
++    return maxApplicationLifetime;
++  }
++
++  public long getDefaultApplicationLifetime() {
++    return defaultApplicationLifetime;
++  }
++
++  public boolean getDefaultAppLifetimeWasSpecifiedInConfig() {
++    return defaultAppLifetimeWasSpecifiedInConfig;
++  }
+ }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/CSQueue.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/CSQueue.java
+index d507e53543c1..9fb7e7d0cc37 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/CSQueue.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/CSQueue.java
+@@ -449,4 +449,26 @@ public void validateSubmitApplication(ApplicationId applicationId,
+    * @return policy name
+    */
+   String getMultiNodeSortingPolicyName();
++
++  /**
++   * Get the maximum lifetime in seconds of an application which is submitted to
++   * this queue. Apps can set their own lifetime timeout up to this value.
++   * @return max lifetime in seconds
++   */
++  long getMaximumApplicationLifetime();
++
++  /**
++   * Get the default lifetime in seconds of an application which is submitted to
++   * this queue. If an app doesn't specify its own timeout when submitted, this
++   * value will be used.
++   * @return default app lifetime
++   */
++  long getDefaultApplicationLifetime();
++
++  /**
++   * Get the indicator of whether or not the default application lifetime was
++   * set by a config property or was calculated by the capacity scheduler.
++   * @return indicator whether set or calculated
++   */
++  boolean getDefaultAppLifetimeWasSpecifiedInConfig();
+ }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/LeafQueue.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/LeafQueue.java
+index 1028a7d0b2ee..37549280164b 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/LeafQueue.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/LeafQueue.java
+@@ -45,7 +45,6 @@
+ import org.apache.hadoop.yarn.api.records.QueueState;
+ import org.apache.hadoop.yarn.api.records.QueueUserACLInfo;
+ import org.apache.hadoop.yarn.api.records.Resource;
+-import org.apache.hadoop.yarn.exceptions.YarnRuntimeException;
+ import org.apache.hadoop.yarn.factories.RecordFactory;
+ import org.apache.hadoop.yarn.factory.providers.RecordFactoryProvider;
+ import org.apache.hadoop.yarn.nodelabels.CommonNodeLabelsManager;
+@@ -130,10 +129,6 @@ public class LeafQueue extends AbstractCSQueue {
+   List<AppPriorityACLGroup> priorityAcls =
+       new ArrayList<AppPriorityACLGroup>();
+ 
+-  // -1 indicates lifetime is disabled
+-  private volatile long maxApplicationLifetime = -1;
+-  private volatile long defaultApplicationLifetime = -1;
+-
+   @SuppressWarnings({ "unchecked", "rawtypes" })
+   public LeafQueue(CapacitySchedulerContext cs,
+       String queueName, CSQueue parent, CSQueue old) throws IOException {
+@@ -256,19 +251,6 @@ protected void setupQueueConfigs(Resource clusterResource,
+       defaultAppPriorityPerQueue = Priority.newInstance(
+           conf.getDefaultApplicationPriorityConfPerQueue(getQueuePath()));
+ 
+-      maxApplicationLifetime =
+-          conf.getMaximumLifetimePerQueue((getQueuePath()));
+-      defaultApplicationLifetime =
+-          conf.getDefaultLifetimePerQueue((getQueuePath()));
+-      if (maxApplicationLifetime > 0 &&
+-          defaultApplicationLifetime > maxApplicationLifetime) {
+-        throw new YarnRuntimeException(
+-            "Default lifetime" + defaultApplicationLifetime
+-                + " can't exceed maximum lifetime " + maxApplicationLifetime);
+-      }
+-      defaultApplicationLifetime = defaultApplicationLifetime > 0
+-          ? defaultApplicationLifetime : maxApplicationLifetime;
+-
+       // Validate leaf queue's user's weights.
+       int queueUL = Math.min(100, conf.getUserLimit(getQueuePath()));
+       for (Entry<String, Float> e : getUserWeights().entrySet()) {
+@@ -329,9 +311,9 @@ protected void setupQueueConfigs(Resource clusterResource,
+               + reservationsContinueLooking + "\n" + "preemptionDisabled = "
+               + getPreemptionDisabled() + "\n" + "defaultAppPriorityPerQueue = "
+               + defaultAppPriorityPerQueue + "\npriority = " + priority
+-              + "\nmaxLifetime = " + maxApplicationLifetime + " seconds"
+-              + "\ndefaultLifetime = "
+-              + defaultApplicationLifetime + " seconds");
++              + "\nmaxLifetime = " + getMaximumApplicationLifetime()
++              + " seconds" + "\ndefaultLifetime = "
++              + getDefaultApplicationLifetime() + " seconds");
+     } finally {
+       writeLock.unlock();
+     }
+@@ -2209,14 +2191,6 @@ static class CachedUserLimit {
+     }
+   }
+ 
+-  public long getMaximumApplicationLifetime() {
+-    return maxApplicationLifetime;
+-  }
+-
+-  public long getDefaultApplicationLifetime() {
+-    return defaultApplicationLifetime;
+-  }
+-
+   private void updateQueuePreemptionMetrics(RMContainer rmc) {
+     final long usedMillis = rmc.getFinishTime() - rmc.getCreationTime();
+     final long usedSeconds = usedMillis / DateUtils.MILLIS_PER_SECOND;
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/TestApplicationLifetimeMonitor.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/TestApplicationLifetimeMonitor.java
+index 4e4043662b2b..2e003151e79a 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/TestApplicationLifetimeMonitor.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/TestApplicationLifetimeMonitor.java
+@@ -390,6 +390,204 @@ public synchronized void updateApplicationStateInternal(
+     }
+   }
+ 
++  static final String CQ1 = "child1";
++  @Test(timeout = 120000)
++  public void testInheritAppLifetimeFromParentQueue() throws Exception {
++    YarnConfiguration yarnConf = conf;
++    long maxRootLifetime = 20L;
++    long defaultRootLifetime = 10L;
++    if (scheduler.equals(CapacityScheduler.class)) {
++      CapacitySchedulerConfiguration csConf =
++          new CapacitySchedulerConfiguration();
++      csConf.setQueues(CapacitySchedulerConfiguration.ROOT,
++          new String[] {CQ1});
++      csConf.setCapacity(CapacitySchedulerConfiguration.ROOT + "." + CQ1, 100);
++      csConf.setMaximumLifetimePerQueue(
++          CapacitySchedulerConfiguration.ROOT, maxRootLifetime);
++      csConf.setDefaultLifetimePerQueue(
++          CapacitySchedulerConfiguration.ROOT, defaultRootLifetime);
++      yarnConf = new YarnConfiguration(csConf);
++    }
++
++    MockRM rm = null;
++    try {
++      rm = new MockRM(yarnConf);
++      rm.start();
++
++      Priority appPriority = Priority.newInstance(0);
++      MockNM nm1 = rm.registerNode("127.0.0.1:1234", 16 * 1024);
++
++      // user not set lifetime, so queue max lifetime will be considered.
++      RMApp app1 = MockRMAppSubmitter.submit(rm,
++          MockRMAppSubmissionData.Builder.createWithMemory(1024, rm)
++              .withAppPriority(appPriority)
++              .withApplicationTimeouts(Collections.emptyMap())
++              .withQueue(CQ1)
++              .build());
++
++      nm1.nodeHeartbeat(true);
++
++      if (scheduler.equals(CapacityScheduler.class)) {
++        // Supported only on capacity scheduler
++        CapacityScheduler csched =
++            (CapacityScheduler) rm.getResourceScheduler();
++
++        rm.waitForState(app1.getApplicationId(), RMAppState.KILLED);
++        long totalTimeRun = app1.getFinishTime() - app1.getSubmitTime();
++        // Child queue should have inherited parent max and default lifetimes.
++        Assert.assertEquals("Child queue max lifetime should have overridden"
++            + " parent value",
++            maxRootLifetime,
++            csched.getQueue(CQ1).getMaximumApplicationLifetime());
++        Assert.assertEquals("Child queue default lifetime should have"
++            + "  overridden parent value",
++            defaultRootLifetime,
++            csched.getQueue(CQ1).getDefaultApplicationLifetime());
++        // app1 (run in the 'child1' queue) should have run longer than the
++        // default lifetime but less than the max lifetime.
++        Assert.assertTrue("Application killed before default lifetime value",
++            totalTimeRun > (defaultRootLifetime * 1000));
++        Assert.assertTrue(
++            "Application killed after max lifetime value " + totalTimeRun,
++            totalTimeRun < (maxRootLifetime * 1000));
++      }
++    } finally {
++      stopRM(rm);
++    }
++  }
++
++  @Test(timeout = 120000)
++  public void testOverrideParentQueueMaxAppLifetime() throws Exception {
++    YarnConfiguration yarnConf = conf;
++    long maxRootLifetime = 20L;
++    long maxChildLifetime = 40L;
++    long defaultRootLifetime = 10L;
++    if (scheduler.equals(CapacityScheduler.class)) {
++      CapacitySchedulerConfiguration csConf =
++          new CapacitySchedulerConfiguration();
++      csConf.setQueues(CapacitySchedulerConfiguration.ROOT,
++          new String[] {CQ1});
++      csConf.setCapacity(CapacitySchedulerConfiguration.ROOT + "." + CQ1, 100);
++      csConf.setMaximumLifetimePerQueue(
++          CapacitySchedulerConfiguration.ROOT, maxRootLifetime);
++      csConf.setMaximumLifetimePerQueue(
++          CapacitySchedulerConfiguration.ROOT + "." + CQ1, maxChildLifetime);
++      csConf.setDefaultLifetimePerQueue(
++          CapacitySchedulerConfiguration.ROOT, defaultRootLifetime);
++      csConf.setDefaultLifetimePerQueue(
++          CapacitySchedulerConfiguration.ROOT + "." + CQ1, maxChildLifetime);
++      yarnConf = new YarnConfiguration(csConf);
++    }
++
++    MockRM rm = null;
++    try {
++      rm = new MockRM(yarnConf);
++      rm.start();
++
++      Priority appPriority = Priority.newInstance(0);
++      MockNM nm1 = rm.registerNode("127.0.0.1:1234", 16 * 1024);
++
++      // user not set lifetime, so queue max lifetime will be considered.
++      RMApp app1 = MockRMAppSubmitter.submit(rm,
++          MockRMAppSubmissionData.Builder.createWithMemory(1024, rm)
++              .withAppPriority(appPriority)
++              .withApplicationTimeouts(Collections.emptyMap())
++              .withQueue(CQ1)
++              .build());
++
++      nm1.nodeHeartbeat(true);
++
++      if (scheduler.equals(CapacityScheduler.class)) {
++        // Supported only on capacity scheduler
++        CapacityScheduler csched =
++            (CapacityScheduler) rm.getResourceScheduler();
++
++        rm.waitForState(app1.getApplicationId(), RMAppState.KILLED);
++        long totalTimeRun = app1.getFinishTime() - app1.getSubmitTime();
++        // Child queue's max lifetime can override parent's and be larger.
++        Assert.assertTrue("Application killed before default lifetime value",
++            (maxRootLifetime < maxChildLifetime)
++              && (totalTimeRun > (maxChildLifetime * 1000)));
++        Assert.assertEquals("Root queue max lifetime property set incorrectly",
++            maxRootLifetime,
++            csched.getRootQueue().getMaximumApplicationLifetime());
++        Assert.assertEquals("Child queue max lifetime should have overridden"
++            + " parent value", maxChildLifetime,
++            csched.getQueue(CQ1).getMaximumApplicationLifetime());
++      }
++    } finally {
++      stopRM(rm);
++    }
++  }
++
++  @Test(timeout = 120000)
++  public void testOverrideParentQueueDefaultAppLifetime() throws Exception {
++    YarnConfiguration yarnConf = conf;
++    long maxRootLifetime = -1L;
++    long maxChildLifetime = -1L;
++    long defaultChildLifetime = 10L;
++    if (scheduler.equals(CapacityScheduler.class)) {
++      CapacitySchedulerConfiguration csConf =
++          new CapacitySchedulerConfiguration();
++      csConf.setQueues(CapacitySchedulerConfiguration.ROOT,
++          new String[] {CQ1});
++      csConf.setCapacity(CapacitySchedulerConfiguration.ROOT + "." + CQ1, 100);
++      csConf.setMaximumLifetimePerQueue(
++          CapacitySchedulerConfiguration.ROOT, maxRootLifetime);
++      csConf.setMaximumLifetimePerQueue(
++          CapacitySchedulerConfiguration.ROOT + "." + CQ1, maxChildLifetime);
++      csConf.setDefaultLifetimePerQueue(
++          CapacitySchedulerConfiguration.ROOT + "." + CQ1,
++          defaultChildLifetime);
++      yarnConf = new YarnConfiguration(csConf);
++    }
++
++    MockRM rm = null;
++    try {
++      rm = new MockRM(yarnConf);
++      rm.start();
++
++      Priority appPriority = Priority.newInstance(0);
++      MockNM nm1 = rm.registerNode("127.0.0.1:1234", 16 * 1024);
++
++      // user not set lifetime, so queue max lifetime will be considered.
++      RMApp app1 = MockRMAppSubmitter.submit(rm,
++          MockRMAppSubmissionData.Builder.createWithMemory(1024, rm)
++              .withAppPriority(appPriority)
++              .withApplicationTimeouts(Collections.emptyMap())
++              .withQueue(CQ1)
++              .build());
++
++      nm1.nodeHeartbeat(true);
++
++      if (scheduler.equals(CapacityScheduler.class)) {
++        // Supported only on capacity scheduler
++        CapacityScheduler csched =
++            (CapacityScheduler) rm.getResourceScheduler();
++
++        rm.waitForState(app1.getApplicationId(), RMAppState.KILLED);
++        long totalTimeRun = app1.getFinishTime() - app1.getSubmitTime();
++        // app1 (run in 'child1' queue) should have overridden the parent's
++        // default lifetime.
++        Assert.assertTrue("Application killed before default lifetime value",
++            totalTimeRun > (defaultChildLifetime * 1000));
++        // Root and child queue's max lifetime should be -1.
++        Assert.assertEquals("Root queue max lifetime property set incorrectly",
++            maxRootLifetime,
++            csched.getRootQueue().getMaximumApplicationLifetime());
++        Assert.assertEquals("Child queue max lifetime property set incorrectly",
++            maxChildLifetime,
++            csched.getQueue(CQ1).getMaximumApplicationLifetime());
++        // 'child1' queue's default lifetime should have overridden parent's.
++        Assert.assertEquals("Child queue default lifetime should have"
++            + " overridden parent value", defaultChildLifetime,
++            csched.getQueue(CQ1).getDefaultApplicationLifetime());
++      }
++    } finally {
++      stopRM(rm);
++    }
++  }
++
+   private CapacitySchedulerConfiguration setUpCSQueue(long maxLifetime,
+       long defaultLifetime) {
+     CapacitySchedulerConfiguration csConf =
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-site/src/site/markdown/CapacityScheduler.md b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-site/src/site/markdown/CapacityScheduler.md
+index 81781d32ad26..5a463e65d137 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-site/src/site/markdown/CapacityScheduler.md
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-site/src/site/markdown/CapacityScheduler.md
+@@ -236,8 +236,8 @@ Below example covers single mapping separately. In case of multiple mappings wit
+ 
+ | Property | Description |
+ |:---- |:---- |
+-| `yarn.scheduler.capacity.<queue-path>.maximum-application-lifetime` | Maximum lifetime of an application which is submitted to a queue in seconds. Any value less than or equal to zero will be considered as disabled. This will be a hard time limit for all applications in this queue. If positive value is configured then any application submitted to this queue will be killed after exceeds the configured lifetime. User can also specify lifetime per application basis in application submission context. But user lifetime will be overridden if it exceeds queue maximum lifetime. It is point-in-time configuration. Note : Configuring too low value will result in killing application sooner. This feature is applicable only for leaf queue. |
+-| `yarn.scheduler.capacity.root.<queue-path>.default-application-lifetime` | Default lifetime of an application which is submitted to a queue in seconds. Any value less than or equal to zero will be considered as disabled. If the user has not submitted application with lifetime value then this value will be taken. It is point-in-time configuration. Note : Default lifetime can't exceed maximum lifetime. This feature is applicable only for leaf queue.|
++| `yarn.scheduler.capacity.<queue-path>.maximum-application-lifetime` | Maximum lifetime (in seconds) of an application which is submitted to a queue. Any value less than or equal to zero will be considered as disabled. The default is -1. If positive value is configured then any application submitted to this queue will be killed after it exceeds the configured lifetime. User can also specify lifetime per application in application submission context. However, user lifetime will be overridden if it exceeds queue maximum lifetime. It is point-in-time configuration. Note: This feature can be set at any level in the queue hierarchy. Child queues will inherit their parent's value unless overridden at the child level. A value of 0 means no max lifetime and will override a parent's max lifetime. If this property is not set or is set to a negative number, then this queue's max lifetime value will be inherited from it's parent.|
++| `yarn.scheduler.capacity.root.<queue-path>.default-application-lifetime` | Default lifetime (in seconds) of an application which is submitted to a queue. Any value less than or equal to zero will be considered as disabled. If the user has not submitted application with lifetime value then this value will be taken. It is point-in-time configuration. This feature can be set at any level in the queue hierarchy. Child queues will inherit their parent's value unless overridden at the child level. If set to less than or equal to 0, the queue's max value must also be unlimited. Default lifetime can't exceed maximum lifetime. |
+ 
+ 
+ ###Setup for application priority.

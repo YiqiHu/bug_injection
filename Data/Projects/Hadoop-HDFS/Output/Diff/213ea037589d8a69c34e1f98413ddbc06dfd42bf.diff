@@ -1,0 +1,143 @@
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/retry/RetryPolicies.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/retry/RetryPolicies.java
+index d7693f868eb3..e14459123016 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/retry/RetryPolicies.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/retry/RetryPolicies.java
+@@ -181,15 +181,20 @@ public static final RetryPolicy retryByRemoteException(
+   }
+ 
+   /**
+-   * A retry policy for exceptions other than RemoteException.
++   * <p>
++   * A retry policy where RemoteException and SaslException are not retried, other individual
++   * exception types can have RetryPolicy overrides, and any other exception type without an
++   * override is not retried.
++   * </p>
++   *
+    * @param defaultPolicy defaultPolicy.
+    * @param exceptionToPolicyMap exceptionToPolicyMap.
+    * @return RetryPolicy.
+    */
+-  public static final RetryPolicy retryOtherThanRemoteException(
++  public static final RetryPolicy retryOtherThanRemoteAndSaslException(
+       RetryPolicy defaultPolicy,
+       Map<Class<? extends Exception>, RetryPolicy> exceptionToPolicyMap) {
+-    return new OtherThanRemoteExceptionDependentRetry(defaultPolicy,
++    return new OtherThanRemoteAndSaslExceptionDependentRetry(defaultPolicy,
+         exceptionToPolicyMap);
+   }
+ 
+@@ -589,12 +594,12 @@ public RetryAction shouldRetry(Exception e, int retries, int failovers,
+     }
+   }
+ 
+-  static class OtherThanRemoteExceptionDependentRetry implements RetryPolicy {
++  static class OtherThanRemoteAndSaslExceptionDependentRetry implements RetryPolicy {
+ 
+     private RetryPolicy defaultPolicy;
+     private Map<Class<? extends Exception>, RetryPolicy> exceptionToPolicyMap;
+ 
+-    public OtherThanRemoteExceptionDependentRetry(RetryPolicy defaultPolicy,
++    OtherThanRemoteAndSaslExceptionDependentRetry(RetryPolicy defaultPolicy,
+         Map<Class<? extends Exception>,
+         RetryPolicy> exceptionToPolicyMap) {
+       this.defaultPolicy = defaultPolicy;
+@@ -605,10 +610,8 @@ public OtherThanRemoteExceptionDependentRetry(RetryPolicy defaultPolicy,
+     public RetryAction shouldRetry(Exception e, int retries, int failovers,
+         boolean isIdempotentOrAtMostOnce) throws Exception {
+       RetryPolicy policy = null;
+-      // ignore Remote Exception
+-      if (e instanceof RemoteException) {
+-        // do nothing
+-      } else {
++      // ignore RemoteException and SaslException
++      if (!(e instanceof RemoteException || isSaslFailure(e))) {
+         policy = exceptionToPolicyMap.get(e.getClass());
+       }
+       if (policy == null) {
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/Client.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/Client.java
+index c4b96bffd86c..534824e204fa 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/Client.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/Client.java
+@@ -61,6 +61,7 @@
+ 
+ import javax.net.SocketFactory;
+ import javax.security.sasl.Sasl;
++import javax.security.sasl.SaslException;
+ import java.io.*;
+ import java.net.*;
+ import java.nio.ByteBuffer;
+@@ -1620,7 +1621,8 @@ private Writable getRpcResponse(final Call call, final Connection connection,
+       }
+ 
+       if (call.error != null) {
+-        if (call.error instanceof RemoteException) {
++        if (call.error instanceof RemoteException ||
++            call.error instanceof SaslException) {
+           call.error.fillInStackTrace();
+           throw call.error;
+         } else { // local exception
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/SaslRpcClient.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/SaslRpcClient.java
+index e5d62389abab..ce7878480e22 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/SaslRpcClient.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/SaslRpcClient.java
+@@ -237,7 +237,14 @@ private SaslClient createSaslClient(SaslAuth authType)
+           LOG.debug("client isn't using kerberos");
+           return null;
+         }
+-        String serverPrincipal = getServerPrincipal(authType);
++        final String serverPrincipal;
++        try {
++          serverPrincipal = getServerPrincipal(authType);
++        } catch (IllegalArgumentException ex) {
++          // YARN-11210: getServerPrincipal can throw IllegalArgumentException if Kerberos
++          // configuration is bad, this is surfaced as a non-retryable SaslException
++          throw new SaslException("Bad Kerberos server principal configuration", ex);
++        }
+         if (serverPrincipal == null) {
+           LOG.debug("protocol doesn't use kerberos");
+           return null;
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/retry/TestRetryProxy.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/retry/TestRetryProxy.java
+index e1fc29f88126..59b9b13fbff5 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/retry/TestRetryProxy.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/retry/TestRetryProxy.java
+@@ -291,7 +291,7 @@ public void testRetryOtherThanRemoteException() throws Throwable {
+ 
+     UnreliableInterface unreliable = (UnreliableInterface)
+         RetryProxy.create(UnreliableInterface.class, unreliableImpl,
+-            retryOtherThanRemoteException(TRY_ONCE_THEN_FAIL,
++            retryOtherThanRemoteAndSaslException(TRY_ONCE_THEN_FAIL,
+                 exceptionToPolicyMap));
+     // should retry with local IOException.
+     unreliable.failsOnceWithIOException();
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api/src/main/java/org/apache/hadoop/yarn/conf/HAUtil.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api/src/main/java/org/apache/hadoop/yarn/conf/HAUtil.java
+index d256252601e0..1360359a9a64 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api/src/main/java/org/apache/hadoop/yarn/conf/HAUtil.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api/src/main/java/org/apache/hadoop/yarn/conf/HAUtil.java
+@@ -64,8 +64,12 @@ public static boolean isFederationEnabled(Configuration conf) {
+    *         configuration; else false.
+    */
+   public static boolean isFederationFailoverEnabled(Configuration conf) {
+-    return conf.getBoolean(YarnConfiguration.FEDERATION_FAILOVER_ENABLED,
+-        YarnConfiguration.DEFAULT_FEDERATION_FAILOVER_ENABLED);
++    // Federation failover is not enabled unless federation is enabled. This previously caused
++    // YARN RMProxy to use the HA Retry policy in a non-HA & non-federation environments because
++    // the default federation failover enabled value is true.
++    return isFederationEnabled(conf) &&
++        conf.getBoolean(YarnConfiguration.FEDERATION_FAILOVER_ENABLED,
++            YarnConfiguration.DEFAULT_FEDERATION_FAILOVER_ENABLED);
+   }
+ 
+   /**
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/client/RMProxy.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/client/RMProxy.java
+index e3be31c10a1c..eb39cc134454 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/client/RMProxy.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/client/RMProxy.java
+@@ -300,7 +300,7 @@ protected static RetryPolicy createRetryPolicy(Configuration conf,
+     // YARN-4288: local IOException is also possible.
+     exceptionToPolicyMap.put(IOException.class, retryPolicy);
+     // Not retry on remote IO exception.
+-    return RetryPolicies.retryOtherThanRemoteException(
++    return RetryPolicies.retryOtherThanRemoteAndSaslException(
+         RetryPolicies.TRY_ONCE_THEN_FAIL, exceptionToPolicyMap);
+   }
+ }

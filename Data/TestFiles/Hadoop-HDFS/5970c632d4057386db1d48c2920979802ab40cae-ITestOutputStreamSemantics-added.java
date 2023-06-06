@@ -1,0 +1,9 @@
+      assertHasStreamCapabilities(stream,
+          StreamCapabilities.HFLUSH,
+          StreamCapabilities.HSYNC);
+      assertLacksStreamCapabilities(stream,
+          StreamCapabilities.DROPBEHIND,
+          StreamCapabilities.READAHEAD,
+          StreamCapabilities.UNBUFFER);
+          StreamCapabilities.HSYNC);
+      assertLacksStreamCapabilities(stream,

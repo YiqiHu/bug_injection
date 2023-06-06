@@ -1,0 +1,326 @@
+
+
+package org.apache.hadoop.fs.s3a.audit.impl;
+
+import javax.annotation.Nullable;
+import java.io.IOException;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.Map;
+
+import com.amazonaws.AmazonWebServiceRequest;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.hadoop.classification.InterfaceAudience;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.audit.AuditConstants;
+import org.apache.hadoop.fs.audit.CommonAuditContext;
+import org.apache.hadoop.fs.s3a.audit.AWSRequestAnalyzer;
+import org.apache.hadoop.fs.s3a.audit.AuditFailureException;
+import org.apache.hadoop.fs.s3a.audit.AuditSpanS3A;
+import org.apache.hadoop.fs.store.audit.HttpReferrerAuditHeader;
+import org.apache.hadoop.security.UserGroupInformation;
+
+import static org.apache.hadoop.fs.audit.AuditConstants.PARAM_FILESYSTEM_ID;
+import static org.apache.hadoop.fs.audit.AuditConstants.PARAM_PRINCIPAL;
+import static org.apache.hadoop.fs.audit.AuditConstants.PARAM_THREAD0;
+import static org.apache.hadoop.fs.audit.AuditConstants.PARAM_TIMESTAMP;
+import static org.apache.hadoop.fs.audit.CommonAuditContext.currentAuditContext;
+import static org.apache.hadoop.fs.audit.CommonAuditContext.currentThreadID;
+import static org.apache.hadoop.fs.s3a.audit.AWSRequestAnalyzer.isRequestNotAlwaysInSpan;
+import static org.apache.hadoop.fs.s3a.audit.S3AAuditConstants.OUTSIDE_SPAN;
+import static org.apache.hadoop.fs.s3a.audit.S3AAuditConstants.REFERRER_HEADER_ENABLED;
+import static org.apache.hadoop.fs.s3a.audit.S3AAuditConstants.REFERRER_HEADER_ENABLED_DEFAULT;
+import static org.apache.hadoop.fs.s3a.audit.S3AAuditConstants.REFERRER_HEADER_FILTER;
+import static org.apache.hadoop.fs.s3a.audit.S3AAuditConstants.REJECT_OUT_OF_SPAN_OPERATIONS;
+import static org.apache.hadoop.fs.s3a.audit.S3AAuditConstants.UNAUDITED_OPERATION;
+import static org.apache.hadoop.fs.s3a.commit.CommitUtils.extractJobID;
+import static org.apache.hadoop.fs.s3a.impl.HeaderProcessing.HEADER_REFERRER;
+
+
+@InterfaceAudience.Private
+public class LoggingAuditor
+    extends AbstractOperationAuditor {
+
+  
+  private static final Logger LOG =
+      LoggerFactory.getLogger(LoggingAuditor.class);
+
+
+  
+  private final AWSRequestAnalyzer analyzer = new AWSRequestAnalyzer();
+
+  
+  private AuditSpanS3A warningSpan;
+
+  
+  private boolean rejectOutOfSpan;
+
+  
+  private final Map<String, String> attributes = new HashMap<>();
+
+  
+  private boolean headerEnabled;
+
+  
+  private volatile String lastHeader = "";
+
+  
+  private Collection<String> filters;
+
+  
+  public LoggingAuditor() {
+
+    super("LoggingAuditor ");
+    attributes.put(PARAM_FILESYSTEM_ID, getAuditorId());
+
+
+    
+    try {
+      UserGroupInformation ugi = UserGroupInformation.getCurrentUser();
+      addAttribute(PARAM_PRINCIPAL, ugi.getUserName());
+    } catch (IOException ex) {
+      LOG.warn("Auditor unable to determine principal", ex);
+    }
+  }
+
+  
+  @Override
+  protected void serviceInit(final Configuration conf) throws Exception {
+    super.serviceInit(conf);
+    rejectOutOfSpan = conf.getBoolean(
+        REJECT_OUT_OF_SPAN_OPERATIONS, false);
+    
+    
+    String jobID = extractJobID(conf);
+    if (jobID != null) {
+      addAttribute(AuditConstants.PARAM_JOB_ID, jobID);
+    }
+    headerEnabled = getConfig().getBoolean(REFERRER_HEADER_ENABLED,
+        REFERRER_HEADER_ENABLED_DEFAULT);
+    filters = conf.getTrimmedStringCollection(REFERRER_HEADER_FILTER);
+    final CommonAuditContext currentContext = currentAuditContext();
+    warningSpan = new WarningSpan(OUTSIDE_SPAN,
+        currentContext, createSpanID(), null, null);
+  }
+
+  @Override
+  public String toString() {
+    final StringBuilder sb = new StringBuilder(
+        "LoggingAuditor{");
+    sb.append("ID='").append(getAuditorId()).append('\'');
+    sb.append(", headerEnabled=").append(headerEnabled);
+    sb.append(", rejectOutOfSpan=").append(rejectOutOfSpan);
+    sb.append('}');
+    return sb.toString();
+  }
+
+  @Override
+  public AuditSpanS3A createSpan(final String operation,
+      @Nullable final String path1,
+      @Nullable final String path2) {
+    LoggingAuditSpan span = new LoggingAuditSpan(
+        createSpanID(),
+        operation,
+        prepareActiveContext(),
+        path1,
+        path2);
+    span.start();
+    return span;
+  }
+
+  
+  private CommonAuditContext prepareActiveContext() {
+    return currentAuditContext();
+  }
+
+  
+  public final void addAttribute(String key, String value) {
+    attributes.put(key, value);
+  }
+
+  @Override
+  public AuditSpanS3A getUnbondedSpan() {
+    return warningSpan;
+  }
+
+  
+  public String getLastHeader() {
+    return lastHeader;
+  }
+
+  
+  private void setLastHeader(final String lastHeader) {
+    this.lastHeader = lastHeader;
+  }
+
+  
+  private class LoggingAuditSpan extends AbstractAuditSpanImpl {
+
+    private final HttpReferrerAuditHeader referrer;
+
+    private final String description;
+
+    private LoggingAuditSpan(
+        final String spanId,
+        final String operationName,
+        final CommonAuditContext context,
+        final String path1,
+        final String path2) {
+      super(spanId, operationName);
+
+      this.referrer = HttpReferrerAuditHeader.builder()
+          .withContextId(getAuditorId())
+          .withSpanId(spanId)
+          .withOperationName(operationName)
+          .withPath1(path1)
+          .withPath2(path2)
+          .withAttributes(attributes)
+          
+          .withAttribute(PARAM_THREAD0,
+              currentThreadID())
+          .withAttribute(PARAM_TIMESTAMP, Long.toString(getTimestamp()))
+          .withEvaluated(context.getEvaluatedEntries())
+          .withFilter(filters)
+          .build();
+
+      this.description = referrer.buildHttpReferrer();
+    }
+
+    public void start() {
+      LOG.trace("{} Start {}", getSpanId(), getDescription());
+    }
+
+    
+    protected String getDescription() {
+      return description;
+    }
+
+    
+    @Override
+    public AuditSpanS3A activate() {
+      LOG.trace("[{}] {} Activate {}",
+          currentThreadID(), getSpanId(), getDescription());
+      return this;
+    }
+
+    
+    @Override
+    public void deactivate() {
+      LOG.trace("[{}] {} Deactivate {}",
+          currentThreadID(), getSpanId(), getDescription());
+    }
+
+
+    
+    @Override
+    public void set(final String key, final String value) {
+      referrer.set(key, value);
+    }
+
+    
+    @Override
+    public <T extends AmazonWebServiceRequest> T beforeExecution(
+        final T request) {
+      
+      final String header = referrer.buildHttpReferrer();
+      
+      setLastHeader(header);
+      if (headerEnabled) {
+        
+        request.putCustomRequestHeader(HEADER_REFERRER,
+            header);
+      }
+      if (LOG.isDebugEnabled()) {
+        LOG.debug("[{}] {} Executing {} with {}; {}",
+            currentThreadID(),
+            getSpanId(),
+            getOperationName(),
+            analyzer.analyze(request),
+            header);
+      }
+      return request;
+    }
+
+    @Override
+    public String toString() {
+      final StringBuilder sb = new StringBuilder(
+          "LoggingAuditSpan{");
+      sb.append(", id='").append(getSpanId()).append('\'');
+      sb.append("description='").append(description).append('\'');
+      sb.append('}');
+      return sb.toString();
+    }
+
+    
+    HttpReferrerAuditHeader getReferrer() {
+      return referrer;
+    }
+  }
+
+  
+  private final class WarningSpan extends LoggingAuditSpan {
+
+    private WarningSpan(
+        final String name,
+        final CommonAuditContext context,
+        final String spanId,
+        final String path1, final String path2) {
+      super(spanId, name, context, path1, path2);
+    }
+
+    @Override
+    public void start() {
+      LOG.warn("[{}] {} Start {}",
+          currentThreadID(), getSpanId(), getDescription());
+    }
+
+    @Override
+    public AuditSpanS3A activate() {
+      LOG.warn("[{}] {} Activate {}",
+          currentThreadID(), getSpanId(), getDescription());
+      return this;
+    }
+
+    @Override
+    public boolean isValidSpan() {
+      return false;
+    }
+
+    @Override
+    public <T extends AmazonWebServiceRequest> T requestCreated(
+        final T request) {
+      String error = "Creating a request outside an audit span "
+          + analyzer.analyze(request);
+      LOG.info(error);
+      if (LOG.isDebugEnabled()) {
+        LOG.debug(error, new AuditFailureException("unaudited"));
+      }
+      return request;
+    }
+
+    
+    @Override
+    public <T extends AmazonWebServiceRequest> T beforeExecution(
+        final T request) {
+
+      String error = "executing a request outside an audit span "
+          + analyzer.analyze(request);
+      final String unaudited = getSpanId() + " "
+          + UNAUDITED_OPERATION + " " + error;
+      if (isRequestNotAlwaysInSpan(request)) {
+        
+        LOG.debug(unaudited);
+      } else {
+        final RuntimeException ex = new AuditFailureException(unaudited);
+        LOG.debug(unaudited, ex);
+        if (rejectOutOfSpan) {
+          throw ex;
+        }
+      }
+      
+      return super.beforeExecution(request);
+    }
+  }
+}
